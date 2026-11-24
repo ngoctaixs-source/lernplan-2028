@@ -1,5 +1,5 @@
-const ADMIN_EMAIL = 'ngoctaixs@gmail.com';
-const FAST_MODELS = ['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-2.0-flash'];
+const FAST_MODELS = ['gemini-3.0-flash', 'gemini-flash-latest', 'gemini-2.0-flash'];
+const REASONING_MODELS = ['gemini-3.0-flash', 'gemini-flash-latest', 'gemini-2.0-flash'];
 const REASONING_MODELS = ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-flash-latest'];
 
 async function verifyUser(req) {
