@@ -1,6 +1,6 @@
 const ADMIN_EMAIL = 'ngoctaixs@gmail.com';
-const FAST_MODELS = ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.0-flash'];
-const REASONING_MODELS = ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+const FAST_MODELS = ['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-2.0-flash'];
+const REASONING_MODELS = ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-flash-latest'];
 
 async function verifyUser(req) {
   const authHeader = req.headers.authorization || '';
@@ -39,24 +39,6 @@ function cleanJsonString(raw) {
   return text;
 }
 
-function buildEndpoints(apiKey, model) {
-  const encodedKey = encodeURIComponent(apiKey.trim());
-  const aiStudioUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodedKey}`;
-  const vertexExpressUrl = `https://aiplatform.googleapis.com/v1/publishers/google/models/${model}:generateContent?key=${encodedKey}`;
-
-  // Vertex AI Express API keys start with "AQ.", Google AI Studio keys start with "AIza"
-  if (apiKey.trim().startsWith('AQ.')) {
-    return [
-      { name: 'Vertex AI Express', url: vertexExpressUrl },
-      { name: 'Google AI Studio', url: aiStudioUrl },
-    ];
-  }
-  return [
-    { name: 'Google AI Studio', url: aiStudioUrl },
-    { name: 'Vertex AI Express', url: vertexExpressUrl },
-  ];
-}
-
 async function callGemini({ parts, expectJson = true, preferReasoning = false, maxOutputTokens = 16384 }) {
   const apiKey = (process.env.GEMINI_API_KEY || '').trim();
   if (!apiKey) {
@@ -67,68 +49,63 @@ async function callGemini({ parts, expectJson = true, preferReasoning = false, m
   const errorLog = [];
 
   for (const model of modelsToTry) {
-    const endpoints = buildEndpoints(apiKey, model);
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+    const body = {
+      contents: [{ role: 'user', parts }],
+      generationConfig: {
+        temperature: 0.3,
+        maxOutputTokens,
+        ...(expectJson ? { responseMimeType: 'application/json' } : {}),
+      },
+    };
 
-    for (const ep of endpoints) {
-      const body = {
-        contents: [{ role: 'user', parts }],
-        generationConfig: {
-          temperature: 0.3,
-          maxOutputTokens,
-          ...(expectJson ? { responseMimeType: 'application/json' } : {}),
+    let response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-goog-api-key': apiKey,
         },
-      };
+        body: JSON.stringify(body),
+      });
+    } catch (netErr) {
+      errorLog.push(`[${model}] Lỗi mạng: ${netErr.message}`);
+      continue;
+    }
 
-      let response;
-      try {
-        response = await fetch(ep.url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        });
-      } catch (netErr) {
-        errorLog.push(`[${ep.name}/${model}] Lỗi mạng: ${netErr.message}`);
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      const msg = data?.error?.message || `HTTP ${response.status}`;
+      errorLog.push(`[${model}] (${response.status}): ${msg}`);
+      if ([400, 401, 403, 404, 429, 500, 503].includes(response.status)) {
         continue;
       }
+      throw new Error(`Gemini API lỗi (${response.status}): ${msg}`);
+    }
 
-      const data = await response.json().catch(() => ({}));
+    const text = data?.candidates?.[0]?.content?.parts
+      ?.map((p) => p.text || '')
+      .join('')
+      .trim();
 
-      if (!response.ok) {
-        const msg = data?.error?.message || `HTTP ${response.status}`;
-        errorLog.push(`[${ep.name}/${model}] (${response.status}): ${msg}`);
-        // Retry next endpoint / fallback model on 400 (key mismatch), 401/403 (endpoint mismatch), 404, 429, 503
-        if ([400, 401, 403, 404, 429, 500, 503].includes(response.status)) {
-          continue;
-        }
-        throw new Error(`Gemini API lỗi (${response.status}): ${msg}`);
-      }
+    if (!text) {
+      errorLog.push(`[${model}] Trả về nội dung trống.`);
+      continue;
+    }
 
-      const text = data?.candidates?.[0]?.content?.parts
-        ?.map((p) => p.text || '')
-        .join('')
-        .trim();
+    if (!expectJson) return text;
 
-      if (!text) {
-        errorLog.push(`[${ep.name}/${model}] Trả về nội dung trống.`);
-        continue;
-      }
-
-      if (!expectJson) return text;
-
-      try {
-        return JSON.parse(cleanJsonString(text));
-      } catch {
-        errorLog.push(`[${ep.name}/${model}] JSON bị cắt cụt hoặc chưa chuẩn.`);
-        continue;
-      }
+    try {
+      return JSON.parse(cleanJsonString(text));
+    } catch {
+      errorLog.push(`[${model}] JSON bị cắt cụt hoặc chưa chuẩn.`);
+      continue;
     }
   }
 
-  const keyHint = apiKey.startsWith('AQ.')
-    ? ' (Gợi ý: Key của bạn bắt đầu bằng "AQ." thuộc Vertex AI. Nếu vẫn lỗi, hãy tạo API Key chuẩn bắt đầu bằng "AIza..." tại aistudio.google.com/apikey và cập nhật vào biến GEMINI_API_KEY trên Vercel rồi Redeploy.)'
-    : '';
-
-  throw new Error(`Không gọi được Gemini AI. Chi tiết: ${errorLog[0] || 'Lỗi không xác định'}${keyHint}`);
+  throw new Error(`Không gọi được Gemini AI. Chi tiết: ${errorLog[0] || 'Lỗi không xác định'}`);
 }
 
 export default async function handler(req, res) {
