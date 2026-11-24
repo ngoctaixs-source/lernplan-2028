@@ -1,7 +1,6 @@
 const ADMIN_EMAIL = 'ngoctaixs@gmail.com';
-const FAST_MODELS = ['gemini-flash-latest', 'gemini-3.0-flash', 'gemini-2.5-flash', 'gemini-2.0-flash'];
-const REASONING_MODELS = ['gemini-flash-latest', 'gemini-3.0-flash', 'gemini-2.5-pro', 'gemini-2.5-flash'];
-
+const FAST_MODELS = ['gemini-3.5-flash', 'gemini-3-flash-preview', 'gemini-flash-latest'];
+const REASONING_MODELS = ['gemini-3.5-flash', 'gemini-3-flash-preview', 'gemini-flash-latest'];
 async function verifyUser(req) {
   const authHeader = req.headers.authorization || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
