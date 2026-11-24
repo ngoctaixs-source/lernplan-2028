@@ -1,6 +1,6 @@
-const FAST_MODELS = ['gemini-3.0-flash', 'gemini-flash-latest', 'gemini-2.0-flash'];
-const REASONING_MODELS = ['gemini-3.0-flash', 'gemini-flash-latest', 'gemini-2.0-flash'];
-const REASONING_MODELS = ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-flash-latest'];
+const ADMIN_EMAIL = 'ngoctaixs@gmail.com';
+const FAST_MODELS = ['gemini-flash-latest', 'gemini-3.0-flash', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+const REASONING_MODELS = ['gemini-flash-latest', 'gemini-3.0-flash', 'gemini-2.5-pro', 'gemini-2.5-flash'];
 
 async function verifyUser(req) {
   const authHeader = req.headers.authorization || '';
@@ -39,77 +39,137 @@ function cleanJsonString(raw) {
   return text;
 }
 
-async function callGemini({ parts, expectJson = true, preferReasoning = false, maxOutputTokens = 16384 }) {
+async function discoverAvailableModels(apiKey) {
+  try {
+    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models', {
+      headers: { 'X-goog-api-key': apiKey },
+    });
+    if (!res.ok) return [];
+    const data = await res.json().catch(() => ({}));
+    const list = (data.models || [])
+      .filter(
+        (m) =>
+          Array.isArray(m.supportedGenerationMethods) &&
+          m.supportedGenerationMethods.includes('generateContent') &&
+          typeof m.name === 'string' &&
+          /gemini/i.test(m.name) &&
+          !/embedding|imagen|veo|tts|audio|robotics/i.test(m.name)
+      )
+      .map((m) => m.name.replace(/^models\//, ''));
+
+    // Prioritize flash models first
+    const flashFirst = [
+      ...list.filter((n) => /flash/i.test(n) && !/lite/i.test(n)),
+      ...list.filter((n) => /flash/i.test(n) && /lite/i.test(n)),
+      ...list.filter((n) => !/flash/i.test(n)),
+    ];
+    return Array.from(new Set(flashFirst));
+  } catch {
+    return [];
+  }
+}
+
+async function requestModel(apiKey, model, parts, expectJson) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  const body = {
+    contents: [{ role: 'user', parts }],
+    generationConfig: {
+      temperature: 0.3,
+      ...(expectJson ? { responseMimeType: 'application/json' } : {}),
+    },
+  };
+
+  let response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-goog-api-key': apiKey,
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (netErr) {
+    return { ok: false, error: `[${model}] Lỗi mạng: ${netErr.message}` };
+  }
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const msg = data?.error?.message || `HTTP ${response.status}`;
+    return { ok: false, error: `[${model}] (${response.status}): ${msg}` };
+  }
+
+  const text = data?.candidates?.[0]?.content?.parts
+    ?.map((p) => p.text || '')
+    .join('')
+    .trim();
+
+  if (!text) {
+    return { ok: false, error: `[${model}] Trả về nội dung trống.` };
+  }
+
+  if (!expectJson) {
+    return { ok: true, data: text, model };
+  }
+
+  try {
+    return { ok: true, data: JSON.parse(cleanJsonString(text)), model };
+  } catch {
+    return { ok: false, error: `[${model}] JSON chưa chuẩn hoặc bị cắt.` };
+  }
+}
+
+async function callGemini({ parts, expectJson = true, preferReasoning = false }) {
   const apiKey = (process.env.GEMINI_API_KEY || '').trim();
   if (!apiKey) {
     throw new Error('Thiếu biến môi trường GEMINI_API_KEY trên Vercel.');
   }
 
-  const modelsToTry = preferReasoning ? REASONING_MODELS : FAST_MODELS;
+  const initialList = preferReasoning ? REASONING_MODELS : FAST_MODELS;
+  const tried = new Set();
   const errorLog = [];
 
-  for (const model of modelsToTry) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-    const body = {
-      contents: [{ role: 'user', parts }],
-      generationConfig: {
-        temperature: 0.3,
-        maxOutputTokens,
-        ...(expectJson ? { responseMimeType: 'application/json' } : {}),
-      },
-    };
-
-    let response;
-    try {
-      response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-goog-api-key': apiKey,
-        },
-        body: JSON.stringify(body),
-      });
-    } catch (netErr) {
-      errorLog.push(`[${model}] Lỗi mạng: ${netErr.message}`);
-      continue;
-    }
-
-    const data = await response.json().catch(() => ({}));
-
-    if (!response.ok) {
-      const msg = data?.error?.message || `HTTP ${response.status}`;
-      errorLog.push(`[${model}] (${response.status}): ${msg}`);
-      if ([400, 401, 403, 404, 429, 500, 503].includes(response.status)) {
-        continue;
-      }
-      throw new Error(`Gemini API lỗi (${response.status}): ${msg}`);
-    }
-
-    const text = data?.candidates?.[0]?.content?.parts
-      ?.map((p) => p.text || '')
-      .join('')
-      .trim();
-
-    if (!text) {
-      errorLog.push(`[${model}] Trả về nội dung trống.`);
-      continue;
-    }
-
-    if (!expectJson) return text;
-
-    try {
-      return JSON.parse(cleanJsonString(text));
-    } catch {
-      errorLog.push(`[${model}] JSON bị cắt cụt hoặc chưa chuẩn.`);
-      continue;
-    }
+  // 1. Try primary known models
+  for (const model of initialList) {
+    tried.add(model);
+    const res = await requestModel(apiKey, model, parts, expectJson);
+    if (res.ok) return res.data;
+    errorLog.push(res.error);
   }
 
-  throw new Error(`Không gọi được Gemini AI. Chi tiết: ${errorLog[0] || 'Lỗi không xác định'}`);
+  // 2. Auto-discover enabled models for this API key if primary list failed
+  const discovered = await discoverAvailableModels(apiKey);
+  for (const model of discovered.slice(0, 4)) {
+    if (tried.has(model)) continue;
+    tried.add(model);
+    const res = await requestModel(apiKey, model, parts, expectJson);
+    if (res.ok) return res.data;
+    errorLog.push(res.error);
+  }
+
+  throw new Error(`Không gọi được Gemini AI. Chi tiết: ${errorLog.slice(0, 3).join(' | ')}`);
 }
 
 export default async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
+
+  // Health-check endpoint: mở https://lernplan-2028.vercel.app/api/gemini để kiểm tra kết nối AI
+  if (req.method === 'GET') {
+    const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+    if (!apiKey) {
+      return res.status(200).json({ ok: false, error: 'Thiếu biến GEMINI_API_KEY trên Vercel' });
+    }
+    const discovered = await discoverAvailableModels(apiKey);
+    const probeModel = FAST_MODELS[0];
+    const probe = await requestModel(apiKey, probeModel, [{ text: 'Reply with OK only.' }], false);
+    return res.status(200).json({
+      ok: probe.ok,
+      keyPrefix: `${apiKey.slice(0, 6)}...`,
+      testedModel: probeModel,
+      testReply: probe.ok ? probe.data : probe.error,
+      availableModels: discovered.slice(0, 8),
+    });
+  }
 
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method Not Allowed' });
@@ -122,7 +182,6 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'Thiếu tham số action.' });
     }
 
-    // Các thao tác thêm nội dung vào kho chung chỉ dành cho Admin
     const adminActions = [
       'import_onenote',
       'import_exam_batch',
@@ -141,14 +200,10 @@ export default async function handler(req, res) {
     }
 
     // =========================================================================
-    // ACTION 1: NHẬP KIẾN THỨC ONENOTE / CHỮ VIẾT TAY BẢNG (CHUẨN HÓA + TỪ VỰNG + BIỂU ĐỒ + TEST CO GIÃN)
+    // ACTION 1: NHẬP KIẾN THỨC ONENOTE / CHỮ VIẾT TAY BẢNG
     // =========================================================================
     if (action === 'import_onenote') {
-      const {
-        rawText = '',
-        images = [], // Array of { base64, mimeType }
-        existingSubjects = [],
-      } = payload || {};
+      const { rawText = '', images = [], existingSubjects = [] } = payload || {};
 
       if (!rawText.trim() && (!Array.isArray(images) || images.length === 0)) {
         return res.status(400).json({ error: 'Vui lòng dán ghi chú hoặc tải lên ít nhất 1 ảnh.' });
@@ -180,18 +235,17 @@ WICHTIGE REGELN:
      c) Prozess / Netzplan / Organigramm: {"type":"flow","title":"...","steps":[{"title":"Schritt 1","subtitle":"Beschreibung","badge":"Tag 1 / Puffer 0"}]}
      d) Balkendiagramm: {"type":"bar","title":"...","unit":"€","items":[{"label":"Miete","value":4000},{"label":"Technik","value":2500}]}
 4. YOUTUBE-LERNVIDEOS:
-   - Gib pro Abschnitt 2 präzise deutsche YouTube-Suchbegriffe in "video_keywords" an (z. B. Simpleclub, Studyflix, IHK-Erklärung), damit der Schüler echte Lernvideos/Praxisbeispiele sofort findet.
+   - Gib pro Abschnitt 2 präzise deutsche YouTube-Suchbegriffe in "video_keywords" an (z. B. Simpleclub, Studyflix, IHK-Erklärung).
 5. FACHWORTSCHATZ (VOKABELN) PRO LEKTION:
-   - Extrahiere 6 bis 12 wichtige deutsche Fachwörter/Verben/Adjektive aus jeder Lektion für das eingebaute Wörterbuch:
+   - Extrahiere 6 bis 12 wichtige deutsche Fachwörter/Verben/Adjektive aus jeder Lektion:
      * Bei Nomen IMMER exakten Artikel ("der" / "die" / "das") und Pluralform ("die ...") angeben.
      * Bei anderen Wortarten article: "", plural: "", word_type genau benennen ("Verb", "Adjektiv", "Abkürzung", "Redewendung").
      * Immer mit vietnamesischer Bedeutung, konkretem Praxisbeispiel (DE + VN) und Grammatik-/Prüfungshinweis.
 6. ADAPTIVE TESTFRAGEN (UMFASSEND):
-   - Passe die Anzahl der Prüfungsfragen dynamisch an die Stoffmenge der Lektion an:
-     * Kurze Lektion (1-2 Abschnitte): 5-6 Fragen
-     * Mittlere Lektion (3-4 Abschnitte): 7-9 Fragen
-     * Lange Lektion (5+ Abschnitte): 10-12 Fragen
-   - Decke JEDEN Abschnitt mit einer guten Mischung aus Multiple-Choice ("mc") und praxisnahen offenen Aufgaben/Rechenaufgaben ("essay") ab!
+   - Kurze Lektion (1-2 Abschnitte): 5-6 Fragen
+   - Mittlere Lektion (3-4 Abschnitte): 7-9 Fragen
+   - Lange Lektion (5+ Abschnitte): 10-12 Fragen
+   - Gute Mischung aus Multiple-Choice ("mc") und offenen Aufgaben/Rechenaufgaben ("essay").
 7. FLASHCARDS:
    - Erstelle 5 bis 8 präzise zweisprachige Flashcards pro Lektion.
 
@@ -296,7 +350,7 @@ ${rawText.trim() ? `ZUSÄTZLICHER TEXT / HINWEIS:\n${rawText.trim()}` : 'Lies al
     }
 
     // =========================================================================
-    // ACTION 2: NẠP ĐỀ THI CŨ (ALTKLAUSUREN) THEO TỪNG ĐỢT 1-3 TRANG
+    // ACTION 2: NẠP ĐỀ THI CŨ (ALTKLAUSUREN)
     // =========================================================================
     if (action === 'import_exam_batch') {
       const { rawText = '', images = [], examTitle = '', startNumber = 1 } = payload || {};
@@ -311,10 +365,10 @@ Startnummer der Aufgaben: ${startNumber}
 AUFGABE:
 Extrahiere JEDE Aufgabe aus dem Text / den angehängten Klausurseiten sauber und vollständig.
 - Behalte Tabellen (als Markdown-Tabellen), Zahlen, Paragraphen und Situationsbeschreibungen exakt bei!
-- Wenn eine Frage Multiple-Choice ist -> q_type: "mc" mit options und correct_index.
-- Wenn eine Frage eine offene Text-, Rechen- oder Zeichnungsaufgabe ist -> q_type: "essay" mit ausführlicher IHK-Musterlösung (inkl. Rechenweg!).
-- Schätze realistische IHK-Punkte (points: z. B. 5, 10, 15 oder 20) oder übernimm die Originalpunkte von der Seite.
-- Übersetze jede Aufgabe zusätzlich klar ins Vietnamesische (question_vn).
+- Multiple-Choice -> q_type: "mc" mit options und correct_index.
+- Offene Text-, Rechen- oder Zeichnungsaufgabe -> q_type: "essay" mit ausführlicher IHK-Musterlösung (inkl. Rechenweg!).
+- Schätze realistische IHK-Punkte (5, 10, 15 oder 20) oder übernimm Originalpunkte.
+- Übersetze jede Aufgabe klar ins Vietnamesische (question_vn).
 
 ANTWORTE NUR ALS VALIDES JSON:
 {
@@ -323,7 +377,7 @@ ANTWORTE NUR ALS VALIDES JSON:
       "section_label": "Aufgabe ${startNumber} · Thema",
       "q_type": "essay",
       "points": 10,
-      "question_de": "Vollständige Originalaufgabe (inkl. Situationsdaten / Markdown-Tabelle)",
+      "question_de": "Vollständige Originalaufgabe",
       "question_vn": "Bản dịch tiếng Việt rõ ràng",
       "options": [],
       "correct_index": null,
@@ -357,7 +411,7 @@ ${rawText.trim() ? `KLAUSUR-TEXT:\n${rawText.trim()}` : 'Lies alle Aufgaben voll
     }
 
     // =========================================================================
-    // ACTION 3: GIẢI THÍCH DỄ HIỂU & VÍ DỤ THỰC TẾ CHO TỪNG MỤC
+    // ACTION 3: GIẢI THÍCH DỄ HIỂU & VÍ DỤ THỰC TẾ
     // =========================================================================
     if (action === 'explain_section') {
       const { lessonTitle, headingDe, contentDe } = payload || {};
@@ -366,8 +420,6 @@ ${rawText.trim() ? `KLAUSUR-TEXT:\n${rawText.trim()}` : 'Lies alle Aufgaben voll
 Lektion: ${lessonTitle || ''}
 Abschnitt: ${headingDe || ''}
 Originaltext: ${contentDe || ''}
-
-Erstelle eine glasklare Erklärung, ein konkretes Praxisbeispiel aus der Eventbranche und einen knackigen IHK-Prüfungstipp.
 
 ANTWORTE NUR ALS VALIDES JSON:
 {
@@ -383,7 +435,7 @@ ANTWORTE NUR ALS VALIDES JSON:
     }
 
     // =========================================================================
-    // ACTION 4: CHẤM BÀI TỰ LUẬN & CHẤM ẢNH CHỤP GIẤY NHÁP (TÍNH TOÁN / VẼ BIỂU ĐỒ)
+    // ACTION 4: CHẤM BÀI TỰ LUẬN & ẢNH GIẤY NHÁP
     // =========================================================================
     if (action === 'grade_quiz') {
       const { essays = [] } = payload || {};
@@ -391,7 +443,6 @@ ANTWORTE NUR ALS VALIDES JSON:
         return res.status(200).json({ data: { results: [] } });
       }
 
-      // Build multimodal parts: text overview + attach any handwritten paper images with clear labels!
       const parts = [];
       const essaySummaries = essays.map((e, idx) => ({
         index: idx + 1,
@@ -442,12 +493,12 @@ ANTWORTE NUR ALS VALIDES JSON:
         }
       });
 
-      const result = await callGemini({ parts, expectJson: true, preferReasoning: true, maxOutputTokens: 8192 });
+      const result = await callGemini({ parts, expectJson: true, preferReasoning: true });
       return res.status(200).json({ data: result });
     }
 
     // =========================================================================
-    // ACTION 5: TRA TỪ ĐIỂN BẤM-ĐÂU-DỊCH-ĐÓ (CONTEXTUAL GERMAN-VIETNAMESE DICTIONARY)
+    // ACTION 5: TRA TỪ ĐIỂN BẤM-ĐÂU-DỊCH-ĐÓ
     // =========================================================================
     if (action === 'lookup_word') {
       const { word = '', contextSentence = '' } = payload || {};
@@ -463,11 +514,11 @@ Angeklicktes Wort: "${cleaned}"
 Kontext-Satz: "${(contextSentence || '').slice(0, 400)}"
 
 REGELN:
-- Bestimme die Grundform (Lemma) des Wortes (z. B. "Verträgen" -> "Vertrag", "berechnet" -> "berechnen").
+- Bestimme die Grundform (Lemma) des Wortes.
 - Wenn es ein Nomen ist: gib zwingend den richtigen Artikel ("der", "die" oder "das") und den Plural ("die ...") an!
 - Wenn es kein Nomen ist: article: "", plural: "", und gib die genaue Wortart an ("Verb", "Adjektiv", "Adverb", "Präposition", "Konjunktion", "Abkürzung", "Pronomen").
-- Erkläre die Bedeutung präzise im Kontext des Satzes (und ggf. Fachbedeutung).
-- Gib 1 kurzes, praxisnahes Beispiel (DE + VN) und einen kompakten Grammatik-Hinweis (z. B. Verb-Konjugation / Kasus / Trennbarkeit).
+- Erkläre die Bedeutung präzise im Kontext des Satzes.
+- Gib 1 kurzes, praxisnahes Beispiel (DE + VN) und einen kompakten Grammatik-Hinweis.
 
 ANTWORTE NUR ALS VALIDES JSON:
 {
@@ -515,11 +566,11 @@ ANTWORTE NUR ALS VALIDES JSON:
     }
 
     // =========================================================================
-    // ACTION 7: TẠO THÊM CÂU HỎI TEST (NỐI THÊM KHÔNG XÓA CÂU CŨ)
+    // ACTION 7: TẠO THÊM CÂU HỎI TEST
     // =========================================================================
     if (action === 'generate_more_quiz') {
       const { lessonTitle, sectionsText, existingQuestions = [] } = payload || {};
-      const prompt = `Erstelle 5 WEITERE, NEUE IHK-Prüfungsfragen (3 Multiple-Choice "mc" + 2 offene Situations-/Rechenaufgaben "essay") für "${lessonTitle}", die Aspekte abdecken, welche noch nicht gefragt wurden.
+      const prompt = `Erstelle 5 WEITERE, NEUE IHK-Prüfungsfragen (3 Multiple-Choice "mc" + 2 offene Aufgaben "essay") für "${lessonTitle}".
 Bereits vorhandene Fragen (NICHT wiederholen): ${JSON.stringify(existingQuestions.slice(0, 15))}.
 
 Inhalt:
@@ -553,7 +604,7 @@ ANTWORTE NUR ALS VALIDES JSON:
     }
 
     // =========================================================================
-    // ACTION 8: TRÍCH XUẤT THÊM TỪ VỰNG CHO BÀI HỌC
+    // ACTION 8: TRÍCH XUẤT THÊM TỪ VỰNG
     // =========================================================================
     if (action === 'generate_more_vocab') {
       const { lessonTitle, sectionsText, existingWords = [] } = payload || {};
