@@ -1,6 +1,24 @@
 const ADMIN_EMAIL = 'ngoctaixs@gmail.com';
-const FAST_MODELS = ['gemini-3.5-flash', 'gemini-3-flash-preview', 'gemini-flash-latest'];
-const REASONING_MODELS = ['gemini-3.5-flash', 'gemini-3-flash-preview', 'gemini-flash-latest'];
+const LITE_FIRST_MODELS = [
+  'gemini-flash-lite-latest',
+  'gemini-3.1-flash-lite-preview',
+  'gemini-2.5-flash-lite',
+  'gemini-3.5-flash',
+  'gemini-3-flash-preview',
+  'gemini-flash-latest',
+];
+const REASONING_MODELS = [
+  'gemini-3.5-flash',
+  'gemini-3-flash-preview',
+  'gemini-flash-lite-latest',
+  'gemini-3.1-flash-lite-preview',
+  'gemini-2.5-flash-lite',
+  'gemini-flash-latest',
+];
+
+let cachedDiscovered = { models: null, at: 0 };
+const modelCooldown = new Map(); // model -> timestamp until skip
+
 async function verifyUser(req) {
   const authHeader = req.headers.authorization || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
@@ -38,45 +56,60 @@ function cleanJsonString(raw) {
   return text;
 }
 
-async function discoverAvailableModels(apiKey) {
+async function discoverAvailableModels(apiKey, forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && cachedDiscovered.models && now - cachedDiscovered.at < 10 * 60 * 1000) {
+    return cachedDiscovered.models;
+  }
+
   try {
-    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models', {
+    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=100', {
       headers: { 'X-goog-api-key': apiKey },
     });
     if (!res.ok) return [];
     const data = await res.json().catch(() => ({}));
-    const list = (data.models || [])
+
+    const blockedPattern =
+      /embedding|imagen|image|veo|tts|audio|robotics|omni|live|computer-use|deep-research|aqa|bison|gecko|learnlm|nano|thinking-exp/i;
+
+    const allNames = (data.models || [])
       .filter(
         (m) =>
           Array.isArray(m.supportedGenerationMethods) &&
           m.supportedGenerationMethods.includes('generateContent') &&
           typeof m.name === 'string' &&
-          /gemini/i.test(m.name) &&
-          !/embedding|imagen|veo|tts|audio|robotics/i.test(m.name)
+          !blockedPattern.test(m.name)
       )
       .map((m) => m.name.replace(/^models\//, ''));
 
-    // Prioritize flash models first
-    const flashFirst = [
-      ...list.filter((n) => /flash/i.test(n) && !/lite/i.test(n)),
-      ...list.filter((n) => /flash/i.test(n) && /lite/i.test(n)),
-      ...list.filter((n) => !/flash/i.test(n)),
-    ];
-    return Array.from(new Set(flashFirst));
+    const geminiLite = allNames.filter((n) => /^gemini/i.test(n) && /lite/i.test(n));
+    const geminiFlash = allNames.filter((n) => /^gemini/i.test(n) && /flash/i.test(n) && !/lite/i.test(n));
+    const geminiOther = allNames.filter((n) => /^gemini/i.test(n) && !/flash/i.test(n));
+    const gemmaBig = allNames
+      .filter((n) => /^gemma-3-(27b|12b)/i.test(n))
+      .sort((a, b) => (b.includes('27b') ? 1 : 0) - (a.includes('27b') ? 1 : 0));
+
+    const ordered = Array.from(new Set([...geminiLite, ...geminiFlash, ...geminiOther, ...gemmaBig]));
+    cachedDiscovered = { models: ordered, at: now };
+    return ordered;
   } catch {
     return [];
   }
 }
 
-async function requestModel(apiKey, model, parts, expectJson) {
+async function requestModel(apiKey, model, parts, expectJson, timeoutMs = 25000) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  const isGemma = /^gemma/i.test(model);
   const body = {
     contents: [{ role: 'user', parts }],
     generationConfig: {
       temperature: 0.3,
-      ...(expectJson ? { responseMimeType: 'application/json' } : {}),
+      ...(expectJson && !isGemma ? { responseMimeType: 'application/json' } : {}),
     },
   };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   let response;
   try {
@@ -87,15 +120,29 @@ async function requestModel(apiKey, model, parts, expectJson) {
         'X-goog-api-key': apiKey,
       },
       body: JSON.stringify(body),
+      signal: controller.signal,
     });
   } catch (netErr) {
-    return { ok: false, error: `[${model}] Lỗi mạng: ${netErr.message}` };
+    clearTimeout(timer);
+    return {
+      ok: false,
+      status: 0,
+      error: `[${model}] Lỗi mạng/timeout: ${netErr.message}`,
+    };
   }
+  clearTimeout(timer);
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const msg = data?.error?.message || `HTTP ${response.status}`;
-    return { ok: false, error: `[${model}] (${response.status}): ${msg}` };
+    if (response.status === 404) {
+      modelCooldown.set(model, Date.now() + 30 * 60 * 1000);
+    } else if (response.status === 429) {
+      modelCooldown.set(model, Date.now() + 5 * 60 * 1000);
+    } else if (response.status === 503) {
+      modelCooldown.set(model, Date.now() + 45 * 1000);
+    }
+    return { ok: false, status: response.status, error: `[${model}] (${response.status}): ${msg}` };
   }
 
   const text = data?.candidates?.[0]?.content?.parts
@@ -104,7 +151,7 @@ async function requestModel(apiKey, model, parts, expectJson) {
     .trim();
 
   if (!text) {
-    return { ok: false, error: `[${model}] Trả về nội dung trống.` };
+    return { ok: false, status: 200, error: `[${model}] Trả về nội dung trống.` };
   }
 
   if (!expectJson) {
@@ -114,7 +161,7 @@ async function requestModel(apiKey, model, parts, expectJson) {
   try {
     return { ok: true, data: JSON.parse(cleanJsonString(text)), model };
   } catch {
-    return { ok: false, error: `[${model}] JSON chưa chuẩn hoặc bị cắt.` };
+    return { ok: false, status: 200, error: `[${model}] JSON chưa chuẩn hoặc bị cắt.` };
   }
 }
 
@@ -124,23 +171,33 @@ async function callGemini({ parts, expectJson = true, preferReasoning = false })
     throw new Error('Thiếu biến môi trường GEMINI_API_KEY trên Vercel.');
   }
 
-  const initialList = preferReasoning ? REASONING_MODELS : FAST_MODELS;
-  const tried = new Set();
-  const errorLog = [];
+  const discovered = await discoverAvailableModels(apiKey);
+  const preferred = preferReasoning ? REASONING_MODELS : LITE_FIRST_MODELS;
 
-  // 1. Try primary known models
-  for (const model of initialList) {
-    tried.add(model);
-    const res = await requestModel(apiKey, model, parts, expectJson);
-    if (res.ok) return res.data;
-    errorLog.push(res.error);
+  // Build ordered candidate list: discovered models prioritized cleanly + preferred defaults
+  const discoveredSet = new Set(discovered);
+  const candidates = [];
+
+  // 1. Preferred models that exist in discovered (or all preferred if discovery failed)
+  for (const m of preferred) {
+    if (!discovered.length || discoveredSet.has(m)) {
+      candidates.push(m);
+    }
+  }
+  // 2. Remaining discovered text models (including all flash-lite, pro, and gemma-3 fallback)
+  for (const m of discovered) {
+    if (!candidates.includes(m)) {
+      candidates.push(m);
+    }
   }
 
-  // 2. Auto-discover enabled models for this API key if primary list failed
-  const discovered = await discoverAvailableModels(apiKey);
-  for (const model of discovered.slice(0, 4)) {
-    if (tried.has(model)) continue;
-    tried.add(model);
+  const now = Date.now();
+  const readyNow = candidates.filter((m) => (modelCooldown.get(m) || 0) <= now);
+  const coolingDown = candidates.filter((m) => (modelCooldown.get(m) || 0) > now);
+  const orderedToTry = [...readyNow, ...coolingDown];
+
+  const errorLog = [];
+  for (const model of orderedToTry.slice(0, 8)) {
     const res = await requestModel(apiKey, model, parts, expectJson);
     if (res.ok) return res.data;
     errorLog.push(res.error);
@@ -152,21 +209,34 @@ async function callGemini({ parts, expectJson = true, preferReasoning = false })
 export default async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
 
-  // Health-check endpoint: mở https://lernplan-2028.vercel.app/api/gemini để kiểm tra kết nối AI
+  // Health-check endpoint: mở https://lernplan-2028.vercel.app/api/gemini để xem toàn bộ model khả dụng
   if (req.method === 'GET') {
     const apiKey = (process.env.GEMINI_API_KEY || '').trim();
     if (!apiKey) {
       return res.status(200).json({ ok: false, error: 'Thiếu biến GEMINI_API_KEY trên Vercel' });
     }
-    const discovered = await discoverAvailableModels(apiKey);
-    const probeModel = FAST_MODELS[0];
-    const probe = await requestModel(apiKey, probeModel, [{ text: 'Reply with OK only.' }], false);
+    const discovered = await discoverAvailableModels(apiKey, true);
+    const probes = [];
+    let workingModel = null;
+    let workingReply = null;
+
+    for (const model of discovered.slice(0, 5)) {
+      const probe = await requestModel(apiKey, model, [{ text: 'Reply OK' }], false, 12000);
+      probes.push({ model, ok: probe.ok, reply: probe.ok ? probe.data : probe.error });
+      if (probe.ok) {
+        workingModel = model;
+        workingReply = probe.data;
+        break;
+      }
+    }
+
     return res.status(200).json({
-      ok: probe.ok,
+      ok: Boolean(workingModel),
       keyPrefix: `${apiKey.slice(0, 6)}...`,
-      testedModel: probeModel,
-      testReply: probe.ok ? probe.data : probe.error,
-      availableModels: discovered.slice(0, 8),
+      workingModel,
+      testReply: workingReply,
+      probes,
+      availableTextModels: discovered,
     });
   }
 
