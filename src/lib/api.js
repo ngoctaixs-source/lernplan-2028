@@ -23,7 +23,7 @@ export async function callGeminiApi(action, payload) {
   return json.data;
 }
 
-export function compressImageToBase64(file, maxDimension = 1600, quality = 0.82) {
+export function compressImageToBase64(file, maxDimension = 1400, quality = 0.78) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error('Không đọc được file ảnh.'));
@@ -54,4 +54,9 @@ export function compressImageToBase64(file, maxDimension = 1600, quality = 0.82)
     };
     reader.readAsDataURL(file);
   });
+}
+
+// Create a lighter thumbnail (< 120KB) suitable for saving original board photo in Supabase text column
+export function compressImageForStorage(file) {
+  return compressImageToBase64(file, 960, 0.62).then((res) => res.previewUrl);
 }

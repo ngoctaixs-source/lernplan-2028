@@ -1,5 +1,6 @@
 const ADMIN_EMAIL = 'ngoctaixs@gmail.com';
-const MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+const FAST_MODELS = ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.0-flash'];
+const REASONING_MODELS = ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash'];
 
 async function verifyUser(req) {
   const authHeader = req.headers.authorization || '';
@@ -38,60 +39,96 @@ function cleanJsonString(raw) {
   return text;
 }
 
-async function callGemini({ parts, expectJson = true }) {
-  const apiKey = process.env.GEMINI_API_KEY;
+function buildEndpoints(apiKey, model) {
+  const encodedKey = encodeURIComponent(apiKey.trim());
+  const aiStudioUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodedKey}`;
+  const vertexExpressUrl = `https://aiplatform.googleapis.com/v1/publishers/google/models/${model}:generateContent?key=${encodedKey}`;
+
+  // Vertex AI Express API keys start with "AQ.", Google AI Studio keys start with "AIza"
+  if (apiKey.trim().startsWith('AQ.')) {
+    return [
+      { name: 'Vertex AI Express', url: vertexExpressUrl },
+      { name: 'Google AI Studio', url: aiStudioUrl },
+    ];
+  }
+  return [
+    { name: 'Google AI Studio', url: aiStudioUrl },
+    { name: 'Vertex AI Express', url: vertexExpressUrl },
+  ];
+}
+
+async function callGemini({ parts, expectJson = true, preferReasoning = false, maxOutputTokens = 16384 }) {
+  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
   if (!apiKey) {
     throw new Error('Thiếu biến môi trường GEMINI_API_KEY trên Vercel.');
   }
 
-  let lastError = 'Không thể kết nối Gemini API.';
+  const modelsToTry = preferReasoning ? REASONING_MODELS : FAST_MODELS;
+  const errorLog = [];
 
-  for (const model of MODELS) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-    const body = {
-      contents: [{ role: 'user', parts }],
-      generationConfig: {
-        temperature: 0.35,
-        ...(expectJson ? { responseMimeType: 'application/json' } : {}),
-      },
-    };
+  for (const model of modelsToTry) {
+    const endpoints = buildEndpoints(apiKey, model);
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    for (const ep of endpoints) {
+      const body = {
+        contents: [{ role: 'user', parts }],
+        generationConfig: {
+          temperature: 0.3,
+          maxOutputTokens,
+          ...(expectJson ? { responseMimeType: 'application/json' } : {}),
+        },
+      };
 
-    if (response.status === 404) {
-      lastError = `Model ${model} không khả dụng (404), đang thử model dự phòng...`;
-      continue;
-    }
+      let response;
+      try {
+        response = await fetch(ep.url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+      } catch (netErr) {
+        errorLog.push(`[${ep.name}/${model}] Lỗi mạng: ${netErr.message}`);
+        continue;
+      }
 
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      const msg = data?.error?.message || `HTTP ${response.status}`;
-      throw new Error(`Gemini API lỗi (${response.status}): ${msg}`);
-    }
+      const data = await response.json().catch(() => ({}));
 
-    const text = data?.candidates?.[0]?.content?.parts
-      ?.map((p) => p.text || '')
-      .join('')
-      .trim();
+      if (!response.ok) {
+        const msg = data?.error?.message || `HTTP ${response.status}`;
+        errorLog.push(`[${ep.name}/${model}] (${response.status}): ${msg}`);
+        // Retry next endpoint / fallback model on 400 (key mismatch), 401/403 (endpoint mismatch), 404, 429, 503
+        if ([400, 401, 403, 404, 429, 500, 503].includes(response.status)) {
+          continue;
+        }
+        throw new Error(`Gemini API lỗi (${response.status}): ${msg}`);
+      }
 
-    if (!text) {
-      throw new Error('Gemini trả về kết quả trống. Hãy thử lại.');
-    }
+      const text = data?.candidates?.[0]?.content?.parts
+        ?.map((p) => p.text || '')
+        .join('')
+        .trim();
 
-    if (!expectJson) return text;
+      if (!text) {
+        errorLog.push(`[${ep.name}/${model}] Trả về nội dung trống.`);
+        continue;
+      }
 
-    try {
-      return JSON.parse(cleanJsonString(text));
-    } catch (e) {
-      throw new Error('AI trả về định dạng JSON chưa chuẩn, vui lòng bấm thử lại.');
+      if (!expectJson) return text;
+
+      try {
+        return JSON.parse(cleanJsonString(text));
+      } catch {
+        errorLog.push(`[${ep.name}/${model}] JSON bị cắt cụt hoặc chưa chuẩn.`);
+        continue;
+      }
     }
   }
 
-  throw new Error(lastError);
+  const keyHint = apiKey.startsWith('AQ.')
+    ? ' (Gợi ý: Key của bạn bắt đầu bằng "AQ." thuộc Vertex AI. Nếu vẫn lỗi, hãy tạo API Key chuẩn bắt đầu bằng "AIza..." tại aistudio.google.com/apikey và cập nhật vào biến GEMINI_API_KEY trên Vercel rồi Redeploy.)'
+    : '';
+
+  throw new Error(`Không gọi được Gemini AI. Chi tiết: ${errorLog[0] || 'Lỗi không xác định'}${keyHint}`);
 }
 
 export default async function handler(req, res) {
@@ -102,13 +139,20 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { action, payload } = req.body || {};
+    const bodyObj = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
+    const { action, payload } = bodyObj;
     if (!action) {
       return res.status(400).json({ error: 'Thiếu tham số action.' });
     }
 
-    // Các thao tác ghi/nhập liệu vào kho chung yêu cầu đúng Admin ngoctaixs@gmail.com
-    const adminActions = ['import_onenote', 'generate_more_cards', 'generate_more_quiz'];
+    // Các thao tác thêm nội dung vào kho chung chỉ dành cho Admin
+    const adminActions = [
+      'import_onenote',
+      'import_exam_batch',
+      'generate_more_cards',
+      'generate_more_quiz',
+      'generate_more_vocab',
+    ];
     if (adminActions.includes(action)) {
       const user = await verifyUser(req);
       const email = (user?.email || '').toLowerCase();
@@ -119,178 +163,360 @@ export default async function handler(req, res) {
       }
     }
 
-    // ACTION 1: NHẬP KIẾN THỨC TỪ ONENOTE (TEXT HOẶC ẢNH OCR)
+    // =========================================================================
+    // ACTION 1: NHẬP KIẾN THỨC ONENOTE / CHỮ VIẾT TAY BẢNG (CHUẨN HÓA + TỪ VỰNG + BIỂU ĐỒ + TEST CO GIÃN)
+    // =========================================================================
     if (action === 'import_onenote') {
-      const { rawText = '', imageBase64 = '', imageMimeType = 'image/jpeg', existingSubjects = [] } = payload || {};
-      if (!rawText.trim() && !imageBase64) {
-        return res.status(400).json({ error: 'Vui lòng dán văn bản OneNote hoặc tải ảnh ghi chú.' });
+      const {
+        rawText = '',
+        images = [], // Array of { base64, mimeType }
+        existingSubjects = [],
+      } = payload || {};
+
+      if (!rawText.trim() && (!Array.isArray(images) || images.length === 0)) {
+        return res.status(400).json({ error: 'Vui lòng dán ghi chú hoặc tải lên ít nhất 1 ảnh.' });
       }
 
       const subjectListText = existingSubjects.length
         ? existingSubjects.map((s) => `- ID: "${s.id}" | DE: "${s.title_de}" | VN: "${s.title_vn}"`).join('\n')
         : '(Chưa có môn học nào)';
 
-      const prompt = `Du bist ein erfahrener IHK-Prüfer und Fachlehrer für den Ausbildungsberuf "Veranstaltungskaufmann / Veranstaltungskauffrau" in Deutschland, der perfekt Deutsch und Vietnamesisch spricht.
+      const prompt = `Du bist ein erfahrener IHK-Prüfer und Fachlehrer für "Veranstaltungskaufmann / Veranstaltungskauffrau" in Deutschland, der perfekt Deutsch und Vietnamesisch spricht.
 
 AUFGABE:
-Analysiere die bereitgestellten OneNote-Notizen (Text und/oder Foto/Screenshot).
-1. Ordne den Inhalt einem passenden bestehenden Fach zu ODER erstelle ein neues Fach (Deutsch + Vietnamesisch).
-Bestehende Fächer:
-${subjectListText}
+Analysiere das bereitgestellte Unterrichtsmaterial (OneNote-Text und/oder Fotos von Tafelanschrieben/Handschrift/Folien).
 
-2. Zerlege den Stoff in 1 bis 3 logisch aufeinander aufbauende, gut lernbare kleine Lektionen.
-   - Sortiere zwingend von GRUNDLAGEN (level: "foundation") -> VERKNÜPFT (level: "connected") -> VERTIEFUNG (level: "advanced"), sodass Vorwissen immer zuerst kommt.
-3. BEWAHRE den exakten deutschen Fachwortschatz, Paragraphen und die prüfungsrelevante Formulierung aus den Originalnotizen (wichtig für IHK-Prüfungen!), strukturiere ihn aber sauber in übersichtliche Abschnitte (sections).
-4. Füge UNTER JEDEM deutschen Textblock eine klare, natürliche vietnamesische Übersetzung hinzu.
-5. Erstelle für JEDE Lektion:
-   - 5 bis 6 zweisprachige Flashcards (Fachbegriff / Formel / Recht / Praxis)
-   - 4 bis 5 gemischte Prüfungsfragen: mindestens 2 Multiple-Choice-Fragen ("mc") und 2 praxisnahe offene Situations-/Textaufgaben ("essay") im IHK-Stil.
+WICHTIGE REGELN:
+1. HANDSCHRIFT & ABKÜRZUNGEN KORRIGIEREN:
+   - Lehrkräfte nutzen oft Stichpunkte, fehlende Subjekte/Prädikate oder Abkürzungen (z. B. VA = Veranstaltung, TN = Teilnehmer, MA = Mitarbeiter, z.B., bzw., i.d.R., VStättV, K = Kosten, E = Erlöse, DB = Deckungsbeitrag).
+   - Wandle bruchstückhafte Stichpunkte in vollständige, grammatikalisch saubere, prüfungstaugliche deutsche Sätze im IHK-Stil um, OHNE die fachlichen Originalbegriffe und Paragraphen zu verlieren!
+2. FACHZUORDNUNG & LEKTIONEN:
+   - Ordne den Stoff einem bestehenden Fach zu ODER erstelle ein neues Fach.
+   Bestehende Fächer:
+   ${subjectListText}
+   - Zerlege den Inhalt in 1 bis 3 logisch geordnete Lektionen: "foundation" (Nền tảng) -> "connected" (Liên kết) -> "advanced" (Mở rộng).
+3. TABELLEN & DIAGRAMME (für Kalkulation, Rechnungswesen, Netzplan, Prozesse):
+   - Wenn Tabellen/Kalkulationsschemata vorkommen, nutze saubere Markdown-Tabellen (| Spalte 1 | Spalte 2 |) direkt in content_de und content_vn.
+   - Wenn ein Abschnitt eine grafische Darstellung sinnvoll macht, gib optional "diagram_json" in EINEM dieser Formate an (sonst null):
+     a) Break-even-Point: {"type":"break_even","title":"...","kf":6000,"kv":6,"price":26,"unit":"Tickets","currency":"€"}
+     b) Buchhaltung T-Konto: {"type":"t_konto","title":"...","account":"Bank / Kasse","soll":[{"label":"Anfangsbestand","amount":"10.000 €"}],"haben":[{"label":"Miete","amount":"2.500 €"}]}
+     c) Prozess / Netzplan / Organigramm: {"type":"flow","title":"...","steps":[{"title":"Schritt 1","subtitle":"Beschreibung","badge":"Tag 1 / Puffer 0"}]}
+     d) Balkendiagramm: {"type":"bar","title":"...","unit":"€","items":[{"label":"Miete","value":4000},{"label":"Technik","value":2500}]}
+4. YOUTUBE-LERNVIDEOS:
+   - Gib pro Abschnitt 2 präzise deutsche YouTube-Suchbegriffe in "video_keywords" an (z. B. Simpleclub, Studyflix, IHK-Erklärung), damit der Schüler echte Lernvideos/Praxisbeispiele sofort findet.
+5. FACHWORTSCHATZ (VOKABELN) PRO LEKTION:
+   - Extrahiere 6 bis 12 wichtige deutsche Fachwörter/Verben/Adjektive aus jeder Lektion für das eingebaute Wörterbuch:
+     * Bei Nomen IMMER exakten Artikel ("der" / "die" / "das") und Pluralform ("die ...") angeben.
+     * Bei anderen Wortarten article: "", plural: "", word_type genau benennen ("Verb", "Adjektiv", "Abkürzung", "Redewendung").
+     * Immer mit vietnamesischer Bedeutung, konkretem Praxisbeispiel (DE + VN) und Grammatik-/Prüfungshinweis.
+6. ADAPTIVE TESTFRAGEN (UMFASSEND):
+   - Passe die Anzahl der Prüfungsfragen dynamisch an die Stoffmenge der Lektion an:
+     * Kurze Lektion (1-2 Abschnitte): 5-6 Fragen
+     * Mittlere Lektion (3-4 Abschnitte): 7-9 Fragen
+     * Lange Lektion (5+ Abschnitte): 10-12 Fragen
+   - Decke JEDEN Abschnitt mit einer guten Mischung aus Multiple-Choice ("mc") und praxisnahen offenen Aufgaben/Rechenaufgaben ("essay") ab!
+7. FLASHCARDS:
+   - Erstelle 5 bis 8 präzise zweisprachige Flashcards pro Lektion.
 
-ANTWORTE AUSSCHLIESSLICH MIT VALIDEM JSON in exakt diesem Schema:
+ANTWORTE AUSSCHLIESSLICH MIT VALIDEM JSON:
 {
-  "existing_subject_id": "UUID eines bestehenden Fachs oder null wenn neues Fach",
+  "existing_subject_id": "UUID oder null",
   "subject": {
-    "title_de": "Deutscher Fachname",
+    "title_de": "Fachname Deutsch",
     "title_vn": "Tên môn tiếng Việt",
-    "description_de": "Kurze Beschreibung auf Deutsch",
+    "description_de": "Kurzbeschreibung Deutsch",
     "description_vn": "Mô tả ngắn tiếng Việt"
   },
   "lessons": [
     {
-      "title_de": "Prägnanter deutscher Lektionstitel",
-      "title_vn": "Tiêu đề bài học tiếng Việt",
+      "title_de": "Lektionstitel Deutsch",
+      "title_vn": "Tiêu đề bài tiếng Việt",
       "level": "foundation",
-      "overview_de": "Allgemeiner Überblick aus den Originalnotizen auf Deutsch",
-      "overview_vn": "Khái quát tổng quan tiếng Việt",
+      "overview_de": "Überblick auf Deutsch",
+      "overview_vn": "Tổng quan tiếng Việt",
       "sections": [
         {
           "heading_de": "1. Überschrift",
-          "heading_vn": "1. Tiêu đề mục",
-          "content_de": "Prüfungsnaher Original-Fachtext auf Deutsch",
-          "content_vn": "Bản dịch tiếng Việt rõ ràng, chính xác"
+          "heading_vn": "1. Tiêu đề",
+          "content_de": "Sauber ausformulierter Fachtext (gern mit Markdown-Tabellen bei Kalkulation)",
+          "content_vn": "Bản dịch tiếng Việt rõ ràng",
+          "diagram_json": null,
+          "video_keywords": [
+            {"label": "Video giải thích ngắn", "query": "exakte deutsche YouTube Suchanfrage"}
+          ]
+        }
+      ],
+      "vocabularies": [
+        {
+          "word_de": "Grundform ohne Artikel",
+          "article": "der",
+          "plural": "die ...",
+          "word_type": "Nomen",
+          "meaning_vn": "Nghĩa tiếng Việt chính xác",
+          "example_de": "Beispielsatz im Event-Kontext",
+          "example_vn": "Dịch ví dụ tiếng Việt",
+          "grammar_note_vn": "Ghi chú ngữ pháp / mẹo nhớ"
         }
       ],
       "flashcards": [
         {
           "category": "Fachbegriff",
-          "front_de": "Begriff / Frage auf Deutsch",
-          "hint_vn": "Gợi ý ngắn tiếng Việt",
-          "back_de": "Prüfungsgerechte Definition auf Deutsch",
-          "back_vn": "Định nghĩa tiếng Việt",
-          "example_de": "Praxisbeispiel Eventbranche auf Deutsch",
-          "example_vn": "Ví dụ thực tế tiếng Việt"
+          "front_de": "Begriff / Formel",
+          "hint_vn": "Gợi ý ngắn VN",
+          "back_de": "IHK-Definition DE",
+          "back_vn": "Định nghĩa VN",
+          "example_de": "Beispiel DE",
+          "example_vn": "Ví dụ VN"
         }
       ],
       "quiz_questions": [
         {
           "q_type": "mc",
-          "question_de": "Frage auf Deutsch",
-          "question_vn": "Câu hỏi tiếng Việt",
+          "question_de": "Frage DE",
+          "question_vn": "Câu hỏi VN",
           "options": [
-            {"de": "Option A", "vn": "Đáp án A"},
-            {"de": "Option B", "vn": "Đáp án B"},
-            {"de": "Option C", "vn": "Đáp án C"},
-            {"de": "Option D", "vn": "Đáp án D"}
+            {"de": "A", "vn": "A"},
+            {"de": "B", "vn": "B"},
+            {"de": "C", "vn": "C"},
+            {"de": "D", "vn": "D"}
           ],
           "correct_index": 0,
-          "explanation_de": "Begründung auf Deutsch",
-          "explanation_vn": "Giải thích chi tiết tiếng Việt"
+          "explanation_de": "Begründung DE",
+          "explanation_vn": "Giải thích VN"
         },
         {
           "q_type": "essay",
-          "question_de": "Praxisfall / offene IHK-Frage auf Deutsch",
-          "question_vn": "Câu hỏi tự luận tình huống tiếng Việt",
-          "model_answer_de": "IHK-Musterlösung auf Deutsch",
-          "model_answer_vn": "Đáp án mẫu tiếng Việt",
-          "explanation_de": "Worauf Prüfer achten",
-          "explanation_vn": "Lưu ý chấm điểm IHK"
+          "question_de": "Situations-/Rechenaufgabe DE",
+          "question_vn": "Tình huống / Bài toán VN",
+          "model_answer_de": "IHK-Musterlösung DE",
+          "model_answer_vn": "Đáp án mẫu VN",
+          "explanation_de": "Bewertungshinweis DE",
+          "explanation_vn": "Lưu ý chấm điểm IHK VN"
         }
       ]
     }
   ]
 }
 
-${rawText.trim() ? `ONENOTE-TEXT:\n${rawText.trim()}` : 'Lies den gesamten deutschen Text sorgfältig aus dem angehängten Bild (OCR) aus.'}`;
+${rawText.trim() ? `ZUSÄTZLICHER TEXT / HINWEIS:\n${rawText.trim()}` : 'Lies alle angehängten Fotos sorgfältig aus (OCR) und korrigiere Stichpunkte/Abkürzungen zu klarem Prüfungsdeutsch.'}`;
 
       const parts = [{ text: prompt }];
-      if (imageBase64) {
-        parts.push({
-          inlineData: {
-            mimeType: imageMimeType || 'image/jpeg',
-            data: imageBase64,
-          },
-        });
+      if (Array.isArray(images)) {
+        for (const img of images.slice(0, 3)) {
+          if (img?.base64) {
+            parts.push({
+              inlineData: {
+                mimeType: img.mimeType || 'image/jpeg',
+                data: img.base64,
+              },
+            });
+          }
+        }
       }
 
       const result = await callGemini({ parts, expectJson: true });
       return res.status(200).json({ data: result });
     }
 
-    // ACTION 2: GIẢI THÍCH DỄ HIỂU & VÍ DỤ THỰC TẾ CHO TỪNG MỤC
+    // =========================================================================
+    // ACTION 2: NẠP ĐỀ THI CŨ (ALTKLAUSUREN) THEO TỪNG ĐỢT 1-3 TRANG
+    // =========================================================================
+    if (action === 'import_exam_batch') {
+      const { rawText = '', images = [], examTitle = '', startNumber = 1 } = payload || {};
+      if (!rawText.trim() && (!Array.isArray(images) || images.length === 0)) {
+        return res.status(400).json({ error: 'Vui lòng dán nội dung đề thi hoặc tải ảnh trang đề thi.' });
+      }
+
+      const prompt = `Du digitalisierst echte IHK-Altklausuren für den Beruf "Veranstaltungskaufmann" (Deutsch + Vietnamesisch).
+Prüfung: "${examTitle}"
+Startnummer der Aufgaben: ${startNumber}
+
+AUFGABE:
+Extrahiere JEDE Aufgabe aus dem Text / den angehängten Klausurseiten sauber und vollständig.
+- Behalte Tabellen (als Markdown-Tabellen), Zahlen, Paragraphen und Situationsbeschreibungen exakt bei!
+- Wenn eine Frage Multiple-Choice ist -> q_type: "mc" mit options und correct_index.
+- Wenn eine Frage eine offene Text-, Rechen- oder Zeichnungsaufgabe ist -> q_type: "essay" mit ausführlicher IHK-Musterlösung (inkl. Rechenweg!).
+- Schätze realistische IHK-Punkte (points: z. B. 5, 10, 15 oder 20) oder übernimm die Originalpunkte von der Seite.
+- Übersetze jede Aufgabe zusätzlich klar ins Vietnamesische (question_vn).
+
+ANTWORTE NUR ALS VALIDES JSON:
+{
+  "questions": [
+    {
+      "section_label": "Aufgabe ${startNumber} · Thema",
+      "q_type": "essay",
+      "points": 10,
+      "question_de": "Vollständige Originalaufgabe (inkl. Situationsdaten / Markdown-Tabelle)",
+      "question_vn": "Bản dịch tiếng Việt rõ ràng",
+      "options": [],
+      "correct_index": null,
+      "model_answer_de": "Vollständige IHK-Musterlösung mit Rechenweg",
+      "model_answer_vn": "Bài mẫu tiếng Việt",
+      "explanation_de": "Prüferhinweis DE",
+      "explanation_vn": "Lưu ý ăn điểm / bẫy đề IHK VN",
+      "diagram_json": null
+    }
+  ]
+}
+
+${rawText.trim() ? `KLAUSUR-TEXT:\n${rawText.trim()}` : 'Lies alle Aufgaben vollständig aus den angehängten Prüfungsseiten aus.'}`;
+
+      const parts = [{ text: prompt }];
+      if (Array.isArray(images)) {
+        for (const img of images.slice(0, 3)) {
+          if (img?.base64) {
+            parts.push({
+              inlineData: {
+                mimeType: img.mimeType || 'image/jpeg',
+                data: img.base64,
+              },
+            });
+          }
+        }
+      }
+
+      const result = await callGemini({ parts, expectJson: true });
+      return res.status(200).json({ data: result });
+    }
+
+    // =========================================================================
+    // ACTION 3: GIẢI THÍCH DỄ HIỂU & VÍ DỤ THỰC TẾ CHO TỪNG MỤC
+    // =========================================================================
     if (action === 'explain_section') {
       const { lessonTitle, headingDe, contentDe } = payload || {};
-      const prompt = `Du erklärst einem Auszubildenden (Veranstaltungskaufmann, Deutsch B2, Muttersprache Vietnamesisch) einen trockenen Berufsschul-Abschnitt extrem verständlich und praxisnah.
+      const prompt = `Du erklärst einem Auszubildenden (Veranstaltungskaufmann, Deutsch B2, Muttersprache Vietnamesisch) einen Berufsschul-Abschnitt extrem verständlich und praxisnah.
 
 Lektion: ${lessonTitle || ''}
 Abschnitt: ${headingDe || ''}
 Originaltext: ${contentDe || ''}
 
-Erstelle eine glasklare Erklärung, ein konkretes Beispiel aus der Eventbranche (Konzert, Messe, Gala, Konferenz, Bowling/Eventlocation) und einen knackigen IHK-Prüfungstipp.
+Erstelle eine glasklare Erklärung, ein konkretes Praxisbeispiel aus der Eventbranche und einen knackigen IHK-Prüfungstipp.
 
 ANTWORTE NUR ALS VALIDES JSON:
 {
   "explanation_de": "Sehr einfache, alltagsnahe Erklärung auf Deutsch (2-4 Sätze)",
-  "explanation_vn": "Giải thích siêu dễ hiểu bằng tiếng Việt như bạn bè giảng lại (2-4 câu)",
-  "example_de": "Konkretes Praxisbeispiel aus dem Event-Alltag auf Deutsch",
+  "explanation_vn": "Giải thích siêu dễ hiểu bằng tiếng Việt (2-4 câu)",
+  "example_de": "Konkretes Praxisbeispiel aus der Eventbranche auf Deutsch",
   "example_vn": "Bản dịch ví dụ thực tế tiếng Việt",
-  "exam_tip_vn": "Mẹo nhớ từ khóa tiếng Đức ăn điểm thi IHK (tiếng Việt kèm từ khóa Đức)"
+  "exam_tip_vn": "Mẹo nhớ từ khóa tiếng Đức ăn điểm thi IHK"
 }`;
 
       const result = await callGemini({ parts: [{ text: prompt }], expectJson: true });
       return res.status(200).json({ data: result });
     }
 
-    // ACTION 3: CHẤM BÀI TỰ LUẬN & SỬA LỖI CHI TIẾT
+    // =========================================================================
+    // ACTION 4: CHẤM BÀI TỰ LUẬN & CHẤM ẢNH CHỤP GIẤY NHÁP (TÍNH TOÁN / VẼ BIỂU ĐỒ)
+    // =========================================================================
     if (action === 'grade_quiz') {
       const { essays = [] } = payload || {};
       if (!essays.length) {
         return res.status(200).json({ data: { results: [] } });
       }
 
-      const prompt = `Du bist ein wohlwollender, aber fachlich genauer IHK-Prüfer für Veranstaltungskaufleute.
-Bewerte die folgenden offenen Antworten des Auszubildenden (der Prüfling darf auf Deutsch, Vietnamesisch oder gemischt antworten – bewerte primär das fachliche Verständnis und gib Hinweise zu wichtigen deutschen Fachbegriffen für die echte IHK-Prüfung).
+      // Build multimodal parts: text overview + attach any handwritten paper images with clear labels!
+      const parts = [];
+      const essaySummaries = essays.map((e, idx) => ({
+        index: idx + 1,
+        question_id: e.question_id,
+        question_de: e.question_de,
+        model_answer_de: e.model_answer_de,
+        typed_answer: e.user_answer || '(Không gõ chữ)',
+        has_handwritten_image: Boolean(e.image_base64),
+      }));
 
-Aufgaben & Antworten:
-${JSON.stringify(essays, null, 2)}
+      parts.push({
+        text: `Du bist ein wohlwollender, aber fachlich genauer IHK-Prüfer für Veranstaltungskaufleute.
+Bewerte die folgenden offenen Aufgaben. Der Prüfling darf auf Deutsch, Vietnamesisch oder gemischt antworten — UND bei Rechenaufgaben/Diagrammen/T-Konten kann ein Foto eines handgeschriebenen Lösungsblatts beigefügt sein!
 
-Vergib für jede Antwort eine Punktzahl von 0 bis 100 ("score").
-Erkläre präzise, was richtig war, was fehlt oder falsch ist, und liefere die saubere IHK-Musterlösung (immer zweisprachig Deutsch + Vietnamesisch).
+WICHTIG BEI FOTOS VON HANDSCHRIFTLICHEN LÖSUNGEN:
+- Lies den handgeschriebenen Rechenweg, Zahlen, Tabellen, T-Konten oder gezeichneten Diagramme (Achsen, Schnittpunkte, Kurven) sehr genau ab.
+- Vergib Teilpunkte für richtige Rechenwege, auch wenn am Ende ein kleiner Rundungsfehler passiert ist, und erkläre genau, in welcher Zeile/Achse der Fehler lag.
+
+Aufgabenliste:
+${JSON.stringify(essaySummaries, null, 2)}
 
 ANTWORTE NUR ALS VALIDES JSON:
 {
   "results": [
     {
-      "question_id": "ID der Frage",
+      "question_id": "exakte question_id",
       "score": 85,
-      "feedback_de": "Konkretes Feedback & Fehlerkorrektur auf Deutsch",
-      "feedback_vn": "Nhận xét & sửa lỗi chi tiết bằng tiếng Việt",
-      "musterloesung_de": "Musterlösung im IHK-Stil auf Deutsch",
+      "feedback_de": "Konkretes Feedback, Lob für Richtiges & genaue Fehlerkorrektur auf Deutsch",
+      "feedback_vn": "Nhận xét chi tiết bằng tiếng Việt (nêu rõ đúng chỗ nào, sai/thiếu dòng nào)",
+      "musterloesung_de": "Saubere IHK-Musterlösung auf Deutsch",
       "musterloesung_vn": "Bài mẫu tiếng Việt"
     }
   ]
+}`,
+      });
+
+      essays.forEach((e, idx) => {
+        if (e.image_base64) {
+          parts.push({
+            text: `>>> HANDSCHRIFTLICHES LÖSUNGSFOTO ZU AUFGABE #${idx + 1} (question_id: "${e.question_id}"):`,
+          });
+          parts.push({
+            inlineData: {
+              mimeType: e.image_mime_type || 'image/jpeg',
+              data: e.image_base64,
+            },
+          });
+        }
+      });
+
+      const result = await callGemini({ parts, expectJson: true, preferReasoning: true, maxOutputTokens: 8192 });
+      return res.status(200).json({ data: result });
+    }
+
+    // =========================================================================
+    // ACTION 5: TRA TỪ ĐIỂN BẤM-ĐÂU-DỊCH-ĐÓ (CONTEXTUAL GERMAN-VIETNAMESE DICTIONARY)
+    // =========================================================================
+    if (action === 'lookup_word') {
+      const { word = '', contextSentence = '' } = payload || {};
+      const cleaned = word.trim();
+      if (!cleaned) {
+        return res.status(400).json({ error: 'Thiếu từ cần tra.' });
+      }
+
+      const prompt = `Du bist ein präzises Deutsch-Vietnamesisch Fachwörterbuch für Auszubildende im Beruf Veranstaltungskaufmann (B2-Niveau).
+Analysiere das angeklickte deutsche Wort im Kontext seines Satzes.
+
+Angeklicktes Wort: "${cleaned}"
+Kontext-Satz: "${(contextSentence || '').slice(0, 400)}"
+
+REGELN:
+- Bestimme die Grundform (Lemma) des Wortes (z. B. "Verträgen" -> "Vertrag", "berechnet" -> "berechnen").
+- Wenn es ein Nomen ist: gib zwingend den richtigen Artikel ("der", "die" oder "das") und den Plural ("die ...") an!
+- Wenn es kein Nomen ist: article: "", plural: "", und gib die genaue Wortart an ("Verb", "Adjektiv", "Adverb", "Präposition", "Konjunktion", "Abkürzung", "Pronomen").
+- Erkläre die Bedeutung präzise im Kontext des Satzes (und ggf. Fachbedeutung).
+- Gib 1 kurzes, praxisnahes Beispiel (DE + VN) und einen kompakten Grammatik-Hinweis (z. B. Verb-Konjugation / Kasus / Trennbarkeit).
+
+ANTWORTE NUR ALS VALIDES JSON:
+{
+  "lemma_de": "Grundform ohne Artikel",
+  "article": "der",
+  "plural": "die ...",
+  "word_type": "Nomen",
+  "meaning_vn": "Nghĩa tiếng Việt rõ ràng trong ngữ cảnh",
+  "example_de": "Kurzer Beispielsatz auf Deutsch",
+  "example_vn": "Bản dịch ví dụ tiếng Việt",
+  "grammar_note_vn": "Ghi chú ngắn về giống/chia động từ/cách dùng"
 }`;
 
       const result = await callGemini({ parts: [{ text: prompt }], expectJson: true });
       return res.status(200).json({ data: result });
     }
 
-    // ACTION 4: TẠO THÊM FLASHCARDS BẰNG AI
+    // =========================================================================
+    // ACTION 6: TẠO THÊM FLASHCARDS
+    // =========================================================================
     if (action === 'generate_more_cards') {
       const { lessonTitle, sectionsText, existingFronts = [] } = payload || {};
-      const prompt = `Erstelle 4 NEUE, prüfungsrelevante zweisprachige Flashcards (Deutsch + Vietnamesisch) für die Veranstaltungskaufmann-Lektion "${lessonTitle}".
-Vermeide Duplikate zu diesen bereits vorhandenen Karten: ${JSON.stringify(existingFronts)}.
+      const prompt = `Erstelle 5 NEUE, prüfungsrelevante zweisprachige Flashcards (Deutsch + Vietnamesisch) für "${lessonTitle}".
+Vermeide Duplikate zu: ${JSON.stringify(existingFronts)}.
 
-Lektionsinhalt:
+Inhalt:
 ${sectionsText}
 
 ANTWORTE NUR ALS VALIDES JSON:
@@ -298,26 +524,28 @@ ANTWORTE NUR ALS VALIDES JSON:
   "flashcards": [
     {
       "category": "Fachbegriff",
-      "front_de": "Begriff auf Deutsch",
-      "hint_vn": "Gợi ý tiếng Việt",
-      "back_de": "IHK-Definition auf Deutsch",
-      "back_vn": "Định nghĩa tiếng Việt",
-      "example_de": "Praxisbeispiel auf Deutsch",
-      "example_vn": "Ví dụ tiếng Việt"
+      "front_de": "Begriff DE",
+      "hint_vn": "Gợi ý VN",
+      "back_de": "IHK-Definition DE",
+      "back_vn": "Định nghĩa VN",
+      "example_de": "Beispiel DE",
+      "example_vn": "Ví dụ VN"
     }
   ]
 }`;
-
       const result = await callGemini({ parts: [{ text: prompt }], expectJson: true });
       return res.status(200).json({ data: result });
     }
 
-    // ACTION 5: TẠO BỘ CÂU HỎI TEST MỚI BẰNG AI
+    // =========================================================================
+    // ACTION 7: TẠO THÊM CÂU HỎI TEST (NỐI THÊM KHÔNG XÓA CÂU CŨ)
+    // =========================================================================
     if (action === 'generate_more_quiz') {
-      const { lessonTitle, sectionsText } = payload || {};
-      const prompt = `Erstelle 5 FRISCHE IHK-Prüfungsfragen (3 Multiple-Choice "mc" + 2 praxisnahe offene Situationsaufgaben "essay") zweisprachig (Deutsch + Vietnamesisch) für die Veranstaltungskaufmann-Lektion "${lessonTitle}".
+      const { lessonTitle, sectionsText, existingQuestions = [] } = payload || {};
+      const prompt = `Erstelle 5 WEITERE, NEUE IHK-Prüfungsfragen (3 Multiple-Choice "mc" + 2 offene Situations-/Rechenaufgaben "essay") für "${lessonTitle}", die Aspekte abdecken, welche noch nicht gefragt wurden.
+Bereits vorhandene Fragen (NICHT wiederholen): ${JSON.stringify(existingQuestions.slice(0, 15))}.
 
-Lektionsinhalt:
+Inhalt:
 ${sectionsText}
 
 ANTWORTE NUR ALS VALIDES JSON:
@@ -325,37 +553,61 @@ ANTWORTE NUR ALS VALIDES JSON:
   "quiz_questions": [
     {
       "q_type": "mc",
-      "question_de": "Frage auf Deutsch",
-      "question_vn": "Câu hỏi tiếng Việt",
-      "options": [
-        {"de": "A", "vn": "A"},
-        {"de": "B", "vn": "B"},
-        {"de": "C", "vn": "C"},
-        {"de": "D", "vn": "D"}
-      ],
+      "question_de": "Frage DE",
+      "question_vn": "Câu hỏi VN",
+      "options": [{"de":"A","vn":"A"},{"de":"B","vn":"B"},{"de":"C","vn":"C"},{"de":"D","vn":"D"}],
       "correct_index": 0,
-      "explanation_de": "Erklärung auf Deutsch",
-      "explanation_vn": "Giải thích tiếng Việt"
+      "explanation_de": "Erklärung DE",
+      "explanation_vn": "Giải thích VN"
     },
     {
       "q_type": "essay",
-      "question_de": "Praxisfall auf Deutsch",
-      "question_vn": "Tình huống thực tế tiếng Việt",
-      "model_answer_de": "Musterlösung Deutsch",
-      "model_answer_vn": "Bài mẫu tiếng Việt",
-      "explanation_de": "Prüfungshinweis Deutsch",
-      "explanation_vn": "Lưu ý IHK tiếng Việt"
+      "question_de": "Praxisfall DE",
+      "question_vn": "Tình huống VN",
+      "model_answer_de": "Musterlösung DE",
+      "model_answer_vn": "Bài mẫu VN",
+      "explanation_de": "Hinweis DE",
+      "explanation_vn": "Lưu ý VN"
     }
   ]
 }`;
+      const result = await callGemini({ parts: [{ text: prompt }], expectJson: true });
+      return res.status(200).json({ data: result });
+    }
 
+    // =========================================================================
+    // ACTION 8: TRÍCH XUẤT THÊM TỪ VỰNG CHO BÀI HỌC
+    // =========================================================================
+    if (action === 'generate_more_vocab') {
+      const { lessonTitle, sectionsText, existingWords = [] } = payload || {};
+      const prompt = `Extrahiere 6 bis 8 weitere wichtige deutsche Fachwörter, Verben und Adjektive aus der Lektion "${lessonTitle}" für das Wörterbuch.
+Bereits vorhandene Wörter (nicht wiederholen): ${JSON.stringify(existingWords)}.
+
+Text:
+${sectionsText}
+
+ANTWORTE NUR ALS VALIDES JSON:
+{
+  "vocabularies": [
+    {
+      "word_de": "Grundform ohne Artikel",
+      "article": "der",
+      "plural": "die ...",
+      "word_type": "Nomen",
+      "meaning_vn": "Nghĩa tiếng Việt",
+      "example_de": "Beispielsatz DE",
+      "example_vn": "Dịch ví dụ VN",
+      "grammar_note_vn": "Ghi chú ngữ pháp"
+    }
+  ]
+}`;
       const result = await callGemini({ parts: [{ text: prompt }], expectJson: true });
       return res.status(200).json({ data: result });
     }
 
     return res.status(400).json({ error: `Action không hợp lệ: ${action}` });
   } catch (err) {
-    console.error('Gemini serverless error:', err);
+    console.error('Gemini API error:', err);
     return res.status(500).json({ error: err.message || 'Lỗi máy chủ khi gọi AI.' });
   }
 }

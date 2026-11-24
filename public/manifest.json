@@ -1,10 +1,10 @@
 {
   "name": "LernPlan 2028 — Veranstaltungskaufmann",
   "short_name": "LernPlan 2028",
-  "description": "Ứng dụng học tập song ngữ Đức - Việt chuẩn bị kỳ thi IHK Abschlussprüfung 2028",
+  "description": "Vì 1 tương lai không trật tốt nghiệp — Ứng dụng ôn thi IHK Abschlussprüfung 2028",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#f8fafc",
+  "background_color": "#0f172a",
   "theme_color": "#0f172a",
   "icons": [
     {

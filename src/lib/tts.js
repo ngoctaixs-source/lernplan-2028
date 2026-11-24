@@ -3,7 +3,8 @@ export function speakGerman(text, rate = 1.0) {
     return;
   }
   window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
+  const cleanText = text.replace(/[*#|`_]/g, ' ').replace(/\s+/g, ' ').trim();
+  const utterance = new SpeechSynthesisUtterance(cleanText);
   utterance.lang = 'de-DE';
   utterance.rate = rate;
 
