@@ -1,283 +1,823 @@
 import React, { useState, useRef } from 'react';
-import { X, Sparkles, FileText, Image as ImageIcon, Loader2, AlertCircle, Upload, Trash2 } from 'lucide-react';
-import { callGeminiApi, compressImageToBase64, compressImageForStorage } from '../lib/api';
-import { SAMPLE_GEMA_ONENOTE } from '../lib/seedData';
+import {
+  X,
+  Sparkles,
+  FileText,
+  Image as ImageIcon,
+  Upload,
+  Loader2,
+  AlertCircle,
+  CheckCircle2,
+  Trash2,
+  Filter,
+  RotateCcw,
+  Layers,
+  Check,
+} from 'lucide-react';
+import { callGeminiApi } from '../lib/api';
 
-export default function ImportModal({ subjects, onClose, onSaveImportedData }) {
-  const [inputMode, setInputMode] = useState('text'); // 'text' | 'image'
+const SAMPLE_GEMA = `GEMA & Urheberrecht bei VA (Stichpunkte Lehrer)
+
+1. UrhG: schützt geistige Schöpfungen (Musik, Texte, Fotos). Entsteht autom. mit Schöpfung -> keine Anmeldung nötig! Schutzfrist: 70 J. nach Tod d. Urhebers (§ 64 UrhG), danach gemeinfrei.
+
+2. GEMA = Verwertungsgesellschaft -> nimmt Nutzungsrechte von Komponisten & Textdichtern wahr.
+
+3. Pflichten Veranstalter:
+- Jede öffentl. Wiedergabe geschützter Musik (Live, DJ, Hintergrundmusik) VOR VA anmelden!
+- Tarife abhängig von: Raumgröße (m²), Eintritt (Brutto), Art (Live vs. Tonträger).
+- Nach Live-VA: Musikfolge (Setlist) einreichen.
+
+4. Nichtanmeldung -> doppelter Tarif (100% Kontrollzuschlag als Schadensersatz).`;
+
+// Nạp động thư viện PDF.js (không cần sửa package.json, chạy mượt trực tiếp trên trình duyệt)
+let pdfJsPromise = null;
+function loadPdfJs() {
+  if (typeof window !== 'undefined' && window.pdfjsLib) {
+    return Promise.resolve(window.pdfjsLib);
+  }
+  if (pdfJsPromise) return pdfJsPromise;
+
+  const sources = [
+    {
+      script: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
+      worker: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',
+    },
+    {
+      script: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js',
+      worker: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js',
+    },
+  ];
+
+  pdfJsPromise = new Promise((resolve, reject) => {
+    const trySource = (idx) => {
+      if (idx >= sources.length) {
+        pdfJsPromise = null;
+        reject(new Error('Không tải được trình đọc PDF. Vui lòng kiểm tra kết nối mạng.'));
+        return;
+      }
+      const { script, worker } = sources[idx];
+      const el = document.createElement('script');
+      el.src = script;
+      el.async = true;
+      el.onload = () => {
+        if (window.pdfjsLib) {
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = worker;
+          resolve(window.pdfjsLib);
+        } else {
+          trySource(idx + 1);
+        }
+      };
+      el.onerror = () => trySource(idx + 1);
+      document.head.appendChild(el);
+    };
+    trySource(0);
+  });
+
+  return pdfJsPromise;
+}
+
+// Nén ảnh chụp bảng / chữ viết tay trước khi gửi lên Vercel Serverless (tránh quá 4.5MB)
+async function compressImageFile(file, maxWidth = 1400, quality = 0.8) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Không đọc được ảnh.'));
+    reader.onload = () => {
+      const img = new window.Image();
+      img.onerror = () => reject(new Error('Định dạng ảnh không hợp lệ.'));
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxWidth) {
+          height = Math.round((height * maxWidth) / width);
+          width = maxWidth;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, width, height);
+        ctx.drawImage(img, 0, 0, width, height);
+        const dataUrl = canvas.toDataURL('image/jpeg', quality);
+        const base64 = dataUrl.split(',')[1];
+        resolve({ base64, mimeType: 'image/jpeg', dataUrl, name: file.name });
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+// Chụp 1 trang PDF sang ảnh JPEG nhẹ để Vision AI đọc bảng biểu / chữ viết tay
+async function renderPdfPageToJpeg(pdfDoc, pageNum, maxWidth = 1280, quality = 0.78) {
+  const page = await pdfDoc.getPage(pageNum);
+  const baseViewport = page.getViewport({ scale: 1 });
+  const scale = Math.min(2, maxWidth / Math.max(1, baseViewport.width));
+  const viewport = page.getViewport({ scale });
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(viewport.width);
+  canvas.height = Math.round(viewport.height);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  const dataUrl = canvas.toDataURL('image/jpeg', quality);
+  return {
+    base64: dataUrl.split(',')[1],
+    mimeType: 'image/jpeg',
+    dataUrl,
+  };
+}
+
+export default function ImportModal({ subjects = [], onClose, onSaveImportedData, onBatchComplete }) {
+  // 'pdf' | 'text' | 'images'
+  const [mode, setMode] = useState('pdf');
+
+  // Text & Photos state
   const [rawText, setRawText] = useState('');
-  const [images, setImages] = useState([]); // [{ base64, mimeType, previewUrl, storageUrl, name }]
+  const [images, setImages] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [statusStep, setStatusStep] = useState('');
   const [error, setError] = useState('');
-  const fileInputRef = useRef(null);
+  const [statusMsg, setStatusMsg] = useState('');
 
-  const handleFilesAdded = async (fileList) => {
-    if (!fileList || fileList.length === 0) return;
-    setError('');
-    const remainingSlots = Math.max(0, 3 - images.length);
-    const selected = Array.from(fileList).slice(0, remainingSlots);
-    if (selected.length === 0) {
-      setError('Tối đa 3 ảnh mỗi lần quét để đảm bảo tốc độ và độ chính xác cao nhất.');
+  // PDF Auto-Filter state
+  const [pdfFileName, setPdfFileName] = useState('');
+  const [pdfPages, setPdfPages] = useState([]); // [{ pageNum, text, charCount, isImageHeavy }]
+  const [pdfSummary, setPdfSummary] = useState('');
+  const [pdfGroups, setPdfGroups] = useState([]); // [{ id, title_de, title_vn, subject_hint, pageNums, reason_vn, selected }]
+  const [pdfSkipped, setPdfSkipped] = useState([]); // [{ pageNum, title_hint, reason_vn }]
+  const [pdfStage, setPdfStage] = useState('upload'); // 'upload' | 'scanning' | 'review' | 'importing'
+  const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0, label: '', doneCount: 0, failList: [] });
+
+  const pdfDocRef = useRef(null);
+  const pdfInputRef = useRef(null);
+  const imgInputRef = useRef(null);
+
+  // ==================== HANDLER 1: ĐỌC PDF & AI TỰ LỌC TRANG NHÁP ====================
+  const handleSelectPdf = async (file) => {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.pdf') && file.type !== 'application/pdf') {
+      setError('Vui lòng chọn đúng định dạng file .PDF xuất từ OneNote.');
       return;
     }
 
+    setError('');
+    setPdfFileName(file.name);
+    setPdfStage('scanning');
+    setStatusMsg('Đang mở file PDF và trích xuất nội dung từng trang...');
+
     try {
-      const processed = [];
-      for (const file of selected) {
-        const compressed = await compressImageToBase64(file);
-        const storageUrl = await compressImageForStorage(file);
-        processed.push({
-          ...compressed,
-          storageUrl,
-          name: file.name || `photo-${Date.now()}.jpg`,
+      const pdfjsLib = await loadPdfJs();
+      const arrayBuffer = await file.arrayBuffer();
+      const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      pdfDocRef.current = pdfDoc;
+
+      const totalPages = Math.min(pdfDoc.numPages, 40);
+      if (totalPages === 0) {
+        throw new Error('File PDF trống, không có trang nào.');
+      }
+
+      const extractedPages = [];
+      for (let p = 1; p <= totalPages; p++) {
+        setStatusMsg(`Đang đọc trang ${p}/${totalPages}...`);
+        const page = await pdfDoc.getPage(p);
+        const textContent = await page.getTextContent();
+        const text = (textContent.items || [])
+          .map((item) => item.str || '')
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+
+        extractedPages.push({
+          pageNum: p,
+          text,
+          charCount: text.length,
+          isImageHeavy: text.length < 140,
         });
       }
-      setImages((prev) => [...prev, ...processed]);
+
+      setPdfPages(extractedPages);
+      setStatusMsg(`AI đang rà soát ${totalPages} trang để lọc bỏ trang nháp & gom bài lý thuyết...`);
+
+      const filterRes = await callGeminiApi('filter_pdf_pages', {
+        fileName: file.name,
+        pages: extractedPages.map((p) => ({
+          pageNum: p.pageNum,
+          charCount: p.charCount,
+          isImageHeavy: p.isImageHeavy,
+          textPreview: p.text.slice(0, 750),
+        })),
+        existingSubjects: subjects,
+      });
+
+      const rawGroups = Array.isArray(filterRes?.groups) ? filterRes.groups : [];
+      const rawSkipped = Array.isArray(filterRes?.skipped_pages) ? filterRes.skipped_pages : [];
+
+      // Đảm bảo không bị sót trang nào ngoài danh sách AI trả về
+      const covered = new Set();
+      const normalizedGroups = rawGroups
+        .map((g, idx) => {
+          const validNums = (Array.isArray(g.pageNums) ? g.pageNums : [])
+            .map((n) => Number(n))
+            .filter((n) => n >= 1 && n <= totalPages);
+          validNums.forEach((n) => covered.add(n));
+          return {
+            id: g.id || `g-${idx + 1}`,
+            title_de: g.title_de || `Thema ${idx + 1}`,
+            title_vn: g.title_vn || '',
+            subject_hint: g.subject_hint || '',
+            pageNums: validNums,
+            reason_vn: g.reason_vn || 'Nội dung lý thuyết trọng tâm thi IHK',
+            selected: true,
+          };
+        })
+        .filter((g) => g.pageNums.length > 0);
+
+      const normalizedSkipped = rawSkipped
+        .map((s) => ({
+          pageNum: Number(s.pageNum),
+          title_hint: s.title_hint || `Trang ${s.pageNum}`,
+          reason_vn: s.reason_vn || 'Trang nháp hoặc nội dung không cần nạp',
+        }))
+        .filter((s) => s.pageNum >= 1 && s.pageNum <= totalPages && !covered.has(s.pageNum));
+
+      normalizedSkipped.forEach((s) => covered.add(s.pageNum));
+
+      // Nếu AI bỏ sót trang nào chưa phân loại -> đưa vào mục xem lại
+      for (let p = 1; p <= totalPages; p++) {
+        if (!covered.has(p)) {
+          const pg = extractedPages[p - 1];
+          normalizedSkipped.push({
+            pageNum: p,
+            title_hint: pg.text ? pg.text.slice(0, 60) : `Trang ${p}`,
+            reason_vn: pg.charCount < 25 ? 'Trang ít chữ / trang trống' : 'Chưa được xếp vào nhóm lý thuyết chính',
+          });
+        }
+      }
+
+      setPdfSummary(
+        filterRes?.summary_vn ||
+          `Đã quét ${totalPages} trang: tìm thấy ${normalizedGroups.length} bài lý thuyết và lọc ra ${normalizedSkipped.length} trang nháp.`
+      );
+      setPdfGroups(normalizedGroups);
+      setPdfSkipped(normalizedSkipped);
+      setPdfStage('review');
+      setStatusMsg('');
+    } catch (err) {
+      setError(err.message || 'Không phân tích được file PDF.');
+      setPdfStage('upload');
+      setStatusMsg('');
+    }
+  };
+
+  const toggleGroupSelected = (groupId) => {
+    setPdfGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, selected: !g.selected } : g)));
+  };
+
+  const restoreSkippedPage = (skippedItem) => {
+    const pg = pdfPages.find((p) => p.pageNum === skippedItem.pageNum);
+    setPdfSkipped((prev) => prev.filter((s) => s.pageNum !== skippedItem.pageNum));
+    setPdfGroups((prev) => [
+      ...prev,
+      {
+        id: `restored-${skippedItem.pageNum}`,
+        title_de: skippedItem.title_hint || `Seite ${skippedItem.pageNum}`,
+        title_vn: `Khôi phục từ trang ${skippedItem.pageNum}`,
+        subject_hint: '',
+        pageNums: [skippedItem.pageNum],
+        reason_vn: pg?.isImageHeavy
+          ? 'Bạn đã chọn giữ lại (trang có hình ảnh / chữ viết tay)'
+          : 'Bạn đã chọn khôi phục để nạp vào web',
+        selected: true,
+      },
+    ]);
+  };
+
+  const resetPdf = () => {
+    pdfDocRef.current = null;
+    setPdfFileName('');
+    setPdfPages([]);
+    setPdfSummary('');
+    setPdfGroups([]);
+    setPdfSkipped([]);
+    setPdfStage('upload');
+    setError('');
+    setStatusMsg('');
+  };
+
+  // ==================== HANDLER 2: TỰ ĐỘNG NẠP HÀNG LOẠT CÁC BÀI ĐÃ DUYỆT ====================
+  const handleRunPdfBatchImport = async () => {
+    const chosen = pdfGroups.filter((g) => g.selected && g.pageNums.length > 0);
+    if (chosen.length === 0) {
+      setError('Hãy tích chọn ít nhất 1 bài học để nạp vào web.');
+      return;
+    }
+
+    setError('');
+    setPdfStage('importing');
+    let workingSubjects = [...subjects];
+    let firstCreatedLessonId = null;
+    let totalLessonsCreated = 0;
+    const failList = [];
+
+    for (let i = 0; i < chosen.length; i++) {
+      const group = chosen[i];
+      setBatchProgress({
+        current: i + 1,
+        total: chosen.length,
+        label: group.title_de,
+        doneCount: totalLessonsCreated,
+        failList: [...failList],
+      });
+
+      try {
+        const groupPages = group.pageNums
+          .map((num) => pdfPages.find((p) => p.pageNum === num))
+          .filter(Boolean);
+
+        const combinedText = [
+          `THEMA / KONTEXT: ${group.title_de}${group.subject_hint ? ` (Fach: ${group.subject_hint})` : ''}`,
+          ...groupPages.map((p) => `--- Seite ${p.pageNum} ---\n${p.text || '(Bild / Handschrift siehe Foto)'}`),
+        ].join('\n\n');
+
+        // Với trang ít chữ (slide ảnh / chữ viết tay bảng), tự chụp thành JPEG để AI đọc trực tiếp
+        const groupImages = [];
+        let firstPhotoDataUrl = '';
+        if (pdfDocRef.current) {
+          const imagePages = groupPages.filter((p) => p.isImageHeavy).slice(0, 3);
+          for (const p of imagePages) {
+            try {
+              const rendered = await renderPdfPageToJpeg(pdfDocRef.current, p.pageNum);
+              groupImages.push({ base64: rendered.base64, mimeType: rendered.mimeType });
+              if (!firstPhotoDataUrl) firstPhotoDataUrl = rendered.dataUrl;
+            } catch {
+              // ignore single page render error
+            }
+          }
+        }
+
+        const aiResult = await callGeminiApi('import_onenote', {
+          rawText: combinedText,
+          images: groupImages,
+          existingSubjects: workingSubjects,
+        });
+
+        const saved = await onSaveImportedData(aiResult, firstPhotoDataUrl, { silent: true });
+        if (saved?.firstCreatedLessonId && !firstCreatedLessonId) {
+          firstCreatedLessonId = saved.firstCreatedLessonId;
+        }
+        if (saved?.subjectObj && !workingSubjects.some((s) => s.id === saved.subjectObj.id)) {
+          workingSubjects = [...workingSubjects, saved.subjectObj];
+        }
+        totalLessonsCreated += saved?.lessonsCount || aiResult?.lessons?.length || 1;
+      } catch (err) {
+        failList.push(`${group.title_de}: ${err.message || 'Lỗi nạp bài'}`);
+      }
+    }
+
+    if (totalLessonsCreated > 0) {
+      if (onBatchComplete) {
+        await onBatchComplete(firstCreatedLessonId, totalLessonsCreated, failList);
+      }
+      onClose();
+    } else {
+      setError(`Không nạp được bài nào. Chi tiết: ${failList[0] || 'Lỗi kết nối AI'}`);
+      setPdfStage('review');
+    }
+  };
+
+  // ==================== HANDLER 3: NHẬP CHỮ ONENOTE / ẢNH BẢNG (CÁCH CŨ) ====================
+  const handlePickImages = async (files) => {
+    const fileArr = Array.from(files || []).slice(0, 3 - images.length);
+    if (!fileArr.length) return;
+    setError('');
+    try {
+      const compressed = await Promise.all(fileArr.map((f) => compressImageFile(f)));
+      setImages((prev) => [...prev, ...compressed].slice(0, 3));
     } catch (err) {
       setError(err.message || 'Không xử lý được ảnh.');
     }
   };
 
-  const handlePaste = async (e) => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
-    const pastedFiles = [];
-    for (const item of items) {
-      if (item.type.startsWith('image/')) {
-        const file = item.getAsFile();
-        if (file) pastedFiles.push(file);
-      }
+  const handleSubmitTextOrImages = async () => {
+    if (mode === 'text' && !rawText.trim()) {
+      setError('Vui lòng dán ghi chú từ OneNote vào khung trên.');
+      return;
     }
-    if (pastedFiles.length > 0) {
-      e.preventDefault();
-      setInputMode('image');
-      await handleFilesAdded(pastedFiles);
-    }
-  };
-
-  const handleSubmit = async () => {
-    setError('');
-    if (!rawText.trim() && images.length === 0) {
-      setError('Vui lòng dán ghi chú OneNote hoặc tải ít nhất 1 ảnh chụp bảng/vở.');
+    if (mode === 'images' && images.length === 0) {
+      setError('Vui lòng chọn ít nhất 1 ảnh chụp bảng hoặc chữ viết tay.');
       return;
     }
 
+    setError('');
     setLoading(true);
-    setStatusStep(
-      'AI đang đọc chữ viết tay/viết tắt, chuẩn hóa câu chuẩn IHK, vẽ bảng/biểu đồ, trích xuất Từ vựng, Flashcards và bộ câu hỏi Test bao quát...'
-    );
+    setStatusMsg('AI đang chuẩn hóa câu tiếng Đức IHK, trích Từ vựng, Flashcards & Bài Test...');
     try {
-      const result = await callGeminiApi('import_onenote', {
+      const aiResult = await callGeminiApi('import_onenote', {
         rawText: rawText.trim(),
-        images: images.map((img) => ({ base64: img.base64, mimeType: img.mimeType })),
-        existingSubjects: subjects.map((s) => ({
-          id: s.id,
-          title_de: s.title_de,
-          title_vn: s.title_vn,
-        })),
+        images: mode === 'images' ? images.map((im) => ({ base64: im.base64, mimeType: im.mimeType })) : [],
+        existingSubjects: subjects,
       });
 
-      if (!result || !Array.isArray(result.lessons) || result.lessons.length === 0) {
-        throw new Error('AI chưa tách được bài học nào. Hãy thử cung cấp nội dung rõ hơn.');
-      }
-
-      setStatusStep('Đang lưu bài học, ảnh bảng gốc, Từ vựng, Flashcards & Bài Test lên Supabase...');
-      const firstBoardPhoto = images[0]?.storageUrl || '';
-      await onSaveImportedData(result, firstBoardPhoto);
+      const firstPhoto = mode === 'images' && images[0] ? images[0].dataUrl : '';
+      await onSaveImportedData(aiResult, firstPhoto);
       onClose();
     } catch (err) {
-      setError(err.message || 'Có lỗi xảy ra khi nhập kiến thức.');
+      setError(err.message || 'Lỗi khi phân tích kiến thức.');
     } finally {
       setLoading(false);
-      setStatusStep('');
+      setStatusMsg('');
     }
   };
 
+  const selectedGroupsCount = pdfGroups.filter((g) => g.selected).length;
+
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 backdrop-blur-sm p-4 overflow-y-auto"
-      onPaste={handlePaste}
-    >
-      <div className="bg-white dark:bg-slate-900 w-full max-w-2xl rounded-2xl shadow-2xl border border-slate-200 dark:border-slate-800 overflow-hidden my-auto">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/70 backdrop-blur-sm">
+      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden">
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900">
+        <div className="p-5 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center shadow-sm">
+            <div className="w-10 h-10 rounded-2xl bg-indigo-600 text-white flex items-center justify-center shadow-sm shrink-0">
               <Sparkles className="w-5 h-5" />
             </div>
             <div>
-              <h2 className="text-base font-bold text-slate-900 dark:text-white">Thêm kiến thức mới (OneNote / Ảnh bảng)</h2>
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                Tự sửa viết tắt & thiếu chủ vị ngữ · Tự trích Từ vựng, Bảng/Biểu đồ, Flashcards & Test bao quát
+              <h2 className="text-base font-extrabold text-slate-900 dark:text-white">
+                Thêm kiến thức mới (PDF OneNote / Chữ / Ảnh bảng)
+              </h2>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                Tự lọc trang nháp · Sửa viết tắt chuẩn IHK · Trích Từ vựng, Flashcards & Bài Test
               </p>
             </div>
           </div>
           <button
             onClick={onClose}
-            disabled={loading}
-            className="p-2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-200/60 dark:hover:bg-slate-800 rounded-lg transition"
+            disabled={loading || pdfStage === 'importing'}
+            className="p-2 rounded-xl text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 disabled:opacity-40"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
-        {/* Mode switch */}
-        <div className="px-6 pt-4 flex items-center justify-between gap-2 flex-wrap">
-          <div className="inline-flex bg-slate-100 dark:bg-slate-800 p-1 rounded-xl">
-            <button
-              type="button"
-              onClick={() => setInputMode('text')}
-              className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold transition ${
-                inputMode === 'text'
-                  ? 'bg-white dark:bg-slate-900 text-indigo-700 dark:text-indigo-300 shadow-sm'
-                  : 'text-slate-600 dark:text-slate-400'
-              }`}
-            >
-              <FileText className="w-4 h-4" />
-              Dán chữ từ OneNote
-            </button>
-            <button
-              type="button"
-              onClick={() => setInputMode('image')}
-              className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold transition ${
-                inputMode === 'image'
-                  ? 'bg-white dark:bg-slate-900 text-indigo-700 dark:text-indigo-300 shadow-sm'
-                  : 'text-slate-600 dark:text-slate-400'
-              }`}
-            >
-              <ImageIcon className="w-4 h-4" />
-              Chụp bảng / Chữ viết tay (tối đa 3 ảnh)
-            </button>
-          </div>
-
-          {inputMode === 'text' && (
-            <button
-              type="button"
-              onClick={() => setRawText(SAMPLE_GEMA_ONENOTE)}
-              className="text-xs font-semibold text-indigo-600 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/60 hover:bg-indigo-100 px-3 py-1.5 rounded-lg transition"
-            >
-              + Dán mẫu GEMA (viết tắt kiểu thầy cô)
-            </button>
-          )}
+        {/* Mode Tabs */}
+        <div className="px-5 pt-4 flex flex-wrap gap-2">
+          {[
+            { id: 'pdf', label: 'File PDF OneNote (Tự lọc nháp)', icon: Filter },
+            { id: 'text', label: 'Dán chữ từ OneNote', icon: FileText },
+            { id: 'images', label: 'Chụp bảng / Chữ viết tay', icon: ImageIcon },
+          ].map((tab) => {
+            const Icon = tab.icon;
+            const active = mode === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                disabled={loading || pdfStage === 'importing'}
+                onClick={() => {
+                  setMode(tab.id);
+                  setError('');
+                }}
+                className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold border transition ${
+                  active
+                    ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm'
+                    : 'bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-100'
+                }`}
+              >
+                <Icon className="w-3.5 h-3.5" />
+                {tab.label}
+              </button>
+            );
+          })}
         </div>
 
         {/* Body */}
-        <div className="p-6 space-y-4">
-          {inputMode === 'text' ? (
-            <textarea
-              rows={9}
-              value={rawText}
-              onChange={(e) => setRawText(e.target.value)}
-              disabled={loading}
-              placeholder="Dán ghi chú OneNote tiếng Đức (kể cả viết tắt, gạch đầu dòng thiếu chủ vị ngữ)... Hoặc nhấn Cmd+V để dán thẳng ảnh chụp màn hình!"
-              className="w-full p-4 text-sm text-slate-800 dark:text-slate-100 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 leading-relaxed resize-y"
-            />
-          ) : (
-            <div className="space-y-3">
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/*"
-                multiple
-                className="hidden"
-                onChange={(e) => {
-                  handleFilesAdded(e.target.files);
-                  e.target.value = '';
-                }}
-              />
+        <div className="p-5 overflow-y-auto flex-1 space-y-4">
+          {/* ==================== TAB 1: PDF ONENOTE AUTO-FILTER ==================== */}
+          {mode === 'pdf' && (
+            <div className="space-y-4">
+              {pdfStage === 'upload' && (
+                <>
+                  <div
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      const dropped = e.dataTransfer.files?.[0];
+                      if (dropped) handleSelectPdf(dropped);
+                    }}
+                    onClick={() => pdfInputRef.current?.click()}
+                    className="border-2 border-dashed border-indigo-300 dark:border-indigo-700 bg-indigo-50/50 dark:bg-indigo-950/30 hover:bg-indigo-50 dark:hover:bg-indigo-950/50 rounded-2xl p-7 text-center cursor-pointer transition space-y-3"
+                  >
+                    <input
+                      ref={pdfInputRef}
+                      type="file"
+                      accept="application/pdf,.pdf"
+                      className="hidden"
+                      onChange={(e) => {
+                        handleSelectPdf(e.target.files?.[0]);
+                        e.target.value = '';
+                      }}
+                    />
+                    <div className="w-12 h-12 rounded-2xl bg-indigo-600 text-white flex items-center justify-center mx-auto shadow">
+                      <Upload className="w-6 h-6" />
+                    </div>
+                    <div className="space-y-1">
+                      <p className="text-sm font-extrabold text-slate-900 dark:text-white">
+                        Kéo thả file PDF xuất từ OneNote vào đây (tối đa 40 trang)
+                      </p>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">
+                        Bấm vào khung để chọn file · AI sẽ tự đọc, gạch bỏ trang nháp & gom chủ đề trước khi nạp
+                      </p>
+                    </div>
+                  </div>
 
-              {images.length < 3 && (
-                <div
-                  onClick={() => fileInputRef.current?.click()}
-                  onDragOver={(e) => e.preventDefault()}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    handleFilesAdded(e.dataTransfer.files);
-                  }}
-                  className="border-2 border-dashed border-slate-300 dark:border-slate-700 hover:border-indigo-400 hover:bg-indigo-50/40 dark:hover:bg-indigo-950/30 rounded-2xl p-6 text-center cursor-pointer transition"
-                >
-                  <Upload className="w-8 h-8 text-indigo-500 mx-auto mb-2" />
-                  <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">
-                    Bấm chọn ảnh chụp bảng/vở, kéo thả, hoặc nhấn{' '}
-                    <kbd className="px-1.5 py-0.5 bg-slate-200 dark:bg-slate-700 rounded text-xs">Cmd + V</kbd>
-                  </p>
-                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                    Đã chọn {images.length}/3 ảnh · Ảnh đầu tiên sẽ được lưu kèm trong bài để bạn đối chiếu lại bất cứ lúc nào
-                  </p>
+                  <div className="bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-2xl p-4 text-xs text-slate-600 dark:text-slate-300 space-y-1.5">
+                    <p className="font-bold text-slate-800 dark:text-slate-100">
+                      Mẹo xuất cả chương trên OneNote (MacBook) trong 5 giây:
+                    </p>
+                    <p>
+                      1. Mở mục bài giảng trong OneNote → nhấn <strong>Command + P</strong> (hoặc <em>File → Export as PDF</em>).
+                    </p>
+                    <p>
+                      2. Chọn lưu cả trang / cả Section thành <strong>1 file .pdf</strong> → kéo thẳng vào ô trên, khỏi cần lọc tay!
+                    </p>
+                  </div>
+                </>
+              )}
+
+              {pdfStage === 'scanning' && (
+                <div className="py-12 text-center space-y-3">
+                  <Loader2 className="w-9 h-9 animate-spin text-indigo-600 mx-auto" />
+                  <p className="text-sm font-bold text-slate-900 dark:text-white">{pdfFileName}</p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">{statusMsg || 'Đang phân tích...'}</p>
                 </div>
               )}
 
-              {images.length > 0 && (
-                <div className="grid grid-cols-3 gap-3">
-                  {images.map((img, idx) => (
-                    <div
-                      key={idx}
-                      className="relative rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden bg-slate-100 dark:bg-slate-800 group"
+              {pdfStage === 'review' && (
+                <div className="space-y-4">
+                  {/* Summary Banner */}
+                  <div className="bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-2xl p-4 flex items-start justify-between gap-3">
+                    <div className="space-y-1">
+                      <p className="text-xs font-extrabold text-emerald-800 dark:text-emerald-300 flex items-center gap-1.5">
+                        <CheckCircle2 className="w-4 h-4 shrink-0" />
+                        Đã lọc xong: {pdfFileName} ({pdfPages.length} trang)
+                      </p>
+                      <p className="text-xs text-emerald-900 dark:text-emerald-200">{pdfSummary}</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={resetPdf}
+                      className="px-2.5 py-1.5 bg-white dark:bg-slate-800 border border-emerald-300 dark:border-emerald-700 rounded-lg text-[11px] font-bold shrink-0"
                     >
-                      <img src={img.previewUrl} alt={img.name} className="w-full h-28 object-cover" />
+                      Chọn file khác
+                    </button>
+                  </div>
+
+                  {/* Groups to Keep */}
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-xs font-extrabold uppercase tracking-wider text-indigo-600 dark:text-indigo-400 flex items-center gap-1.5">
+                        <Layers className="w-3.5 h-3.5" />
+                        Bài lý thuyết đề xuất nạp ({selectedGroupsCount}/{pdfGroups.length})
+                      </h3>
+                      <span className="text-[11px] text-slate-400">Bấm để tích chọn / bỏ chọn</span>
+                    </div>
+
+                    {pdfGroups.length === 0 ? (
+                      <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs text-slate-500 text-center">
+                        AI không thấy trang lý thuyết nào — hãy kiểm tra mục trang bị loại bên dưới và bấm Khôi phục nếu cần.
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        {pdfGroups.map((g) => (
+                          <button
+                            key={g.id}
+                            type="button"
+                            onClick={() => toggleGroupSelected(g.id)}
+                            className={`w-full text-left p-3.5 rounded-2xl border transition flex items-start gap-3 ${
+                              g.selected
+                                ? 'bg-indigo-50/70 dark:bg-indigo-950/40 border-indigo-400 dark:border-indigo-700'
+                                : 'bg-slate-50 dark:bg-slate-800/40 border-slate-200 dark:border-slate-800 opacity-60'
+                            }`}
+                          >
+                            <div
+                              className={`w-5 h-5 rounded-md mt-0.5 flex items-center justify-center shrink-0 border ${
+                                g.selected
+                                  ? 'bg-indigo-600 border-indigo-600 text-white'
+                                  : 'bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-600'
+                              }`}
+                            >
+                              {g.selected && <Check className="w-3.5 h-3.5" />}
+                            </div>
+                            <div className="min-w-0 flex-1 space-y-1">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-xs font-extrabold text-slate-900 dark:text-white">{g.title_de}</span>
+                                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-100 dark:bg-indigo-900 text-indigo-700 dark:text-indigo-200">
+                                  Trang {g.pageNums.join(', ')}
+                                </span>
+                                {g.subject_hint && (
+                                  <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-200/80 dark:bg-slate-700 text-slate-700 dark:text-slate-200">
+                                    {g.subject_hint}
+                                  </span>
+                                )}
+                              </div>
+                              {g.title_vn && <p className="text-xs font-semibold text-indigo-600 dark:text-indigo-400">{g.title_vn}</p>}
+                              <p className="text-[11px] text-slate-500 dark:text-slate-400">{g.reason_vn}</p>
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Skipped Pages */}
+                  {pdfSkipped.length > 0 && (
+                    <div className="space-y-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+                      <h3 className="text-xs font-extrabold uppercase tracking-wider text-rose-600 dark:text-rose-400">
+                        Trang nháp / thừa đã tự lọc bỏ ({pdfSkipped.length} trang)
+                      </h3>
+                      <div className="space-y-1.5">
+                        {pdfSkipped.map((s) => (
+                          <div
+                            key={s.pageNum}
+                            className="p-3 rounded-xl bg-rose-50/50 dark:bg-rose-950/20 border border-rose-200/70 dark:border-rose-900/50 flex items-center justify-between gap-3 text-xs"
+                          >
+                            <div className="min-w-0">
+                              <span className="font-bold text-rose-700 dark:text-rose-300">Trang {s.pageNum}:</span>{' '}
+                              <span className="text-slate-700 dark:text-slate-300">{s.title_hint}</span>
+                              <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">{s.reason_vn}</p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => restoreSkippedPage(s)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 text-[11px] font-bold text-slate-700 dark:text-slate-200 hover:border-indigo-500 shrink-0"
+                            >
+                              <RotateCcw className="w-3 h-3" /> Giữ lại
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {pdfStage === 'importing' && (
+                <div className="py-10 text-center space-y-4">
+                  <Loader2 className="w-10 h-10 animate-spin text-indigo-600 mx-auto" />
+                  <div className="space-y-1">
+                    <p className="text-sm font-extrabold text-slate-900 dark:text-white">
+                      Đang tự động nạp bài {batchProgress.current}/{batchProgress.total}...
+                    </p>
+                    <p className="text-xs font-semibold text-indigo-600 dark:text-indigo-400">{batchProgress.label}</p>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                      AI đang chuẩn hóa lý thuyết, trích từ vựng, tạo Flashcards 3D & bài Test — đừng đóng cửa sổ này nhé!
+                    </p>
+                  </div>
+                  <div className="max-w-sm mx-auto h-2.5 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-indigo-600 transition-all duration-500"
+                      style={{
+                        width: `${Math.max(10, Math.round((batchProgress.current / Math.max(1, batchProgress.total)) * 100))}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ==================== TAB 2: TEXT PASTE FROM ONENOTE ==================== */}
+          {mode === 'text' && (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() => setRawText(SAMPLE_GEMA)}
+                  className="px-3 py-1.5 rounded-xl bg-indigo-50 dark:bg-indigo-950/60 hover:bg-indigo-100 text-indigo-700 dark:text-indigo-300 text-xs font-bold border border-indigo-200 dark:border-indigo-800"
+                >
+                  + Dán mẫu GEMA (viết tắt kiểu thầy cô)
+                </button>
+                {rawText && (
+                  <button
+                    type="button"
+                    onClick={() => setRawText('')}
+                    className="text-xs text-slate-400 hover:text-rose-500 font-semibold"
+                  >
+                    Xóa chữ
+                  </button>
+                )}
+              </div>
+              <textarea
+                rows={9}
+                value={rawText}
+                onChange={(e) => setRawText(e.target.value)}
+                placeholder="Dán ghi chú OneNote tiếng Đức (kể cả gạch đầu dòng viết tắt, thiếu chủ vị ngữ) vào đây..."
+                className="w-full p-4 text-sm bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-2xl text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+            </div>
+          )}
+
+          {/* ==================== TAB 3: BOARD / HANDWRITING PHOTOS ==================== */}
+          {mode === 'images' && (
+            <div className="space-y-3">
+              <div
+                onClick={() => images.length < 3 && imgInputRef.current?.click()}
+                className="border-2 border-dashed border-slate-300 dark:border-slate-700 hover:border-indigo-400 rounded-2xl p-6 text-center cursor-pointer transition space-y-2"
+              >
+                <input
+                  ref={imgInputRef}
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  className="hidden"
+                  onChange={(e) => {
+                    handlePickImages(e.target.files);
+                    e.target.value = '';
+                  }}
+                />
+                <ImageIcon className="w-8 h-8 text-indigo-500 mx-auto" />
+                <p className="text-xs font-bold text-slate-700 dark:text-slate-200">
+                  Chọn tối đa 3 ảnh chụp bảng / vở viết tay / slide ({images.length}/3)
+                </p>
+                <p className="text-[11px] text-slate-400">Tự động nén nhẹ ảnh trước khi gửi AI đọc chữ</p>
+              </div>
+
+              {images.length > 0 && (
+                <div className="grid grid-cols-3 gap-2.5">
+                  {images.map((im, idx) => (
+                    <div key={idx} className="relative rounded-xl overflow-hidden border border-slate-200 dark:border-slate-700 aspect-square bg-slate-100">
+                      <img src={im.dataUrl} alt={im.name} className="w-full h-full object-cover" />
                       <button
                         type="button"
                         onClick={() => setImages((prev) => prev.filter((_, i) => i !== idx))}
-                        className="absolute top-1.5 right-1.5 p-1 bg-rose-600 text-white rounded-lg shadow"
+                        className="absolute top-1.5 right-1.5 p-1 rounded-lg bg-slate-900/80 text-white hover:bg-rose-600"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
-                      <div className="px-2 py-1 text-[10px] font-semibold text-slate-600 dark:text-slate-300 truncate bg-white/90 dark:bg-slate-900/90">
-                        Ảnh {idx + 1}
-                      </div>
                     </div>
                   ))}
                 </div>
               )}
 
-              <input
-                type="text"
+              <textarea
+                rows={3}
                 value={rawText}
                 onChange={(e) => setRawText(e.target.value)}
-                disabled={loading}
-                placeholder="(Tùy chọn) Gợi ý thêm cho AI (VD: Đây là bài Netzplantechnik / chú ý ký hiệu GP = Gesamtpuffer)..."
-                className="w-full px-3.5 py-2.5 text-xs bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white border border-slate-200 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                placeholder="Ghi chú thêm cho AI (không bắt buộc, VD: Đây là môn Rechnungswesen phần Deckungsbeitrag)..."
+                className="w-full p-3 text-xs bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-xl"
               />
             </div>
           )}
 
+          {/* Loading & Error Feedback */}
+          {loading && statusMsg && (
+            <div className="bg-indigo-50 dark:bg-indigo-950/50 border border-indigo-200 dark:border-indigo-800 rounded-2xl p-3.5 flex items-center gap-3 text-xs text-indigo-800 dark:text-indigo-200">
+              <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+              <span>{statusMsg}</span>
+            </div>
+          )}
+
           {error && (
-            <div className="bg-rose-50 dark:bg-rose-950/60 border border-rose-200 dark:border-rose-900 text-rose-700 dark:text-rose-300 text-xs rounded-xl p-3.5 flex items-start gap-2">
+            <div className="bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 rounded-2xl p-3.5 flex items-start gap-2.5 text-xs text-rose-700 dark:text-rose-200">
               <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
               <span>{error}</span>
             </div>
           )}
+        </div>
 
-          {loading && (
-            <div className="bg-indigo-50 dark:bg-indigo-950/50 border border-indigo-200 dark:border-indigo-900 text-indigo-800 dark:text-indigo-200 text-xs rounded-xl p-4 flex items-center gap-3">
-              <Loader2 className="w-5 h-5 animate-spin text-indigo-600 shrink-0" />
-              <div>
-                <p className="font-bold">Gemini 2.5 Flash đang xử lý toàn diện...</p>
-                <p className="opacity-85 mt-0.5">{statusStep}</p>
-              </div>
-            </div>
-          )}
+        {/* Footer */}
+        <div className="p-4 border-t border-slate-100 dark:border-slate-800 flex items-center justify-end gap-2.5 bg-slate-50/60 dark:bg-slate-900/60">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={loading || pdfStage === 'importing'}
+            className="px-4 py-2.5 rounded-xl text-xs font-bold text-slate-600 dark:text-slate-300 hover:bg-slate-200/70 dark:hover:bg-slate-800 disabled:opacity-40"
+          >
+            Hủy
+          </button>
 
-          <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-slate-100 dark:border-slate-800">
+          {mode === 'pdf' ? (
+            pdfStage === 'review' && (
+              <button
+                type="button"
+                onClick={handleRunPdfBatchImport}
+                disabled={selectedGroupsCount === 0}
+                className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white text-xs font-bold shadow-sm flex items-center gap-2"
+              >
+                <Sparkles className="w-4 h-4" />
+                Nạp {selectedGroupsCount} bài đã chọn vào Web
+              </button>
+            )
+          ) : (
             <button
               type="button"
-              onClick={onClose}
+              onClick={handleSubmitTextOrImages}
               disabled={loading}
-              className="px-4 py-2.5 text-sm font-medium text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-xl transition"
-            >
-              Hủy
-            </button>
-            <button
-              type="button"
-              onClick={handleSubmit}
-              disabled={loading}
-              className="px-5 py-2.5 text-sm font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-xl shadow-sm transition flex items-center gap-2 disabled:opacity-60"
+              className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white text-xs font-bold shadow-sm flex items-center gap-2"
             >
               {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
               Phân tích & Thêm vào Web
             </button>
-          </div>
+          )}
         </div>
       </div>
     </div>
