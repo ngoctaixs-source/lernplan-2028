@@ -452,6 +452,7 @@ export default async function handler(req, res) {
     }
 
     const adminActions = [
+      'ocr_pdf_page',
       'import_onenote',
       'filter_pdf_pages',
       'import_exam_batch',
@@ -470,10 +471,55 @@ export default async function handler(req, res) {
     }
 
     // =========================================================================
-    // ACTION 0: TỰ ĐỘNG LỌC TRANG NHÁP & GOM CHỦ ĐỀ TỪ FILE PDF ONENOTE (CÓ VISION ĐỌC ẢNH)
+    // ACTION -1: OCR TỪNG TRANG PDF BẰNG VISION AI (ĐỌC SẠCH 100% CHỮ, SƠ ĐỒ & TÌNH HUỐNG)
+    // =========================================================================
+    if (action === 'ocr_pdf_page') {
+      const { pageNum = 1, image = null, existingText = '' } = payload || {};
+      if (!image?.base64) {
+        return res.status(400).json({ error: 'Thiếu dữ liệu ảnh trang PDF để đọc OCR.' });
+      }
+
+      const prompt = `Du bist ein hochpräzises OCR-System für deutsche Berufsschul-Unterlagen (Veranstaltungskaufmann IHK).
+Lies diese EINE Seite (Seite ${pageNum}) VOLLSTÄNDIG, WORTGETREU und LÜCKENLOS aus!
+
+STRENGE REGELN:
+1. Schreibe JEDEN sichtbaren deutschen Text ab: Überschriften, Fließtext, Aufzählungen, Tabellen, Fußnoten.
+2. BESONDERS WICHTIG — PRAXISFÄLLE & AUFGABEN: Wenn auf der Seite "Situation 1, 2, 3, 4", "Fall A / Fall B", "Übung", "Aufgabe" oder konkrete Beispielfälle stehen, schreibe JEDEN einzelnen Fall vollständig und ungekürzt ab!
+3. SCHEMATA / DIAGRAMME / KÄSTEN: Gib alle Begriffe in Kästen und Pfeilverbindungen klar wieder (z. B. "Objektives Recht -> Privatrecht (BGB, HGB) | Öffentliches Recht (StGB, Grundgesetz)").
+4. Wenn die Seite wirklich KOMPLETT leer ist oder nur sinnlose Striche enthält, antworte exakt mit: [[EMPTY_PAGE]]
+5. Antworte NUR mit dem reinen, sauber strukturierten deutschen Text (kein JSON, keine Einleitung).${
+        existingText?.trim()
+          ? `\n\nBereits maschinell erkannter Teiltext (bitte um alle fehlenden Bild-/Diagramm-/Textteile auf der Seite ergänzen):\n${existingText.trim().slice(0, 1200)}`
+          : ''
+      }`;
+
+      const parts = [
+        { text: prompt },
+        {
+          inlineData: {
+            mimeType: image.mimeType || 'image/jpeg',
+            data: image.base64,
+          },
+        },
+      ];
+
+      const text = await callGemini({ parts, expectJson: false, maxTokens: 3200 });
+      const cleanedText = String(text || '').trim();
+      const isEmpty = cleanedText === '[[EMPTY_PAGE]]' || cleanedText.length < 10;
+      return res.status(200).json({
+        data: {
+          pageNum,
+          text: isEmpty ? '' : cleanedText,
+          isEmpty,
+        },
+      });
+    }
+
+    // =========================================================================
+    // ACTION 0: TỰ ĐỘNG LỌC TRANG NHÁP & GOM CHỦ ĐỀ TỪ TOÀN BỘ NỘI DUNG ĐÃ ĐỌC OCR
     // =========================================================================
     if (action === 'filter_pdf_pages') {
-      const { fileName = 'OneNote.pdf', pages = [], pageImages = [], existingSubjects = [] } = payload || {};
+      const { fileName = 'OneNote.pdf', pages = [], existingSubjects = [] } = payload || {};
       if (!Array.isArray(pages) || pages.length === 0) {
         return res.status(400).json({ error: 'File PDF không có trang nào để phân tích.' });
       }
@@ -482,62 +528,45 @@ export default async function handler(req, res) {
         ? existingSubjects.map((s) => `- ${s.title_de} (${s.title_vn})`).join('\n')
         : '(Chưa có môn nào)';
 
-      const attachedImgNums = new Set((Array.isArray(pageImages) ? pageImages : []).map((im) => Number(im.pageNum)));
-
       const pagesDigest = pages
         .map((p) => {
-          const flags = [];
-          if (p.isBlank) flags.push('TRANG TRẮNG THẬT SỰ');
-          else if (p.hasVisualContent) flags.push('CÓ HÌNH ẢNH / PHIẾU BÀI TẬP / SƠ ĐỒ');
-          if (attachedImgNums.has(Number(p.pageNum))) flags.push('ĐÃ ĐÍNH KÈM ẢNH BÊN DƯỚI ĐỂ BẠN ĐỌC TRỰC TIẾP');
-          else if (!p.isBlank && p.charCount < 160) flags.push('TRANG ẢNH CHƯA ĐÍNH KÈM — MẶC ĐỊNH GIỮ LẠI');
-
-          const preview = p.textPreview
-            ? p.textPreview.slice(0, 700)
-            : p.isBlank
-            ? '(Trang trắng hoàn toàn)'
-            : attachedImgNums.has(Number(p.pageNum))
-            ? '(Chữ nằm trong ảnh/PDF printout — HÃY ĐỌC TRỰC TIẾP ẢNH ĐÍNH KÈM BÊN DƯỚI!)'
-            : '(Chữ nằm trong ảnh/PDF printout — KHÔNG PHẢI TRANG TRỐNG, MẶC ĐỊNH GIỮ LẠI)';
-
-          return `[Trang ${p.pageNum}] (${p.charCount} ký tự${flags.length ? ' | ' + flags.join(' · ') : ''}):\n${preview}`;
+          const textBody = (p.textPreview || '').trim();
+          const status = p.isBlank || !textBody ? 'TRANG TRẮNG' : `${p.charCount || textBody.length} ký tự`;
+          return `[Trang ${p.pageNum}] (${status}):\n${textBody ? textBody.slice(0, 1100) : '(Trang trống hoàn toàn)'}`;
         })
         .join('\n---\n');
 
       const prompt = `Du bist ein erfahrener IHK-Fachlehrer für "Veranstaltungskaufmann" (Deutsch + Vietnamesisch).
-Ein Azubi hat Seiten aus OneNote als PDF ("${fileName}", ${pages.length} Seiten) exportiert.
-WICHTIG: Lehrer fügen in OneNote oft Arbeitsblätter, Fälle und Diagramme als Bilder/Ausdrucke ein (0 getippte Zeichen, aber VOLL mit wichtigem Text im Bild!).
+Ein Azubi hat Seiten aus OneNote als PDF ("${fileName}", ${pages.length} Seiten) exportiert. Alle Seiten wurden bereits per OCR vollständig ausgelesen.
 
-DEINE AUFGABE — SORTIERE JEDE SEITE (1 bis ${pages.length}) SEHR SORGFÄLTIG:
+DEINE AUFGABE — SORTIERE JEDE SEITE (1 bis ${pages.length}) PRÄZISE:
 1. IMMER BEHALTEN (in "groups"):
-   - Seiten mit Theorie, Definitionen, Gesetzen (§ BGB, VStättV, UrhG, GEMA...), Schemata, Tabellen, Diagrammen.
-   - SEHR WICHTIG: Seiten mit PRAXISFÄLLEN, SITUATIONEN, FALLBEISPIELEN, AUFGABEN & ÜBUNGSFÄLLEN (z. B. Situation 1–4, Fall A / Fall B, Fallstudien, Anwendungsfragen) — diese sind die WERTVOLLSTEN Inhalte für die IHK-Prüfung und MÜSSEN IMMER BEHALTEN werden!
-   - Jede Seite mit "CÓ HÌNH ẢNH" / nicht-leere Seiten: Lies das angehängte Bild sorgfältig! Wenn ein Bild nicht angehängt wurde, die Seite aber NICHT "TRANG TRẮNG THẬT SỰ" ist -> IM ZWEIFEL IMMER BEHALTEN!
-2. NUR DANN AUSSORTIEREN (in "skipped_pages"):
-   - Seiten mit "TRANG TRẮNG THẬT SỰ" (komplett leer).
-   - Reine Organisations-/Terminnotizen (Stundenplan, Pausen, "Hausaufgabe bis Montag", Sitzordnung ohne Fachstoff).
-   - Zusammenhanglose Kritzeleien / leere Lückentext-Reste ohne brauchbare Fallbeschreibung oder Theorie.
-3. GRUPPIERUNG:
-   - Fasse zusammengehörige Seiten (z. B. Theorie + zugehörige Praxisfälle/Situationen) in sinnvolle Lektions-Pakete zusammen (maximal 4 Seiten pro Paket).
-   - Wenn eine Seite viele Praxisfälle enthält (z. B. Situation 1–4, Fall A/B), darf sie entweder mit der Theorie zusammen (wenn insgesamt <= 4 Seiten) ODER als eigenes Paket "Praxisfälle & Lösungen" gruppiert werden.
+   - Jede Seite mit Theorie, Definitionen, Gesetzen (§ BGB, VStättV, UrhG, GEMA...), Schemata, Tabellen, Diagrammen.
+   - EXTREM WICHTIG: Jede Seite mit PRAXISFÄLLEN, SITUATIONEN, FALLBEISPIELEN, AUFGABEN (z. B. Situation 1–4, Fall A / Fall B, Übungsfälle) — diese gehören zu den wertvollsten IHK-Lerninhalten!
+2. NUR AUSSORTIEREN (in "skipped_pages"):
+   - Komplett leere Seiten ("TRANG TRẮNG").
+   - Reine Organisations-/Terminnotizen (Pausen, "Hausaufgabe bis Montag", Sitzordnung ohne Fachstoff) oder völlig zusammenhanglose Kritzeleien.
+3. SMARTE GRUPPIERUNG (DAMIT NICHTS ABGESCHNITTEN WIRD):
+   - Packe maximal 2–3 dichte Seiten in EIN Paket!
+   - Wenn eine Datei sowohl Theorie-Seiten (z. B. Seite 1–2) als auch eine dichte Seite mit vielen Praxisfällen (z. B. Situation 1–4 + Fall A/B auf Seite 4) enthält, teile sie sinnvoll in 2 Pakete auf (z. B. Paket 1: Theorie & Übersicht; Paket 2: Praxisfälle & Lösungen), damit die KI JEDEN einzelnen Fall ausführlich lösen kann, ohne etwas zu kürzen!
 
 Bestehende Fächer in der App:
 ${subjectListText}
 
-SEITEN-ÜBERSICHT:
+VOLLSTÄNDIGE SEITEN-ÜBERSICHT:
 ${pagesDigest}
 
 ANTWORTE NUR ALS VALIDES JSON:
 {
-  "summary_vn": "Tóm tắt ngắn gọn bằng tiếng Việt (nêu rõ giữ mấy bài lý thuyết/tình huống thực tế, bỏ mấy trang trống/nháp)",
+  "summary_vn": "Tóm tắt ngắn gọn bằng tiếng Việt (nêu rõ giữ mấy bài/tình huống, bỏ mấy trang trống/nháp)",
   "groups": [
     {
       "id": "g1",
       "title_de": "Thementitel Deutsch",
       "title_vn": "Tên bài học tiếng Việt",
       "subject_hint": "Tên môn học phù hợp",
-      "pageNums": [1, 2, 3, 4],
-      "reason_vn": "Lý do giữ lại (nêu cụ thể có lý thuyết gì, có các tình huống/câu hỏi thực tế nào)"
+      "pageNums": [1, 2],
+      "reason_vn": "Mô tả cụ thể nội dung của các trang này (VD: Lý thuyết Luật tư/Luật công + Sơ đồ hệ thống pháp luật)"
     }
   ],
   "skipped_pages": [
@@ -549,27 +578,12 @@ ANTWORTE NUR ALS VALIDES JSON:
   ]
 }`;
 
-      const parts = [{ text: prompt }];
-      if (Array.isArray(pageImages)) {
-        for (const img of pageImages.slice(0, 5)) {
-          if (img?.base64) {
-            parts.push({ text: `>>> ẢNH XEM TRƯỚC TRANG ${img.pageNum} (HÃY ĐỌC KỸ NỘI DUNG TRONG ẢNH NÀY):` });
-            parts.push({
-              inlineData: {
-                mimeType: img.mimeType || 'image/jpeg',
-                data: img.base64,
-              },
-            });
-          }
-        }
-      }
-
-      const result = await callGemini({ parts, expectJson: true, maxTokens: 4000 });
+      const result = await callGemini({ parts: [{ text: prompt }], expectJson: true, maxTokens: 4000 });
       return res.status(200).json({ data: result });
     }
 
     // =========================================================================
-    // ACTION 1: NHẬP KIẾN THỨC ONENOTE / PDF / CHỮ VIẾT TAY + GIẢI ĐÁP TÌNH HUỐNG THỰC TẾ
+    // ACTION 1: NHẬP KIẾN THỨC ONENOTE / PDF / CHỮ VIẾT TAY + GIẢI ĐÁP ĐẦY ĐỦ MỌI TRANG & TÌNH HUỐNG
     // =========================================================================
     if (action === 'import_onenote') {
       const { rawText = '', images = [], existingSubjects = [] } = payload || {};
@@ -585,47 +599,44 @@ ANTWORTE NUR ALS VALIDES JSON:
       const prompt = `Du bist ein erfahrener IHK-Prüfer und Fachlehrer für "Veranstaltungskaufmann / Veranstaltungskauffrau" in Deutschland, der perfekt Deutsch und Vietnamesisch spricht.
 
 AUFGABE:
-Analysiere das bereitgestellte Unterrichtsmaterial (OneNote-Text, PDF-Seiten und/oder Fotos von Arbeitsblättern, Tafelanschrieben, Handschrift, Folien).
+Verarbeite das GESAMTE bereitgestellte Unterrichtsmaterial (ALLE angegebenen Seiten "--- Seite 1 ---", "--- Seite 2 ---", "--- Seite 3 ---", "--- Seite 4 ---" usw.) vollständig zu hochwertigem, prüfungstauglichem Lernmaterial!
 
-WICHTIGE REGELN:
-1. HANDSCHRIFT, BILDER & ABKÜRZUNGEN KORRIGIEREN:
-   - Lies ALLE angehängten Fotos/PDF-Seiten vollständig und sorgfältig aus (OCR)!
-   - Wandle bruchstückhafte Stichpunkte oder Abkürzungen (VA, TN, MA, RO, BGB, VStättV, K, E, DB...) in vollständige, grammatikalisch saubere, prüfungstaugliche deutsche Sätze im IHK-Stil um, OHNE fachliche Originalbegriffe und Paragraphen zu verlieren!
-2. PRAXISFÄLLE, SITUATIONEN & FRAGEN IM MATERIAL IMMER VOLLSTÄNDIG LÖSEN & ERKLÄREN (EXTREM WICHTIG!):
-   - Wenn das Material konkrete Praxisbeispiele, Situationen, Fallstudien oder Aufgaben enthält (z. B. "Situation 1, 2, 3, 4", "Fall A", "Fall B", "Aufgabe 1", konkrete Rechts-/Kalkulationsfälle):
-     * ÜBERSPRINGE SIE NIEMALS!
-     * Erstelle dafür eigene, klar gegliederte Abschnitte in "sections" (z. B. "Praxisfälle & Lösungen: Situation 1–4 / Phân tích & Giải đáp chi tiết từng tình huống").
-     * Gehe JEDEN einzelnen Fall / JEDE Situation konkret durch:
-       1) Kurzfassung des Sachverhalts (DE + VN),
-       2) Konkrete IHK-Antwort / Zuordnung / Berechnung,
-       3) Präzise fachliche & rechtliche Begründung WARUM das in genau dieser Situation gilt (z. B. Gleichordnung vs. Über-/Unterordnung, konkrete Gesetze/Paragraphen/Begriffe) — komplett zweisprachig (DE + VN)!
-     * Übernimm außerdem die besten konkreten Praxisfälle/Situationen direkt als Prüfungsfragen in "quiz_questions" (mit vollständiger Musterlösung & Erklärung)!
+PFLICHTREGELN (SEHR WICHTIG):
+1. ALLE SEITEN VOLLSTÄNDIG VERARBEITEN — NICHTS WEGLASSEN!
+   - Lies JEDE einzelne Seite im Input bis zum allerletzten Satz durch!
+   - Stoppe NIEMALS nach Seite 1! Jede Seite (Theorie, Diagramme, Vergleiche, UND jede einzelne Situation/Aufgabe auf späteren Seiten) MUSS sich klar in "sections" wiederfinden.
+   - Korrigiere Stichpunkte und Abkürzungen (VA, TN, MA, RO, BGB, VStättV, K, E, DB...) zu sauberem, grammatikalisch korrektem IHK-Prüfungsdeutsch.
+2. JEDEN PRAXISFALL / JEDE SITUATION / JEDE AUFGABE KONKRET LÖSEN & ERKLÄREN!
+   - Wenn das Material konkrete Fälle, Situationen oder Aufgaben enthält (z. B. "Situation 1", "Situation 2", "Situation 3", "Situation 4", "Fall A", "Fall B", "Aufgabe 1"...):
+     * Erstelle für die Praxisfälle eigene, übersichtliche Abschnitte in "sections" (gern 1 Abschnitt pro 1–2 Fälle, damit die Lösung gründlich und leicht lesbar bleibt!).
+     * Bearbeite JEDEN EINZELNEN Fall konkret nach diesem Schema (sowohl in content_de als auch in content_vn):
+       - **Sachverhalt / Tóm tắt tình huống:** Worum geht es genau?
+       - **Lösung / Đáp án chuẩn IHK:** Klare Zuordnung / Entscheidung / Berechnung (z. B. Privatrecht vs. Öffentliches Recht, welches Gesetz/Rechtsgebiet gilt).
+       - **Begründung / Giải thích cụ thể tại sao:** Präzise rechtliche bzw. fachliche Begründung für genau diesen Fall (z. B. Verhältnis Gleichordnung vs. Über-/Unterordnung, Vertrag zwischen Privatpersonen vs. hoheitliches Handeln des Staates, relevante Paragraphen/Begriffe).
+     * Übernimm die besten Praxisfälle außerdem als konkrete Fragen in "quiz_questions" (mit vollständiger Musterlösung & Erklärung)!
 3. FACHZUORDNUNG & LEKTIONEN:
    - Ordne den Stoff einem bestehenden Fach zu ODER erstelle ein neues Fach.
    Bestehende Fächer:
    ${subjectListText}
-   - Zerlege den Inhalt in 1 bis 3 logisch geordnete Lektionen: "foundation" (Nền tảng) -> "connected" (Liên kết) -> "advanced" (Mở rộng).
-4. TABELLEN & DIAGRAMME (für Kalkulation, Rechnungswesen, Netzplan, Prozesse, Rechtsvergleiche):
-   - Nutze saubere Markdown-Tabellen (| Spalte 1 | Spalte 2 |) direkt in content_de und content_vn, wenn Vergleiche (z. B. Privatrecht vs. Öffentliches Recht) oder Tabellen sinnvoll sind.
+   - Erstelle 1 bis 2 logisch aufgebaute Lektionen ("foundation" -> "connected" -> "advanced").
+4. TABELLEN & DIAGRAMME:
+   - Nutze saubere Markdown-Tabellen (| Spalte 1 | Spalte 2 |) direkt in content_de und content_vn (z. B. für Vergleiche wie Privatrecht vs. Öffentliches Recht oder Kalkulationen).
    - Optional "diagram_json" in EINEM dieser Formate (sonst null):
      a) Break-even-Point: {"type":"break_even","title":"...","kf":6000,"kv":6,"price":26,"unit":"Tickets","currency":"€"}
      b) Buchhaltung T-Konto: {"type":"t_konto","title":"...","account":"Bank / Kasse","soll":[{"label":"Anfangsbestand","amount":"10.000 €"}],"haben":[{"label":"Miete","amount":"2.500 €"}]}
-     c) Prozess / Netzplan / Struktur: {"type":"flow","title":"...","steps":[{"title":"Schritt 1","subtitle":"Beschreibung","badge":"Tag 1 / Merkmal"}]}
+     c) Prozess / Struktur / Übersicht: {"type":"flow","title":"...","steps":[{"title":"Schritt 1","subtitle":"Beschreibung","badge":"Merkmal"}]}
      d) Balkendiagramm: {"type":"bar","title":"...","unit":"€","items":[{"label":"Miete","value":4000},{"label":"Technik","value":2500}]}
 5. YOUTUBE-LERNVIDEOS:
    - Gib pro Abschnitt 2 präzise deutsche YouTube-Suchbegriffe in "video_keywords" an (z. B. Simpleclub, Studyflix, IHK-Erklärung).
 6. FACHWORTSCHATZ (VOKABELN) PRO LEKTION:
-   - Extrahiere 6 bis 12 wichtige deutsche Fachwörter/Verben/Adjektive aus jeder Lektion:
+   - Extrahiere 8 bis 14 wichtige deutsche Fachwörter/Verben/Adjektive aus ALLEN Seiten der Lektion:
      * Bei Nomen IMMER exakten Artikel ("der" / "die" / "das") und Pluralform ("die ...") angeben.
      * Bei anderen Wortarten article: "", plural: "", word_type genau benennen ("Verb", "Adjektiv", "Abkürzung", "Redewendung").
      * Immer mit vietnamesischer Bedeutung, konkretem Praxisbeispiel (DE + VN) und Grammatik-/Prüfungshinweis.
-7. ADAPTIVE TESTFRAGEN (UMFASSEND + PRAXISFÄLLE):
-   - Kurze Lektion (1-2 Abschnitte): 5-6 Fragen
-   - Mittlere Lektion (3-4 Abschnitte): 7-9 Fragen
-   - Lange Lektion (5+ Abschnitte): 10-12 Fragen
-   - Gute Mischung aus Multiple-Choice ("mc") und offenen Situations-/Rechenaufgaben ("essay"). Nutze bevorzugt die konkreten Situationen/Fälle aus dem Unterrichtsmaterial!
+7. UMFASSENDE TESTFRAGEN (INKL. PRAXISFÄLLE):
+   - Erstelle 6 bis 10 abwechslungsreiche Fragen (Mix aus "mc" und "essay"), die sowohl Theorie als auch die konkreten Praxisfälle/Situationen aus dem Material abfragen!
 8. FLASHCARDS:
-   - Erstelle 5 bis 8 präzise zweisprachige Flashcards pro Lektion.
+   - Erstelle 6 bis 10 präzise zweisprachige Flashcards pro Lektion.
 
 ANTWORTE AUSSCHLIESSLICH MIT VALIDEM JSON:
 {
@@ -647,8 +658,8 @@ ANTWORTE AUSSCHLIESSLICH MIT VALIDEM JSON:
         {
           "heading_de": "1. Überschrift",
           "heading_vn": "1. Tiêu đề",
-          "content_de": "Sauber ausformulierter Fachtext (inkl. Tabellen oder konkreter Falllösungen)",
-          "content_vn": "Bản dịch & giải thích tiếng Việt rõ ràng",
+          "content_de": "Ausführlicher Fachtext (inkl. Tabellen oder konkreter Falllösungen)",
+          "content_vn": "Bản dịch & giải thích tiếng Việt chi tiết, dễ hiểu",
           "diagram_json": null,
           "video_keywords": [
             {"label": "Video giải thích ngắn", "query": "exakte deutsche YouTube Suchanfrage"}
@@ -707,7 +718,7 @@ ANTWORTE AUSSCHLIESSLICH MIT VALIDEM JSON:
   ]
 }
 
-${rawText.trim() ? `ZUSÄTZLICHER TEXT / HINWEIS:\n${rawText.trim()}` : 'Lies alle angehängten Fotos/PDF-Seiten vollständig aus (OCR), löse alle darin enthaltenen Situationen/Fälle/Aufgaben konkret und korrigiere Stichpunkte zu klarem Prüfungsdeutsch.'}`;
+${rawText.trim() ? `VOLLSTÄNDIGES UNTERRICHTSMATERIAL (BITTE ALLE SEITEN & FÄLLE VERARBEITEN):\n${rawText.trim()}` : 'Lies alle angehängten Fotos vollständig aus (OCR), löse alle darin enthaltenen Situationen/Fälle/Aufgaben konkret und korrigiere Stichpunkte zu klarem Prüfungsdeutsch.'}`;
 
       const parts = [{ text: prompt }];
       if (Array.isArray(images)) {
