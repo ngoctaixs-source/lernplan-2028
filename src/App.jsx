@@ -66,6 +66,7 @@ import SettingsView from './components/SettingsView';
 
 const LOCAL_PREFS_KEY = 'lernplan2028_prefs_v2';
 const LOCAL_GUEST_KEY = 'lernplan2028_guest_v2';
+const LOCAL_DICT_CACHE_KEY = 'lernplan2028_dict_cache_v2';
 
 export default function App() {
   // User Preferences (Dark Mode, Font Scale, Dict Mode, TTS, VN)
@@ -141,8 +142,14 @@ export default function App() {
   const [sectionNotes, setSectionNotes] = useState({}); // { [sectionId]: string }
   const [wrongQuestions, setWrongQuestions] = useState([]);
 
-  // Dictionary Cache & Popover State
-  const [dictCache, setDictCache] = useState({}); // { [wordKey]: entry }
+  // Dictionary Cache & Popover State (lưu sẵn localStorage để tra lại mất 0ms)
+  const [dictCache, setDictCache] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem(LOCAL_DICT_CACHE_KEY) || '{}') || {};
+    } catch {
+      return {};
+    }
+  }); // { [wordKey]: entry }
   const [wordLookup, setWordLookup] = useState(null); // { word, loading, data, error, saved }
 
   // Lesson Study UI State
@@ -234,11 +241,18 @@ export default function App() {
       if (!exRes.error) setMockExams(exRes.data || []);
       if (!exQRes.error) setMockExamQuestions(exQRes.data || []);
       if (!dictRes.error && dictRes.data) {
-        const cacheMap = {};
-        dictRes.data.forEach((d) => {
-          cacheMap[d.word_key] = d;
+        setDictCache((prev) => {
+          const merged = { ...prev };
+          dictRes.data.forEach((d) => {
+            if (d?.word_key) merged[d.word_key] = d;
+          });
+          try {
+            localStorage.setItem(LOCAL_DICT_CACHE_KEY, JSON.stringify(merged));
+          } catch {
+            // ignore quota
+          }
+          return merged;
         });
-        setDictCache(cacheMap);
       }
       if (vocRes.error || exRes.error) {
         setDataError(
@@ -352,18 +366,39 @@ export default function App() {
     [wrongQuestions]
   );
 
-  // ==================== CLICK-TO-TRANSLATE DICTIONARY HANDLER ====================
+  // ==================== CLICK-TO-TRANSLATE DICTIONARY HANDLER (0ms LOCAL + SIÊU TỐC) ====================
   const handleWordClick = async (rawWord, contextSentence = '') => {
     const cleaned = rawWord.trim();
     if (!cleaned) return;
     const key = cleaned.toLowerCase();
 
-    // Instant 0ms lookup from dictionary cache!
+    // Tầng 1 (0ms): Đã từng tra trước đó (RAM / localStorage / Supabase cache)
     if (dictCache[key]) {
       setWordLookup({ word: cleaned, loading: false, data: dictCache[key], error: '', saved: false });
       return;
     }
 
+    // Tầng 2 (0ms): Đã có sẵn trong kho Từ vựng IHK của các bài học
+    const vocabMatch = vocabularies.find(
+      (v) => (v.word_de || '').trim().toLowerCase() === key
+    );
+    if (vocabMatch) {
+      const entry = {
+        word_key: key,
+        lemma_de: vocabMatch.word_de || cleaned,
+        article: vocabMatch.article || '',
+        plural: vocabMatch.plural || '',
+        word_type: vocabMatch.word_type || 'Fachbegriff',
+        meaning_vn: vocabMatch.meaning_vn || '',
+        example_de: vocabMatch.example_de || '',
+        example_vn: vocabMatch.example_vn || '',
+        grammar_note_vn: vocabMatch.grammar_note_vn || '',
+      };
+      setWordLookup({ word: cleaned, loading: false, data: entry, error: '', saved: true });
+      return;
+    }
+
+    // Tầng 3 (~0.3-0.5s): Từ hoàn toàn mới -> gọi Groq llama-3.1-8b-instant siêu tốc
     setWordLookup({ word: cleaned, loading: true, data: null, error: '', saved: false });
     try {
       const data = await callGeminiApi('lookup_word', { word: cleaned, contextSentence });
@@ -379,11 +414,19 @@ export default function App() {
         grammar_note_vn: data.grammar_note_vn || '',
       };
 
-      setDictCache((prev) => ({
-        ...prev,
-        [key]: entry,
-        [(entry.lemma_de || '').toLowerCase()]: entry,
-      }));
+      setDictCache((prev) => {
+        const next = {
+          ...prev,
+          [key]: entry,
+          ...(entry.lemma_de ? { [entry.lemma_de.toLowerCase()]: entry } : {}),
+        };
+        try {
+          localStorage.setItem(LOCAL_DICT_CACHE_KEY, JSON.stringify(next));
+        } catch {
+          // ignore storage quota
+        }
+        return next;
+      });
       setWordLookup({ word: cleaned, loading: false, data: entry, error: '', saved: false });
 
       // Save to Supabase shared dictionary_cache asynchronously
@@ -601,12 +644,31 @@ export default function App() {
     setSections((prev) => prev.map((s) => (s.id === sec.id ? { ...s, video_urls: updatedVideos } : s)));
   };
 
-  // ==================== ADMIN: IMPORT ONENOTE / HANDWRITING ====================
-  const handleSaveImportedData = async (aiResult, firstBoardPhotoUrl = '') => {
+  // ==================== ADMIN: IMPORT ONENOTE / PDF / HANDWRITING ====================
+  const handleSaveImportedData = async (aiResult, firstBoardPhotoUrl = '', options = {}) => {
     if (!supabase || !isAdmin) throw new Error('Chỉ Admin mới có quyền thêm bài.');
+    if (!Array.isArray(aiResult?.lessons) || aiResult.lessons.length === 0) {
+      throw new Error('AI không trả về bài học nào hợp lệ.');
+    }
 
     let subjectId = aiResult.existing_subject_id;
-    if (!subjectId || !subjects.some((s) => s.id === subjectId)) {
+    let subjectObj = subjects.find((s) => s.id === subjectId) || null;
+    if (!subjectId || !subjectObj) {
+      // Kiểm tra trong DB tránh tạo trùng môn khi nạp hàng loạt từ PDF
+      const candidateDe = (aiResult.subject?.title_de || '').trim();
+      if (candidateDe) {
+        const { data: existingByTitle } = await supabase
+          .from('subjects')
+          .select('*')
+          .ilike('title_de', candidateDe)
+          .limit(1);
+        if (existingByTitle && existingByTitle[0]) {
+          subjectId = existingByTitle[0].id;
+          subjectObj = existingByTitle[0];
+        }
+      }
+    }
+    if (!subjectId || !subjectObj) {
       const { data: newSub, error: subErr } = await supabase
         .from('subjects')
         .insert({
@@ -620,6 +682,7 @@ export default function App() {
         .single();
       if (subErr) throw subErr;
       subjectId = newSub.id;
+      subjectObj = newSub;
     }
 
     const existingLessonCount = lessons.filter((l) => l.subject_id === subjectId).length;
@@ -715,8 +778,28 @@ export default function App() {
       }
     }
 
+    if (!options.silent) {
+      await loadCurriculum();
+      showToast(`Đã nạp ${aiResult.lessons.length} bài học kèm Từ vựng, Flashcard & Bài Test bao quát!`);
+      if (firstCreatedLessonId) {
+        openLesson(firstCreatedLessonId);
+      }
+    }
+    return {
+      subjectId,
+      subjectObj,
+      firstCreatedLessonId,
+      lessonsCount: aiResult.lessons.length,
+    };
+  };
+
+  const handleBatchImportComplete = async (firstCreatedLessonId, totalLessons, failList = []) => {
     await loadCurriculum();
-    showToast(`Đã nạp ${aiResult.lessons.length} bài học kèm Từ vựng, Flashcard & Bài Test bao quát!`);
+    if (failList.length > 0) {
+      showToast(`Đã nạp ${totalLessons} bài học (${failList.length} cụm bị lỗi nhẹ).`, 'success');
+    } else {
+      showToast(`Đã tự động lọc & nạp thành công ${totalLessons} bài học từ file PDF!`);
+    }
     if (firstCreatedLessonId) {
       openLesson(firstCreatedLessonId);
     }
@@ -2204,6 +2287,7 @@ export default function App() {
           subjects={subjects}
           onClose={() => setShowImportModal(false)}
           onSaveImportedData={handleSaveImportedData}
+          onBatchComplete={handleBatchImportComplete}
         />
       )}
 
