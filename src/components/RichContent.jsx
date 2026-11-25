@@ -265,7 +265,7 @@ function MathExpr({ expr, display = false }) {
     );
   }
 
-  const hasFraction = /\(?:d|t)?frac/.test(cleaned);
+  const hasFraction = /\\(?:d|t)?frac\b/.test(cleaned);
   return (
     <span
       className={
@@ -369,7 +369,7 @@ function renderClickableInline(text, dictMode, onWordClick, contextText, keyPref
       if (closeIdx !== -1) {
         const inner = text.slice(i + 1, closeIdx);
         // Guard against stray currency pairs unless math-like
-        const looksLikeCurrencyPair = /^\d[\d.,]*\s+[A-Za-z]/.test(inner) && !/[=+\-*/\\^_€]/.test(inner);
+        const looksLikeCurrencyPair = /^\d[\d.,]*\s+[A-Za-z]/.test(inner) && !/[=+\-*\/\\^_€]/.test(inner);
         if (!looksLikeCurrencyPair) {
           flushPlain();
           nodes.push(<MathExpr key={`${keyPrefix}-im${k++}`} expr={inner} />);
