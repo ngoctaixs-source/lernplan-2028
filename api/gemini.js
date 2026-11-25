@@ -627,16 +627,21 @@ PFLICHTREGELN (SEHR WICHTIG):
         2. **Thay số (Einsetzen):** 573.000 € − (195.000 € + 42.000 €)
         3. **Kết quả (Ergebnis):** = **336.000,00 €**
         4. **Giải thích bản chất (Warum?):** Warum steht das im Soll/Haben? Warum × 1,19 bzw. ÷ 1,19?
-   c) **HƯỚNG DẪN BẤM MÁY TÍNH CẦM TAY CASIO (Casio-Tastenfolge — BẮT BUỘC KHI CÓ TÍNH TOÁN!):**
-      - In der IHK-Prüfung ist ein nicht-programmierbarer Casio-Taschenrechner (z. B. Casio fx-82 / fx-85 / fx-991DE X / Casio Tischrechner) erlaubt.
-      - Füge bei JEDEM Rechenabschnitt im Text (besonders klar in content_vn, und kurz in content_de) einen eigenen Block **"Bấm máy tính Casio:"** ein mit der EXAKTEN Tastenfolge in eckigen Klammern!
-      - Beispiele für saubere Casio-Tastenfolgen:
-        * Netto -> 19% USt/VSt: \`[ 5250 ] [ × ] [ 0.19 ] [ = ]\` → \`997,50 €\` (Nếu Casio hiện phân số như \`1995/2\`, bấm thêm phím \`[ S⇔D ]\`)
-        * Netto -> Brutto (+19%): \`[ 5250 ] [ × ] [ 1.19 ] [ = ]\` → \`6.247,50 €\`
-        * Brutto -> Netto (rút thuế 19%): \`[ 476 ] [ ÷ ] [ 1.19 ] [ = ]\` → \`400,00 €\` (Lưu ý: tuyệt đối không bấm \`- 19%\`!)
-        * Eigenkapital / Saldo: \`[ 573000 ] [ - ] [ 195000 ] [ - ] [ 42000 ] [ = ]\` → \`336.000 €\`
-        * Break-even / Bruch: \`[ 6000 ] [ ÷ ] [ ( ] [ 26 ] [ - ] [ 6 ] [ ) ] [ = ]\` → \`300\`
-        * Preiselastizität: \`[ ( ] [ ( ] [ x2 ] [ - ] [ x1 ] [ ) ] [ ÷ ] [ x1 ] [ ) ] [ ÷ ] [ ( ] [ ( ] [ p2 ] [ - ] [ p1 ] [ ) ] [ ÷ ] [ p1 ] [ ) ] [ = ]\`
+   c) **HƯỚNG DẪN BẤM MÁY TÍNH CASIO fx-580VN X (CHUẨN PHÍM MÁY THẬT — BẮT BUỘC KHI CÓ TÍNH TOÁN!):**
+      - Der Azubi nutzt exakt das Modell **Casio fx-580VN X** (baugleich mit Casio fx-991DE X ClassWiz).
+      - Füge bei JEDEM Rechenabschnitt im Text (besonders klar in content_vn, und kurz in content_de) einen eigenen Block **"Bấm máy Casio fx-580VN X:"** ein mit der EXAKTEN Tastenfolge in eckigen Klammern!
+      - Nutze gezielt die Stärken des **Casio fx-580VN X**:
+        * **Phím phân số \`[ ■/□ ]\`** (+ \`[ ▼ ]\` xuống mẫu, \`[ ▶ ]\` thoát phân số) cho mọi công thức chia / Break-even / Preiselastizität / Kalkulationsfaktor thay vì lồng nhiều dấu ngoặc rối mắt!
+        * **Phím \`[ Ans ]\`** để nối phép tính liên tiếp (ví dụ tính Netto xong bấm thẳng \`[ × ] [ 0.19 ] [ = ]\` ra thuế mà không cần gõ lại số).
+        * **Phím \`[ S⇔D ]\`** nhắc chuyển phân số sang số thập phân (nếu máy đang ở chế độ ToánV/ToánR).
+        * **Tính năng \`SOLVE\`** (\`[ x ]\` để nhập ẩn, \`[ ALPHA ] [ CALC ]\` để gõ dấu \`=\`, rồi \`[ SHIFT ] [ CALC ]\` → \`[ = ]\`) cho các bài tính ngược tìm ẩn (VD: tìm giá bán p, tìm Eigenkapital, tính ngược Rabatt / Skonto, hoặc dò lại đáp án).
+        * **Phím lưu biến \`[ STO ] [ A ]\`** (và gọi lại bằng \`[ ALPHA ] [ A ]\`) khi bài kế toán / BAB / Handelskalkulation có số trung gian phải dùng lại nhiều lần.
+      - Beispiele für exakte **Casio fx-580VN X** Tastenfolgen:
+        * Netto → 19% USt/VSt → Brutto nối bằng Ans: \`[ 5250 ] [ × ] [ 0.19 ] [ = ]\` → \`997,50 €\` (hiện phân số bấm \`[ S⇔D ]\`), hoặc tính thẳng Brutto: \`[ 5250 ] [ × ] [ 1.19 ] [ = ]\` → \`6.247,50 €\`
+        * Brutto → Netto rồi lấy ngay thuế bằng Ans: \`[ 476 ] [ ÷ ] [ 1.19 ] [ = ]\` → \`400,00 €\`, bấm tiếp \`[ × ] [ 0.19 ] [ = ]\` → \`76,00 €\` (Lưu ý: tuyệt đối KHÔNG bấm \`- 19%\`!)
+        * Break-even bằng phím phân số: \`[ ■/□ ] [ 6000 ] [ ▼ ] [ 26 ] [ - ] [ 6 ] [ = ]\` → \`300\`
+        * Preiselastizität bằng phím phân số lồng nhau: \`[ ■/□ ] [ ■/□ ] [ x2 - x1 ] [ ▼ ] [ x1 ] [ ▼ ] [ ■/□ ] [ p2 - p1 ] [ ▼ ] [ p1 ] [ = ] [ S⇔D ]\`
+        * Tính ngược / dò ẩn x bằng SOLVE (VD tìm giá vé p hòa vốn ở 300 vé): nhập \`[ 300 ] [ × ] [ ( ] [ x ] [ - ] [ 6 ] [ ) ] [ ALPHA ] [ CALC ] [ 6000 ]\`, bấm \`[ SHIFT ] [ CALC ] [ = ]\` → \`x = 26\`
 3. PRAXISFÄLLE & SITUATIONEN VOLLSTÄNDIG LÖSEN:
    - Wenn das Material konkrete Fälle/Situationen enthält ("Situation 1–4", "Fall A/B", "Geschäftsfälle 1–11"), bearbeite JEDEN einzelnen Fall konkret mit Sachverhalt, IHK-Lösung und Begründung (DE + VN)!
 4. VISUELLE DIAGRAMME, T-KONTEN & KURVEN ("diagram_json"):
@@ -690,8 +695,8 @@ ANTWORTE AUSSCHLIESSLICH MIT VALIDEM JSON:
         {
           "heading_de": "1. Überschrift",
           "heading_vn": "1. Tiêu đề",
-          "content_de": "Ausführlicher Fachtext im IHK-Standard (inkl. Markdown-Tabellen, Rechenwegen & Casio-Tastenfolge)",
-          "content_vn": "Giải thích từng bước cực dễ hiểu bằng tiếng Việt (kèm bảng, cách tính và hướng dẫn bấm máy Casio cụ thể)",
+          "content_de": "Ausführlicher Fachtext im IHK-Standard (inkl. Markdown-Tabellen, Rechenwegen & Casio fx-580VN X Tastenfolge)",
+          "content_vn": "Giải thích từng bước cực dễ hiểu bằng tiếng Việt (kèm bảng, cách tính và hướng dẫn bấm máy Casio fx-580VN X cụ thể)",
           "diagram_json": null,
           "video_keywords": [
             {"label": "Video giải thích ngắn", "query": "exakte deutsche YouTube Suchanfrage"}
@@ -734,14 +739,14 @@ ANTWORTE AUSSCHLIESSLICH MIT VALIDEM JSON:
           ],
           "correct_index": 0,
           "explanation_de": "Begründung / Rechenweg DE",
-          "explanation_vn": "Giải thích / Cách bấm Casio VN"
+          "explanation_vn": "Giải thích / Cách bấm Casio fx-580VN X VN"
         },
         {
           "q_type": "essay",
           "question_de": "Situations-/Rechen-/Buchungsaufgabe DE",
           "question_vn": "Tình huống / Bài toán / Định khoản VN",
           "model_answer_de": "IHK-Musterlösung inkl. Rechenweg DE",
-          "model_answer_vn": "Đáp án mẫu chi tiết + hướng dẫn bấm Casio VN",
+          "model_answer_vn": "Đáp án mẫu chi tiết + hướng dẫn bấm Casio fx-580VN X VN",
           "explanation_de": "Bewertungshinweis DE",
           "explanation_vn": "Lưu ý ăn điểm / tránh bẫy IHK VN"
         }
@@ -787,7 +792,7 @@ AUFGABE:
 Extrahiere JEDE Aufgabe aus dem Text / den angehängten Klausurseiten sauber und vollständig.
 - Behalte Tabellen (als Markdown-Tabellen), Zahlen, Paragraphen und Situationsbeschreibungen exakt bei!
 - Multiple-Choice -> q_type: "mc" mit options und correct_index.
-- Offene Text-, Rechen- oder Zeichnungsaufgabe -> q_type: "essay" mit ausführlicher IHK-Musterlösung (inkl. Rechenweg!).
+- Offene Text-, Rechen- oder Zeichnungsaufgabe -> q_type: "essay" mit ausführlicher IHK-Musterlösung (inkl. Rechenweg UND bei Rechenaufgaben mit konkreter Casio fx-580VN X Tastenfolge wie [ ■/□ ], [ Ans ], [ S⇔D ] oder SOLVE in model_answer_vn!).
 - Schätze realistische IHK-Punkte (5, 10, 15 oder 20) oder übernimm Originalpunkte.
 - Übersetze jede Aufgabe klar ins Vietnamesische (question_vn).
 
@@ -837,7 +842,7 @@ ${rawText.trim() ? `KLAUSUR-TEXT:\n${rawText.trim()}` : 'Lies alle Aufgaben voll
     if (action === 'explain_section') {
       const { lessonTitle, headingDe, contentDe } = payload || {};
       const prompt = `Du erklärst einem Auszubildenden (Veranstaltungskaufmann, Deutsch B2, Muttersprache Vietnamesisch) einen Berufsschul-Abschnitt extrem verständlich und praxisnah.
-Wenn der Abschnitt Rechnungswesen, Kalkulation, Prozentrechnung oder Mathematik enthält: erkläre die Rechenlogik Schritt für Schritt UND gib die genaue Casio-Taschenrechner-Tastenfolge (z. B. [ 5250 ] [ × ] [ 1.19 ] [ = ], [ S⇔D ]) mit an!
+Wenn der Abschnitt Rechnungswesen, Kalkulation, Prozentrechnung oder Mathematik enthält: erkläre die Rechenlogik Schritt für Schritt UND gib die genaue **Casio fx-580VN X** Tastenfolge an (nutze gezielt [ ■/□ ] + [ ▼ ] für Brüche, [ Ans ] für Kettenrechnungen, [ S⇔D ] für Dezimalzahlen und bei Rückwärtsrechnungen SOLVE: [ x ], [ ALPHA ] [ CALC ], [ SHIFT ] [ CALC ] [ = ])!
 
 Lektion: ${lessonTitle || ''}
 Abschnitt: ${headingDe || ''}
@@ -846,10 +851,10 @@ Originaltext: ${contentDe || ''}
 ANTWORTE NUR ALS VALIDES JSON:
 {
   "explanation_de": "Sehr einfache, alltagsnahe Erklärung auf Deutsch (2-5 Sätze, bei Rechenthemen inkl. klarer Schrittfolge)",
-  "explanation_vn": "Giải thích siêu dễ hiểu bằng tiếng Việt (tách rõ từng bước tính và phím bấm Casio nếu là bài tính toán)",
+  "explanation_vn": "Giải thích siêu dễ hiểu bằng tiếng Việt (tách rõ từng bước tính và tổ hợp phím Casio fx-580VN X nếu là bài tính toán)",
   "example_de": "Konkretes Praxisbeispiel / Zahlenbeispiel aus der Eventbranche auf Deutsch",
   "example_vn": "Bản dịch ví dụ thực tế / ví dụ số liệu tiếng Việt",
-  "exam_tip_vn": "Mẹo ăn điểm thi IHK (kèm mẹo bấm máy Casio tránh sai số hoặc từ khóa tiếng Đức bắt buộc)"
+  "exam_tip_vn": "Mẹo ăn điểm thi IHK (kèm mẹo bấm Casio fx-580VN X như dùng [ ■/□ ], [ Ans ], SOLVE tránh sai số hoặc từ khóa tiếng Đức bắt buộc)"
 }`;
 
       const result = await callGemini({ parts: [{ text: prompt }], expectJson: true });
@@ -881,7 +886,7 @@ Bewerte die folgenden offenen Aufgaben. Der Prüfling darf auf Deutsch, Vietname
 
 WICHTIG BEI FOTOS VON HANDSCHRIFTLICHEN LÖSUNGEN:
 - Lies den handgeschriebenen Rechenweg, Zahlen, Tabellen, T-Konten oder gezeichneten Diagramme (Achsen, Schnittpunkte, Kurven) sehr genau ab.
-- Vergib Teilpunkte für richtige Rechenwege, auch wenn am Ende ein kleiner Rundungsfehler passiert ist, und erkläre genau, in welcher Zeile/Achse der Fehler lag.
+- Vergib Teilpunkte für richtige Rechenwege, auch wenn am Ende ein kleiner Rundungsfehler passiert ist, und erkläre genau, in welcher Zeile/Achse der Fehler lag. Bei Rechenaufgaben füge in feedback_vn / musterloesung_vn kurz die richtige Casio fx-580VN X Tastenfolge ([ ■/□ ], [ Ans ], [ S⇔D ], SOLVE) hinzu.
 
 Aufgabenliste:
 ${JSON.stringify(essaySummaries, null, 2)}
@@ -979,7 +984,7 @@ ANTWORTE NUR ALS VALIDES JSON:
     // =========================================================================
     if (action === 'generate_more_quiz') {
       const { lessonTitle, sectionsText, existingQuestions = [] } = payload || {};
-      const prompt = `Erstelle 5 WEITERE, NEUE IHK-Prüfungsfragen (3 Multiple-Choice "mc" + 2 offene Aufgaben "essay") für "${lessonTitle}".
+      const prompt = `Erstelle 5 WEITERE, NEUE IHK-Prüfungsfragen (3 Multiple-Choice "mc" + 2 offene Aufgaben "essay") für "${lessonTitle}". Bei Rechenaufgaben gib in der vietnamesischen Lösung/Erklärung immer die genaue Casio fx-580VN X Tastenfolge ([ ■/□ ], [ Ans ], [ S⇔D ], SOLVE) an!
 Bereits vorhandene Fragen (NICHT wiederholen): ${JSON.stringify(existingQuestions.slice(0, 15))}.
 
 Inhalt:
