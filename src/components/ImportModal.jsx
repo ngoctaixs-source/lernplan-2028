@@ -30,7 +30,7 @@ const SAMPLE_GEMA = `GEMA & Urheberrecht bei VA (Stichpunkte Lehrer)
 
 4. Nichtanmeldung -> doppelter Tarif (100% Kontrollzuschlag als Schadensersatz).`;
 
-// Nạp động thư viện PDF.js (không cần sửa package.json, chạy mượt trực tiếp trên trình duyệt)
+// Nạp động thư viện PDF.js trực tiếp trên trình duyệt
 let pdfJsPromise = null;
 function loadPdfJs() {
   if (typeof window !== 'undefined' && window.pdfjsLib) {
@@ -77,7 +77,7 @@ function loadPdfJs() {
   return pdfJsPromise;
 }
 
-// Nén ảnh chụp bảng / chữ viết tay trước khi gửi lên Vercel Serverless (tránh quá 4.5MB)
+// Nén ảnh chụp bảng / chữ viết tay trước khi gửi lên Vercel Serverless
 async function compressImageFile(file, maxWidth = 1400, quality = 0.8) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -108,11 +108,10 @@ async function compressImageFile(file, maxWidth = 1400, quality = 0.8) {
   });
 }
 
-// Quét nhanh 1 trang PDF: đo tỷ lệ mực thật (phân biệt trang trắng thật vs. trang có ảnh/phiếu bài tập) + tạo ảnh xem trước nhỏ
+// Quét nhanh 1 trang PDF: lấy chữ gõ máy, phát hiện ảnh nhúng, đo mực thật & tạo thumbnail
 async function inspectPdfPageVisual(pdfDoc, pageNum, pdfjsLib) {
   const page = await pdfDoc.getPage(pageNum);
 
-  // 1. Lấy chữ gõ máy
   const textContent = await page.getTextContent();
   const text = (textContent.items || [])
     .map((item) => item.str || '')
@@ -120,7 +119,6 @@ async function inspectPdfPageVisual(pdfDoc, pageNum, pdfjsLib) {
     .replace(/\s+/g, ' ')
     .trim();
 
-  // 2. Kiểm tra trang có chứa hình ảnh nhúng (OneNote Printout / sơ đồ / ảnh chụp) hay không
   let hasEmbeddedImage = false;
   try {
     const ops = await page.getOperatorList();
@@ -134,7 +132,6 @@ async function inspectPdfPageVisual(pdfDoc, pageNum, pdfjsLib) {
     hasEmbeddedImage = false;
   }
 
-  // 3. Render thumbnail nhỏ (width 220px) để đo độ phủ mực thật & hiện ảnh xem trước
   let inkRatio = 0;
   let thumbUrl = '';
   try {
@@ -156,19 +153,18 @@ async function inspectPdfPageVisual(pdfDoc, pageNum, pdfjsLib) {
       const r = pixels[i];
       const g = pixels[i + 1];
       const b = pixels[i + 2];
-      // Điểm không phải nền trắng
       if (r < 242 || g < 242 || b < 242) {
         darkCount++;
       }
     }
     inkRatio = (darkCount * 4) / Math.max(1, totalPixels);
-    thumbUrl = canvas.toDataURL('image/jpeg', 0.6);
+    thumbUrl = canvas.toDataURL('image/jpeg', 0.62);
   } catch {
     inkRatio = text.length > 0 ? 0.05 : 0;
   }
 
-  const isBlank = text.length < 15 && inkRatio < 0.007;
-  const hasVisualContent = !isBlank && (hasEmbeddedImage || text.length < 220 || inkRatio > 0.015);
+  const isBlank = text.length < 15 && inkRatio < 0.006;
+  const needsOcr = !isBlank && (hasEmbeddedImage || text.length < 350);
 
   return {
     pageNum,
@@ -177,16 +173,18 @@ async function inspectPdfPageVisual(pdfDoc, pageNum, pdfjsLib) {
     hasEmbeddedImage,
     inkRatio,
     isBlank,
-    hasVisualContent,
+    needsOcr,
+    ocrDone: false,
+    ocrFailed: false,
     thumbUrl,
   };
 }
 
-// Chụp 1 trang PDF sang ảnh JPEG để Vision AI đọc trực tiếp phiếu bài tập / sơ đồ / tình huống
-async function renderPdfPageToJpeg(pdfDoc, pageNum, maxWidth = 1240, quality = 0.76) {
+// Render 1 trang PDF sang JPEG sắc nét để Vision AI đọc từng chữ nhỏ (Situation 1-4, Fall A/B)
+async function renderPdfPageToJpeg(pdfDoc, pageNum, maxWidth = 1400, quality = 0.8) {
   const page = await pdfDoc.getPage(pageNum);
   const baseViewport = page.getViewport({ scale: 1 });
-  const scale = Math.min(2, maxWidth / Math.max(1, baseViewport.width));
+  const scale = Math.min(2.2, maxWidth / Math.max(1, baseViewport.width));
   const viewport = page.getViewport({ scale });
   const canvas = document.createElement('canvas');
   canvas.width = Math.round(viewport.width);
@@ -214,20 +212,21 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
   const [error, setError] = useState('');
   const [statusMsg, setStatusMsg] = useState('');
 
-  // PDF Auto-Filter state
+  // PDF Auto-Filter + Per-Page Vision OCR state
   const [pdfFileName, setPdfFileName] = useState('');
   const [pdfPages, setPdfPages] = useState([]);
   const [pdfSummary, setPdfSummary] = useState('');
   const [pdfGroups, setPdfGroups] = useState([]);
   const [pdfSkipped, setPdfSkipped] = useState([]);
   const [pdfStage, setPdfStage] = useState('upload'); // 'upload' | 'scanning' | 'review' | 'importing'
+  const [scanProgress, setScanProgress] = useState({ done: 0, total: 0 });
   const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0, label: '', doneCount: 0, failList: [] });
 
   const pdfDocRef = useRef(null);
   const pdfInputRef = useRef(null);
   const imgInputRef = useRef(null);
 
-  // ==================== HANDLER 1: ĐỌC PDF + VISION QUÉT CẢ TRANG ẢNH / PHIẾU BÀI TẬP ====================
+  // ==================== HANDLER 1: ĐỌC PDF + OCR TỪNG TRANG ẢNH + PHÂN LOẠI 70B ====================
   const handleSelectPdf = async (file) => {
     if (!file) return;
     if (!file.name.toLowerCase().endsWith('.pdf') && file.type !== 'application/pdf') {
@@ -238,7 +237,8 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
     setError('');
     setPdfFileName(file.name);
     setPdfStage('scanning');
-    setStatusMsg('Đang mở file PDF và kiểm tra từng trang (cả chữ gõ lẫn ảnh phiếu bài tập)...');
+    setScanProgress({ done: 0, total: 0 });
+    setStatusMsg('Đang mở file PDF và kiểm tra từng trang...');
 
     try {
       const pdfjsLib = await loadPdfJs();
@@ -251,45 +251,71 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
         throw new Error('File PDF trống, không có trang nào.');
       }
 
+      // Bước 1: Kiểm tra nhanh toàn bộ trang & tạo ảnh thumbnail
       const extractedPages = [];
       for (let p = 1; p <= totalPages; p++) {
-        setStatusMsg(`Đang đọc & soi hình ảnh trang ${p}/${totalPages}...`);
+        setStatusMsg(`Đang soi cấu trúc trang ${p}/${totalPages}...`);
         const info = await inspectPdfPageVisual(pdfDoc, p, pdfjsLib);
         extractedPages.push(info);
       }
 
-      setPdfPages(extractedPages);
+      // Bước 2: Chạy OCR Vision RIÊNG TỪNG TRANG cho mọi trang có hình ảnh / phiếu bài tập (không bao giờ bỏ sót trang 2, 3, 4!)
+      const ocrTargets = extractedPages.filter((p) => p.needsOcr);
+      setScanProgress({ done: 0, total: ocrTargets.length });
 
-      // Chụp ảnh các trang dạng PDF Printout / ít chữ gõ nhưng KHÔNG phải trang trắng (tối đa 5 trang) để Vision AI đọc thật!
-      const imageOnlyPages = extractedPages.filter((p) => !p.isBlank && p.charCount < 160).slice(0, 5);
-      const previewPageImages = [];
-      for (let i = 0; i < imageOnlyPages.length; i++) {
-        const pg = imageOnlyPages[i];
-        setStatusMsg(`Đang chuẩn bị ảnh trang ${pg.pageNum} để AI Vision đọc tình huống & sơ đồ...`);
-        try {
-          const rendered = await renderPdfPageToJpeg(pdfDoc, pg.pageNum, 900, 0.7);
-          previewPageImages.push({
-            pageNum: pg.pageNum,
-            base64: rendered.base64,
-            mimeType: rendered.mimeType,
-          });
-        } catch {
-          // ignore single preview failure
-        }
+      let ocrCompleted = 0;
+      const CONCURRENCY = 2; // Chạy song song 2 trang một lúc cho nhanh mà vẫn nhẹ server
+      for (let i = 0; i < ocrTargets.length; i += CONCURRENCY) {
+        const chunk = ocrTargets.slice(i, i + CONCURRENCY);
+        const pageLabels = chunk.map((c) => `trang ${c.pageNum}`).join(' & ');
+        setStatusMsg(
+          `AI Vision đang đọc chi tiết từng chữ & tình huống trên ${pageLabels} (${ocrCompleted}/${ocrTargets.length})...`
+        );
+
+        await Promise.all(
+          chunk.map(async (pg) => {
+            try {
+              const rendered = await renderPdfPageToJpeg(pdfDoc, pg.pageNum, 1400, 0.8);
+              const ocrRes = await callGeminiApi('ocr_pdf_page', {
+                pageNum: pg.pageNum,
+                image: { base64: rendered.base64, mimeType: rendered.mimeType },
+                existingText: pg.text,
+              });
+              const ocrText = (ocrRes?.text || '').trim();
+              if (ocrRes?.isEmpty && pg.charCount < 15) {
+                pg.isBlank = true;
+                pg.text = '';
+                pg.charCount = 0;
+              } else if (ocrText.length > pg.text.length * 0.7) {
+                pg.text = ocrText;
+                pg.charCount = ocrText.length;
+              } else if (ocrText) {
+                pg.text = `${pg.text}\n\n[Nội dung trong ảnh/sơ đồ]:\n${ocrText}`;
+                pg.charCount = pg.text.length;
+              }
+              pg.ocrDone = true;
+            } catch {
+              pg.ocrFailed = true;
+            } finally {
+              ocrCompleted += 1;
+              setScanProgress({ done: ocrCompleted, total: ocrTargets.length });
+            }
+          })
+        );
       }
 
-      setStatusMsg(`AI đang rà soát ${totalPages} trang (đọc cả chữ trong ảnh & các tình huống thực tế)...`);
+      setPdfPages([...extractedPages]);
 
+      // Bước 3: Gửi TOÀN BỘ văn bản đã đọc sạch của mọi trang cho model 70B lọc rác & chia bài thông minh
+      setStatusMsg(`AI đang tổng hợp & chia bài cho toàn bộ ${totalPages} trang...`);
       const filterRes = await callGeminiApi('filter_pdf_pages', {
         fileName: file.name,
         pages: extractedPages.map((p) => ({
           pageNum: p.pageNum,
           charCount: p.charCount,
           isBlank: p.isBlank,
-          hasVisualContent: p.hasVisualContent,
-          textPreview: p.text.slice(0, 750),
+          textPreview: p.text.slice(0, 1150),
         })),
-        pageImages: previewPageImages,
         existingSubjects: subjects,
       });
 
@@ -325,44 +351,37 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
 
       normalizedSkipped.forEach((s) => covered.add(s.pageNum));
 
-      // Trang nào AI chưa nhắc tới -> nếu là trang có hình ảnh nội dung thật thì tự giữ lại, chỉ bỏ trang trắng
-      const orphanVisualNums = [];
+      const orphanContentNums = [];
       for (let p = 1; p <= totalPages; p++) {
         if (!covered.has(p)) {
           const pg = extractedPages[p - 1];
-          if (pg.isBlank) {
+          if (pg.isBlank && pg.charCount < 15) {
             normalizedSkipped.push({
               pageNum: p,
               title_hint: `Trang ${p}`,
               reason_vn: 'Trang trắng hoàn toàn',
             });
           } else {
-            orphanVisualNums.push(p);
+            orphanContentNums.push(p);
           }
         }
       }
 
-      if (orphanVisualNums.length > 0) {
-        if (normalizedGroups.length > 0 && normalizedGroups[0].pageNums.length + orphanVisualNums.length <= 4) {
-          normalizedGroups[0].pageNums = Array.from(
-            new Set([...normalizedGroups[0].pageNums, ...orphanVisualNums])
-          ).sort((a, b) => a - b);
-        } else {
-          normalizedGroups.push({
-            id: 'g-visual-auto',
-            title_de: file.name.replace(/\.pdf$/i, ''),
-            title_vn: 'Trang hình ảnh / tình huống bổ sung',
-            subject_hint: '',
-            pageNums: orphanVisualNums,
-            reason_vn: 'Trang có hình ảnh/chữ viết thật (AI Vision sẽ đọc trực tiếp khi nạp)',
-            selected: true,
-          });
-        }
+      if (orphanContentNums.length > 0) {
+        normalizedGroups.push({
+          id: 'g-extra-auto',
+          title_de: `${file.name.replace(/\.pdf$/i, '')} (Zusatzseiten)`,
+          title_vn: 'Nội dung & tình huống bổ sung',
+          subject_hint: normalizedGroups[0]?.subject_hint || '',
+          pageNums: orphanContentNums,
+          reason_vn: 'Trang có nội dung học tập được tự động giữ lại',
+          selected: true,
+        });
       }
 
       setPdfSummary(
         filterRes?.summary_vn ||
-          `Đã quét ${totalPages} trang: giữ lại ${normalizedGroups.length} cụm bài lý thuyết & tình huống, loại bỏ ${normalizedSkipped.length} trang trống/nháp.`
+          `Đã đọc xong ${totalPages} trang: giữ lại ${normalizedGroups.length} bài lý thuyết & tình huống, loại bỏ ${normalizedSkipped.length} trang trống/nháp.`
       );
       setPdfGroups(normalizedGroups);
       setPdfSkipped(normalizedSkipped);
@@ -381,25 +400,18 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
 
   const restoreSkippedPage = (skippedItem) => {
     setPdfSkipped((prev) => prev.filter((s) => s.pageNum !== skippedItem.pageNum));
-    setPdfGroups((prev) => {
-      // Nếu chỉ có 1 nhóm và tổng <= 4 trang, gộp thẳng vào nhóm đầu cho liền mạch bài học
-      if (prev.length === 1 && prev[0].pageNums.length < 4) {
-        const merged = Array.from(new Set([...prev[0].pageNums, skippedItem.pageNum])).sort((a, b) => a - b);
-        return [{ ...prev[0], pageNums: merged, selected: true }];
-      }
-      return [
-        ...prev,
-        {
-          id: `restored-${skippedItem.pageNum}`,
-          title_de: skippedItem.title_hint || `Seite ${skippedItem.pageNum}`,
-          title_vn: `Khôi phục từ trang ${skippedItem.pageNum}`,
-          subject_hint: prev[0]?.subject_hint || '',
-          pageNums: [skippedItem.pageNum],
-          reason_vn: 'Bạn đã chọn giữ lại để AI Vision đọc & giải đáp',
-          selected: true,
-        },
-      ];
-    });
+    setPdfGroups((prev) => [
+      ...prev,
+      {
+        id: `restored-${skippedItem.pageNum}`,
+        title_de: skippedItem.title_hint || `Seite ${skippedItem.pageNum}`,
+        title_vn: `Khôi phục từ trang ${skippedItem.pageNum}`,
+        subject_hint: prev[0]?.subject_hint || '',
+        pageNums: [skippedItem.pageNum],
+        reason_vn: 'Bạn đã chọn giữ lại để nạp vào web',
+        selected: true,
+      },
+    ]);
   };
 
   const restoreAllNonBlankSkipped = () => {
@@ -410,24 +422,18 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
     if (!nonBlank.length) return;
     const nums = nonBlank.map((s) => s.pageNum);
     setPdfSkipped((prev) => prev.filter((s) => !nums.includes(s.pageNum)));
-    setPdfGroups((prev) => {
-      if (prev.length === 1 && prev[0].pageNums.length + nums.length <= 5) {
-        const merged = Array.from(new Set([...prev[0].pageNums, ...nums])).sort((a, b) => a - b);
-        return [{ ...prev[0], pageNums: merged, selected: true }];
-      }
-      return [
-        ...prev,
-        {
-          id: `restored-all-${Date.now()}`,
-          title_de: `${pdfFileName.replace(/\.pdf$/i, '')} (Praxisfälle & Zusatzseiten)`,
-          title_vn: 'Các trang tình huống & nội dung giữ lại',
-          subject_hint: prev[0]?.subject_hint || '',
-          pageNums: nums.sort((a, b) => a - b),
-          reason_vn: 'Đã giữ lại toàn bộ trang có nội dung hình ảnh/tình huống',
-          selected: true,
-        },
-      ];
-    });
+    setPdfGroups((prev) => [
+      ...prev,
+      {
+        id: `restored-all-${Date.now()}`,
+        title_de: `${pdfFileName.replace(/\.pdf$/i, '')} (Praxisfälle & Zusatzseiten)`,
+        title_vn: 'Các trang tình huống & nội dung giữ lại',
+        subject_hint: prev[0]?.subject_hint || '',
+        pageNums: nums.sort((a, b) => a - b),
+        reason_vn: 'Đã giữ lại toàn bộ trang có nội dung',
+        selected: true,
+      },
+    ]);
   };
 
   const resetPdf = () => {
@@ -442,7 +448,7 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
     setStatusMsg('');
   };
 
-  // ==================== HANDLER 2: TỰ ĐỘNG NẠP HÀNG LOẠT CÁC BÀI ĐÃ DUYỆT ====================
+  // ==================== HANDLER 2: NẠP HÀNG LOẠT BẰNG MODEL 70B TỪ VĂN BẢN ĐÃ OCR ĐẦY ĐỦ ====================
   const handleRunPdfBatchImport = async () => {
     const chosen = pdfGroups.filter((g) => g.selected && g.pageNums.length > 0);
     if (chosen.length === 0) {
@@ -462,7 +468,7 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
       setBatchProgress({
         current: i + 1,
         total: chosen.length,
-        label: group.title_de,
+        label: `${group.title_de} (Trang ${group.pageNums.join(', ')})`,
         doneCount: totalLessonsCreated,
         failList: [...failList],
       });
@@ -472,35 +478,45 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
           .map((num) => pdfPages.find((p) => p.pageNum === num))
           .filter(Boolean);
 
-        const combinedText = [
-          `THEMA / KONTEXT: ${group.title_de}${group.subject_hint ? ` (Fach: ${group.subject_hint})` : ''}`,
-          ...groupPages.map(
-            (p) =>
-              `--- Seite ${p.pageNum} ---\n${
-                p.text || '(Inhalt befindet sich im angehängten Bild — bitte alle Fälle, Situationen & Diagramme vollständig auslesen und lösen!)'
-              }`
-          ),
-        ].join('\n\n');
-
-        // Chụp mọi trang có hình ảnh / sơ đồ / phiếu bài tập (tối đa 5 ảnh/nhóm) để Vision AI đọc trọn vẹn
-        const groupImages = [];
-        let firstPhotoDataUrl = '';
+        // Chụp 1 ảnh nhẹ của trang đầu làm ảnh đối chiếu (nếu cần), và CHỈ đính ảnh vào AI cho trang nào OCR bị lỗi
+        let firstPhotoDataUrl = groupPages[0]?.thumbUrl || '';
+        const fallbackImages = [];
         if (pdfDocRef.current) {
-          const visualPages = groupPages.filter((p) => p.hasVisualContent || !p.text).slice(0, 5);
-          for (const p of visualPages) {
+          if (groupPages[0]) {
             try {
-              const rendered = await renderPdfPageToJpeg(pdfDocRef.current, p.pageNum, 1240, 0.76);
-              groupImages.push({ base64: rendered.base64, mimeType: rendered.mimeType });
-              if (!firstPhotoDataUrl) firstPhotoDataUrl = rendered.dataUrl;
+              const refImg = await renderPdfPageToJpeg(pdfDocRef.current, groupPages[0].pageNum, 1000, 0.72);
+              firstPhotoDataUrl = refImg.dataUrl;
             } catch {
-              // ignore single page render error
+              // keep thumbUrl
+            }
+          }
+          const failedOcrPages = groupPages.filter((p) => p.ocrFailed || p.charCount < 20).slice(0, 2);
+          for (const fp of failedOcrPages) {
+            try {
+              const rendered = await renderPdfPageToJpeg(pdfDocRef.current, fp.pageNum, 1280, 0.78);
+              fallbackImages.push({ base64: rendered.base64, mimeType: rendered.mimeType });
+            } catch {
+              // ignore
             }
           }
         }
 
+        const combinedText = [
+          `THEMA: ${group.title_de}${group.subject_hint ? ` | FACH: ${group.subject_hint}` : ''}`,
+          `ANZAHL SEITEN IN DIESEM PAKET: ${groupPages.length} (Seiten: ${group.pageNums.join(', ')})`,
+          'WICHTIG: Verarbeite ALLE folgenden Seiten vollständig und löse JEDE Situation / jeden Fall / jede Aufgabe konkret!',
+          ...groupPages.map(
+            (p) =>
+              `=== Seite ${p.pageNum} ===\n${
+                p.text || '(Text konnte nicht extrahiert werden — siehe angehängtes Bild)'
+              }`
+          ),
+        ].join('\n\n');
+
+        // Gửi văn bản đầy đủ (images rỗng trừ khi có trang lỗi OCR) -> chạy trên model 70B cực thông minh & không sót trang!
         const aiResult = await callGeminiApi('import_onenote', {
           rawText: combinedText,
-          images: groupImages,
+          images: fallbackImages,
           existingSubjects: workingSubjects,
         });
 
@@ -528,7 +544,7 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
     }
   };
 
-  // ==================== HANDLER 3: NHẬP CHỮ ONENOTE / ẢNH BẢNG (CÁCH CŨ) ====================
+  // ==================== HANDLER 3: NHẬP CHỮ ONENOTE / ẢNH BẢNG ====================
   const handlePickImages = async (files) => {
     const fileArr = Array.from(files || []).slice(0, 5 - images.length);
     if (!fileArr.length) return;
@@ -553,11 +569,39 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
 
     setError('');
     setLoading(true);
-    setStatusMsg('AI đang chuẩn hóa câu IHK, giải đáp các tình huống thực tế, trích Từ vựng, Flashcards & Bài Test...');
     try {
+      let finalRawText = rawText.trim();
+      let payloadImages = [];
+
+      // Nếu chụp nhiều ảnh bảng/phiếu bài tập -> OCR riêng từng ảnh trước rồi tổng hợp bằng model 70B cho khỏi sót chữ!
+      if (mode === 'images' && images.length > 0) {
+        const ocrTexts = [];
+        for (let i = 0; i < images.length; i++) {
+          setStatusMsg(`AI Vision đang đọc chữ & tình huống trên ảnh ${i + 1}/${images.length}...`);
+          try {
+            const ocrRes = await callGeminiApi('ocr_pdf_page', {
+              pageNum: i + 1,
+              image: { base64: images[i].base64, mimeType: images[i].mimeType },
+              existingText: '',
+            });
+            if (ocrRes?.text) {
+              ocrTexts.push(`=== Ảnh ${i + 1} ===\n${ocrRes.text}`);
+            } else {
+              payloadImages.push({ base64: images[i].base64, mimeType: images[i].mimeType });
+            }
+          } catch {
+            payloadImages.push({ base64: images[i].base64, mimeType: images[i].mimeType });
+          }
+        }
+        if (ocrTexts.length > 0) {
+          finalRawText = [finalRawText, ...ocrTexts].filter(Boolean).join('\n\n');
+        }
+      }
+
+      setStatusMsg('AI 70B đang soạn bài chuẩn IHK, giải đáp các tình huống thực tế, trích Từ vựng, Flashcards & Test...');
       const aiResult = await callGeminiApi('import_onenote', {
-        rawText: rawText.trim(),
-        images: mode === 'images' ? images.map((im) => ({ base64: im.base64, mimeType: im.mimeType })) : [],
+        rawText: finalRawText,
+        images: payloadImages,
         existingSubjects: subjects,
       });
 
@@ -592,7 +636,7 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
                 Thêm kiến thức mới (PDF OneNote / Chữ / Ảnh bảng)
               </h2>
               <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                Đọc cả ảnh phiếu bài tập · Tự giải chi tiết tình huống thực tế · Lọc trang nháp chuẩn xác
+                OCR từng trang riêng biệt · Giải chi tiết mọi tình huống thực tế · Không bao giờ sót trang
               </p>
             </div>
           </div>
@@ -608,7 +652,7 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
         {/* Mode Tabs */}
         <div className="px-5 pt-4 flex flex-wrap gap-2">
           {[
-            { id: 'pdf', label: 'File PDF OneNote (Tự lọc + Vision)', icon: Filter },
+            { id: 'pdf', label: 'File PDF OneNote (OCR từng trang)', icon: Filter },
             { id: 'text', label: 'Dán chữ từ OneNote', icon: FileText },
             { id: 'images', label: 'Chụp bảng / Chữ viết tay', icon: ImageIcon },
           ].map((tab) => {
@@ -638,7 +682,7 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
 
         {/* Body */}
         <div className="p-5 overflow-y-auto flex-1 space-y-4">
-          {/* ==================== TAB 1: PDF ONENOTE AUTO-FILTER ==================== */}
+          {/* ==================== TAB 1: PDF ONENOTE OCR + AUTO-FILTER ==================== */}
           {mode === 'pdf' && (
             <div className="space-y-4">
               {pdfStage === 'upload' && (
@@ -671,30 +715,44 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
                         Kéo thả file PDF xuất từ OneNote vào đây (tối đa 40 trang)
                       </p>
                       <p className="text-xs text-slate-500 dark:text-slate-400">
-                        AI Vision đọc trực tiếp cả phiếu bài tập dạng ảnh, sơ đồ & giải chi tiết từng tình huống (Situation / Fall)
+                        AI Vision đọc trọn vẹn từng trang 1 → 2 → 3 → 4, rồi model 70B tự giải chi tiết mọi tình huống (Situation / Fall)
                       </p>
                     </div>
                   </div>
 
                   <div className="bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-2xl p-4 text-xs text-slate-600 dark:text-slate-300 space-y-1.5">
                     <p className="font-bold text-slate-800 dark:text-slate-100">
-                      Mẹo xuất PDF từ OneNote trên Mac không bị cắt mép:
+                      Mẹo xuất PDF nhanh nhất từ OneNote trên Mac (khỏi cần căn ảnh tay):
                     </p>
                     <p>
-                      1. Nhấn <strong>Shift + Command + P</strong> → đổi hướng sang <strong>Ngang (Landscape)</strong> hoặc khổ <strong>A3</strong>.
-                    </p>
-                    <p>
-                      2. Nhấn <strong>Command + P</strong> → góc dưới bên trái chọn <strong>PDF → Save as PDF</strong> → kéo thẳng vào ô trên!
+                      Bấm <strong>File → Save as PDF</strong> (hoặc chỉnh <strong>Shift + Command + P</strong> sang khổ ngang 1 lần duy nhất). Chỉ cần chữ không bị cắt mất mép phải là AI đọc ngon 100%!
                     </p>
                   </div>
                 </>
               )}
 
               {pdfStage === 'scanning' && (
-                <div className="py-12 text-center space-y-3">
+                <div className="py-10 text-center space-y-4">
                   <Loader2 className="w-9 h-9 animate-spin text-indigo-600 mx-auto" />
-                  <p className="text-sm font-bold text-slate-900 dark:text-white">{pdfFileName}</p>
-                  <p className="text-xs text-slate-500 dark:text-slate-400">{statusMsg || 'Đang phân tích...'}</p>
+                  <div className="space-y-1">
+                    <p className="text-sm font-bold text-slate-900 dark:text-white">{pdfFileName}</p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">{statusMsg || 'Đang phân tích...'}</p>
+                  </div>
+                  {scanProgress.total > 0 && (
+                    <div className="max-w-xs mx-auto space-y-1">
+                      <div className="h-2 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-indigo-600 transition-all duration-300"
+                          style={{
+                            width: `${Math.max(8, Math.round((scanProgress.done / scanProgress.total) * 100))}%`,
+                          }}
+                        />
+                      </div>
+                      <p className="text-[11px] text-slate-400">
+                        Đã đọc OCR {scanProgress.done}/{scanProgress.total} trang ảnh
+                      </p>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -705,7 +763,7 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
                     <div className="space-y-1">
                       <p className="text-xs font-extrabold text-emerald-800 dark:text-emerald-300 flex items-center gap-1.5">
                         <CheckCircle2 className="w-4 h-4 shrink-0" />
-                        Đã quét xong: {pdfFileName} ({pdfPages.length} trang)
+                        Đã đọc sạch toàn bộ: {pdfFileName} ({pdfPages.length} trang)
                       </p>
                       <p className="text-xs text-emerald-900 dark:text-emerald-200">{pdfSummary}</p>
                     </div>
@@ -735,9 +793,9 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
                     ) : (
                       <div className="space-y-2.5">
                         {pdfGroups.map((g) => {
-                          const thumbs = g.pageNums
+                          const groupPageObjs = g.pageNums
                             .map((n) => pdfPages.find((p) => p.pageNum === n))
-                            .filter((p) => p?.thumbUrl);
+                            .filter(Boolean);
                           return (
                             <button
                               key={g.id}
@@ -773,16 +831,24 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
                                 {g.title_vn && <p className="text-xs font-semibold text-indigo-600 dark:text-indigo-400">{g.title_vn}</p>}
                                 <p className="text-[11px] text-slate-500 dark:text-slate-400">{g.reason_vn}</p>
 
-                                {thumbs.length > 0 && (
-                                  <div className="flex items-center gap-2 pt-1 overflow-x-auto">
-                                    {thumbs.map((pg) => (
+                                {/* Hiển thị ảnh thu nhỏ + số ký tự AI đã đọc được ở TỪNG trang */}
+                                {groupPageObjs.length > 0 && (
+                                  <div className="flex items-center gap-2 pt-1.5 overflow-x-auto">
+                                    {groupPageObjs.map((pg) => (
                                       <div
                                         key={pg.pageNum}
-                                        className="relative w-14 h-16 rounded-lg overflow-hidden border border-slate-200 dark:border-slate-700 bg-white shrink-0"
+                                        className="relative w-16 h-20 rounded-lg overflow-hidden border border-slate-200 dark:border-slate-700 bg-white shrink-0"
+                                        title={pg.text.slice(0, 160)}
                                       >
-                                        <img src={pg.thumbUrl} alt={`Trang ${pg.pageNum}`} className="w-full h-full object-cover" />
-                                        <span className="absolute bottom-0 inset-x-0 bg-slate-900/75 text-white text-[9px] font-bold text-center">
-                                          Tr.{pg.pageNum}
+                                        {pg.thumbUrl ? (
+                                          <img src={pg.thumbUrl} alt={`Trang ${pg.pageNum}`} className="w-full h-full object-cover" />
+                                        ) : (
+                                          <div className="w-full h-full flex items-center justify-center text-[10px] text-slate-400">
+                                            Tr.{pg.pageNum}
+                                          </div>
+                                        )}
+                                        <span className="absolute bottom-0 inset-x-0 bg-slate-900/80 text-white text-[9px] font-bold text-center py-0.5">
+                                          Tr.{pg.pageNum} · {pg.charCount > 0 ? `${pg.charCount}ch` : 'Ảnh'}
                                         </span>
                                       </div>
                                     ))}
@@ -856,11 +922,11 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
                   <Loader2 className="w-10 h-10 animate-spin text-indigo-600 mx-auto" />
                   <div className="space-y-1">
                     <p className="text-sm font-extrabold text-slate-900 dark:text-white">
-                      Đang tự động nạp bài {batchProgress.current}/{batchProgress.total}...
+                      AI 70B đang soạn & giải chi tiết bài {batchProgress.current}/{batchProgress.total}...
                     </p>
                     <p className="text-xs font-semibold text-indigo-600 dark:text-indigo-400">{batchProgress.label}</p>
                     <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                      AI đang đọc toàn bộ hình ảnh, giải chi tiết từng tình huống thực tế, tạo Từ vựng, Flashcards & Test...
+                      Đang tổng hợp trọn vẹn mọi trang, giải đáp từng tình huống thực tế, tạo Từ vựng, Flashcards & Test...
                     </p>
                   </div>
                   <div className="max-w-sm mx-auto h-2.5 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden">
@@ -929,7 +995,7 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
                 <p className="text-xs font-bold text-slate-700 dark:text-slate-200">
                   Chọn tối đa 5 ảnh chụp bảng / vở viết tay / phiếu bài tập ({images.length}/5)
                 </p>
-                <p className="text-[11px] text-slate-400">Tự động nén nhẹ ảnh & giải đáp đầy đủ các câu hỏi tình huống trong ảnh</p>
+                <p className="text-[11px] text-slate-400">OCR từng ảnh riêng biệt rồi dùng AI 70B giải chi tiết mọi tình huống</p>
               </div>
 
               {images.length > 0 && (
