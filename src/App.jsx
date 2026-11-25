@@ -83,14 +83,16 @@ export default function App() {
       return 'md';
     }
   });
-  const [dictMode, setDictMode] = useState(() => {
+  // Chạm vào bất kỳ từ tiếng Đức nào để tra từ điển luôn bật mặc định
+  const dictMode = true;
+  const setDictMode = () => {};
+  const [showVn, setShowVn] = useState(() => {
     try {
-      return JSON.parse(localStorage.getItem(LOCAL_PREFS_KEY) || '{}').dictMode ?? true;
+      return JSON.parse(localStorage.getItem(LOCAL_PREFS_KEY) || '{}').showVn ?? true;
     } catch {
       return true;
     }
   });
-  const [showVn, setShowVn] = useState(true);
   const [ttsRate, setTtsRate] = useState(1.0);
 
   // Apply Dark Mode & Font Scale to <html>
@@ -102,8 +104,8 @@ export default function App() {
     root.classList.remove('font-scale-sm', 'font-scale-md', 'font-scale-lg');
     root.classList.add(`font-scale-${fontScale}`);
 
-    localStorage.setItem(LOCAL_PREFS_KEY, JSON.stringify({ darkMode, fontScale, dictMode }));
-  }, [darkMode, fontScale, dictMode]);
+    localStorage.setItem(LOCAL_PREFS_KEY, JSON.stringify({ darkMode, fontScale, showVn }));
+  }, [darkMode, fontScale, showVn]);
 
   // Auth
   const [user, setUser] = useState(null);
@@ -1320,32 +1322,18 @@ export default function App() {
 
           {/* Quick Toggles */}
           <div className="flex items-center gap-1.5 sm:gap-2">
-            {/* Click-to-translate Toggle */}
+            {/* Toggle hiển thị/ẩn bản dịch tiếng Việt bên dưới mỗi đoạn tiếng Đức */}
             <button
-              onClick={() => setDictMode((m) => !m)}
-              title="Bật/Tắt chế độ chạm vào bất kỳ từ tiếng Đức nào để dịch ngay"
+              onClick={() => setShowVn((v) => !v)}
+              title="Hiện hoặc ẩn bản dịch tiếng Việt bên dưới mỗi đoạn tiếng Đức (chạm từ vẫn luôn bật)"
               className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-bold border transition ${
-                dictMode
+                showVn
                   ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
                   : 'bg-slate-100 dark:bg-slate-800 text-slate-500 border-slate-200 dark:border-slate-700'
               }`}
             >
               <Languages className="w-3.5 h-3.5" />
-              <span className="hidden md:inline">{dictMode ? 'Chạm dịch: BẬT' : 'Chạm dịch: TẮT'}</span>
-            </button>
-
-            {/* Show/Hide VN */}
-            <button
-              onClick={() => setShowVn((v) => !v)}
-              title="Hiện hoặc ẩn bản dịch tiếng Việt"
-              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-bold border transition ${
-                showVn
-                  ? 'bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800'
-                  : 'bg-slate-100 dark:bg-slate-800 text-slate-500 border-slate-200 dark:border-slate-700'
-              }`}
-            >
-              {showVn ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
-              <span className="hidden sm:inline">VN</span>
+              <span className="hidden sm:inline">{showVn ? 'Dịch VN: BẬT' : 'Dịch VN: TẮT'}</span>
             </button>
 
             {/* Dark Mode Quick Toggle */}
