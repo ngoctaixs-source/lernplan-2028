@@ -527,7 +527,7 @@ STRENGE REGELN:
     // ACTION 0: TỰ ĐỘNG LỌC TRANG NHÁP & GOM CHỦ ĐỀ TỪ TOÀN BỘ NỘI DUNG ĐÃ ĐỌC OCR
     // =========================================================================
     if (action === 'filter_pdf_pages') {
-      const { fileName = 'OneNote.pdf', pages = [], existingSubjects = [] } = payload || {};
+      const { fileName = 'OneNote.pdf', pages = [], existingSubjects = [], targetSubjectName = '' } = payload || {};
       if (!Array.isArray(pages) || pages.length === 0) {
         return res.status(400).json({ error: 'File PDF không có trang nào để phân tích.' });
       }
@@ -558,6 +558,21 @@ DEINE AUFGABE — SORTIERE JEDE SEITE (1 bis ${pages.length}) PRÄZISE:
    - Packe maximal 2–3 dichte Seiten in EIN Paket!
    - Wenn eine Datei sowohl Theorie/Aufgabenstellung als auch umfangreiche Lösungen (T-Konten, GuV, Schlussbilanz oder Situation 1–4) enthält, teile sie sinnvoll auf (oder halte Aufgabenstellung + zugehörige Musterlösung in einem klaren Paket <= 3 Seiten), damit die KI JEDEN Rechenschritt ausführlich erklären kann!
 
+FACHZUORDNUNG (SEHR WICHTIG):
+${
+  targetSubjectName
+    ? `- Der Schüler hat das Zielfach FEST AUSGEWÄHLT: "${targetSubjectName}". Setze "subject_hint" bei JEDEM Paket exakt auf "${targetSubjectName}"!`
+    : `- Ordne jedes Paket einem der bestehenden Hauptfächer zu. Erfinde KEINE Unterthemen als Fachname und übernimm NIEMALS Lehrerkürzel wie "_ZeH", "_HsA", "_GeM", "_MuC", "_DoR", "_ScT", "_MaS", "_KiK"!
+- Typische Hauptfächer (Berufsschule Veranstaltungskaufmann):
+  * VKO · Veranstaltungskonzeption & -organisation
+  * BWT · Betriebswirtschaftliche Themen
+  * RW · Rechnungswesen
+  * BuB · Recht & Betriebliche Grundlagen
+  * IuF · Information & Finanzierung
+  * Mt · Märkte & Marketing
+  * PuG · Politik und Gesellschaft
+  * D · Deutsch & Kommunikation`
+}
 Bestehende Fächer in der App:
 ${subjectListText}
 
@@ -594,7 +609,13 @@ ANTWORTE NUR ALS VALIDES JSON:
     // ACTION 1: NHẬP KIẾN THỨC ONENOTE / PDF / RECHNUNGSWESEN + CHUẨN IHK + BẤM MÁY CASIO
     // =========================================================================
     if (action === 'import_onenote') {
-      const { rawText = '', images = [], existingSubjects = [] } = payload || {};
+      const {
+        rawText = '',
+        images = [],
+        existingSubjects = [],
+        targetSubjectId = null,
+        targetSubjectName = '',
+      } = payload || {};
 
       if (!rawText.trim() && (!Array.isArray(images) || images.length === 0)) {
         return res.status(400).json({ error: 'Vui lòng dán ghi chú hoặc tải lên ít nhất 1 ảnh.' });
@@ -658,8 +679,18 @@ PFLICHTREGELN (SEHR WICHTIG):
       {"type":"flow","title":"Ablauf Geschäftsgang (IHK)","steps":[{"title":"1. Eröffnungsbilanz","subtitle":"Aktiva = Passiva, EK berechnen","badge":"Schritt 1"},{"title":"2. Bestandskonten öffnen","subtitle":"AB eintragen","badge":"Schritt 2"}]}
    f) **Balkendiagramm / Kostenvergleich:**
       {"type":"bar","title":"Kostenstruktur","unit":"€","items":[{"label":"Miete","value":4000},{"label":"Technik","value":2500}]}
-5. FACHZUORDNUNG & LEKTIONEN:
-   - Ordne den Stoff einem bestehenden Fach zu ODER erstelle ein neues Fach.
+5. STRENGE FACHZUORDNUNG & LEKTIONEN (KEINE ZERSPLITTERUNG!):
+   ${
+     targetSubjectId
+       ? `- FESTES ZIELFACH: Der Schüler hat das Fach ID "${targetSubjectId}" (${targetSubjectName || 'ausgewähltes Fach'}) verbindlich gewählt!
+   - Setze "existing_subject_id" ZWINGEND auf "${targetSubjectId}" und erfinde KEIN neues Fach!`
+       : `- Wähle ZWINGEND eines der bestehenden Hauptfächer aus der Liste unten, wenn es thematisch passt!
+   - Erstelle ein neues Fach NUR, wenn es ein komplett eigenes Schulfach ist (z. B. PuG, VKO, BWT, RW, BuB, IuF, Mt, D).
+   - VERBOTEN:
+     * Erfinde NIEMALS enge Unterthemen als Fachname (z. B. NICHT "Privatrecht", NICHT "GuV-Konto", NICHT "Veranstaltungsrecht & Verträge", wenn ein Hauptfach wie "BuB · Recht & Betriebliche Grundlagen" oder "RW · Rechnungswesen" existiert!).
+     * Übernimm NIEMALS Lehrerkürzel wie "_ZeH", "_HsA", "_GeM", "_MuC", "_DoR", "_ScT", "_MaS", "_KiK" in den Fachnamen!
+     * Nutze bei einem neuen Schulfach immer das saubere Format "KÜRZEL · Voller Fachname" (z. B. "PuG · Politik und Gesellschaft", "VKO · Veranstaltungskonzeption & -organisation", "BWT · Betriebswirtschaftliche Themen", "RW · Rechnungswesen", "BuB · Recht & Betriebliche Grundlagen", "IuF · Information & Finanzierung", "Mt · Märkte & Marketing", "D · Deutsch & Kommunikation").`
+   }
    Bestehende Fächer:
    ${subjectListText}
    - Erstelle 1 bis 2 logisch aufgebaute Lektionen ("foundation" -> "connected" -> "advanced").
@@ -772,6 +803,16 @@ ${rawText.trim() ? `VOLLSTÄNDIGES UNTERRICHTSMATERIAL (BITTE ALLE SEITEN, HANDS
       }
 
       const result = await callGemini({ parts, expectJson: true, maxTokens: 8000 });
+      // Khóa cứng môn học đích ở backend để AI tuyệt đối không thể tự tạo môn mới hay xếp nhầm môn
+      if (targetSubjectId && result && typeof result === 'object') {
+        result.existing_subject_id = targetSubjectId;
+      } else if (result?.subject?.title_de) {
+        // Loại bỏ sạch hậu tố tên viết tắt giáo viên (VD: _ZeH, _HsA, _GeM, _MuC, _DoR...) nếu AI lỡ dính vào
+        result.subject.title_de = String(result.subject.title_de)
+          .replace(/[_-][A-ZÄÖÜ][a-zäöüß]{1,2}[A-ZÄÖÜ]\b/g, '')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
       return res.status(200).json({ data: result });
     }
 
