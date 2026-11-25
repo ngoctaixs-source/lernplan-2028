@@ -1,23 +1,42 @@
 const ADMIN_EMAIL = 'ngoctaixs@gmail.com';
-const LITE_FIRST_MODELS = [
+
+// Groq: siêu tốc, miễn phí 1.000 - 14.400 lượt/ngày
+// - INSTANT: dành riêng cho tra từ điển 1 từ (~150-300ms!)
+const GROQ_INSTANT_MODELS = [
+  'llama-3.1-8b-instant',
+  'llama-3.3-70b-versatile',
+];
+// - TEXT: dành cho phân tích bài học, lọc PDF, tạo flashcard/test chuẩn IHK
+const GROQ_TEXT_MODELS = [
+  'llama-3.3-70b-versatile',
+  'meta-llama/llama-4-maverick-17b-128e-instruct',
+  'meta-llama/llama-4-scout-17b-16e-instruct',
+  'llama-3.1-8b-instant',
+];
+const GROQ_VISION_MODELS = [
+  'meta-llama/llama-4-scout-17b-16e-instruct',
+  'meta-llama/llama-4-maverick-17b-128e-instruct',
+];
+
+// Gemini (dự phòng khi cần hoặc nếu chưa gắn GROQ_API_KEY)
+const GEMINI_LITE_MODELS = [
   'gemini-flash-lite-latest',
   'gemini-3.1-flash-lite-preview',
-  'gemini-2.5-flash-lite',
   'gemini-3.5-flash',
   'gemini-3-flash-preview',
   'gemini-flash-latest',
 ];
-const REASONING_MODELS = [
+const GEMINI_REASONING_MODELS = [
   'gemini-3.5-flash',
   'gemini-3-flash-preview',
   'gemini-flash-lite-latest',
   'gemini-3.1-flash-lite-preview',
-  'gemini-2.5-flash-lite',
   'gemini-flash-latest',
 ];
 
-let cachedDiscovered = { models: null, at: 0 };
-const modelCooldown = new Map(); // model -> timestamp until skip
+let cachedGeminiModels = { models: null, at: 0 };
+let cachedGroqModels = { models: null, at: 0 };
+const modelCooldown = new Map();
 
 async function verifyUser(req) {
   const authHeader = req.headers.authorization || '';
@@ -56,10 +75,185 @@ function cleanJsonString(raw) {
   return text;
 }
 
-async function discoverAvailableModels(apiKey, forceRefresh = false) {
+// =============================================================================
+// GROQ ENGINE (Bỏ qua gọi list-models lúc khởi động để giảm độ trễ xuống tối thiểu)
+// =============================================================================
+async function discoverGroqModels(groqKey, forceRefresh = false) {
   const now = Date.now();
-  if (!forceRefresh && cachedDiscovered.models && now - cachedDiscovered.at < 10 * 60 * 1000) {
-    return cachedDiscovered.models;
+  if (!forceRefresh && cachedGroqModels.models && now - cachedGroqModels.at < 10 * 60 * 1000) {
+    return cachedGroqModels.models;
+  }
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/models', {
+      headers: { Authorization: `Bearer ${groqKey}` },
+    });
+    if (!res.ok) return [];
+    const data = await res.json().catch(() => ({}));
+    const blocked = /whisper|guard|tts|playai|orpheus|embed|moderation|prompt-guard|safeguard/i;
+    const ids = (data.data || [])
+      .map((m) => m.id)
+      .filter((id) => typeof id === 'string' && !blocked.test(id));
+    cachedGroqModels = { models: ids, at: now };
+    return ids;
+  } catch {
+    return [];
+  }
+}
+
+function partsToOpenAIContent(parts) {
+  const hasImages = parts.some((p) => p.inlineData?.data);
+  if (!hasImages) {
+    return parts.map((p) => p.text || '').join('\n\n');
+  }
+  return parts.map((p) => {
+    if (p.inlineData?.data) {
+      const mime = p.inlineData.mimeType || 'image/jpeg';
+      return {
+        type: 'image_url',
+        image_url: { url: `data:${mime};base64,${p.inlineData.data}` },
+      };
+    }
+    return { type: 'text', text: p.text || '' };
+  });
+}
+
+async function requestGroqModel(
+  groqKey,
+  model,
+  parts,
+  expectJson,
+  { timeoutMs = 45000, maxTokens = 8000, temperature = 0.25 } = {}
+) {
+  const url = 'https://api.groq.com/openai/v1/chat/completions';
+  const content = partsToOpenAIContent(parts);
+  const messages = [
+    ...(expectJson
+      ? [{ role: 'system', content: 'Respond with valid JSON only. No markdown fences or extra text.' }]
+      : []),
+    { role: 'user', content },
+  ];
+
+  const attempt = async (useJsonFormat) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${groqKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature,
+          max_tokens: maxTokens,
+          ...(useJsonFormat ? { response_format: { type: 'json_object' } } : {}),
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      const data = await res.json().catch(() => ({}));
+      return { res, data };
+    } catch (err) {
+      clearTimeout(timer);
+      return { netErr: err };
+    }
+  };
+
+  let { res, data, netErr } = await attempt(expectJson);
+  if (netErr) {
+    return { ok: false, error: `[Groq/${model}] Lỗi mạng/timeout: ${netErr.message}` };
+  }
+
+  if (!res.ok && res.status === 400 && expectJson && /json|response_format/i.test(data?.error?.message || '')) {
+    const retry = await attempt(false);
+    if (retry.netErr) {
+      return { ok: false, error: `[Groq/${model}] Lỗi mạng/timeout: ${retry.netErr.message}` };
+    }
+    res = retry.res;
+    data = retry.data;
+  }
+
+  if (!res.ok) {
+    const msg = data?.error?.message || `HTTP ${res.status}`;
+    if (res.status === 404) modelCooldown.set(`groq:${model}`, Date.now() + 30 * 60 * 1000);
+    else if (res.status === 429) modelCooldown.set(`groq:${model}`, Date.now() + 2 * 60 * 1000);
+    else if (res.status === 503) modelCooldown.set(`groq:${model}`, Date.now() + 30 * 1000);
+    return { ok: false, error: `[Groq/${model}] (${res.status}): ${msg}` };
+  }
+
+  const text = (data?.choices?.[0]?.message?.content || '').trim();
+  if (!text) {
+    return { ok: false, error: `[Groq/${model}] Trả về nội dung trống.` };
+  }
+
+  if (!expectJson) return { ok: true, data: text, model: `groq/${model}` };
+
+  try {
+    return { ok: true, data: JSON.parse(cleanJsonString(text)), model: `groq/${model}` };
+  } catch {
+    return { ok: false, error: `[Groq/${model}] JSON chưa chuẩn hoặc bị cắt.` };
+  }
+}
+
+async function callGroq({
+  parts,
+  expectJson = true,
+  preferReasoning = false,
+  instant = false,
+  maxTokens = 8000,
+}) {
+  const groqKey = (process.env.GROQ_API_KEY || '').trim();
+  if (!groqKey) return { ok: false, errors: [] };
+
+  const hasImages = parts.some((p) => p.inlineData?.data);
+  const preferred = hasImages
+    ? GROQ_VISION_MODELS
+    : instant
+    ? GROQ_INSTANT_MODELS
+    : GROQ_TEXT_MODELS;
+
+  const now = Date.now();
+  const ready = preferred.filter((m) => (modelCooldown.get(`groq:${m}`) || 0) <= now);
+  const cooling = preferred.filter((m) => (modelCooldown.get(`groq:${m}`) || 0) > now);
+  const primaryOrder = [...ready, ...cooling];
+
+  const reqOpts = {
+    timeoutMs: instant ? 12000 : 45000,
+    maxTokens: instant ? Math.min(maxTokens, 360) : maxTokens,
+    temperature: instant ? 0.1 : 0.25,
+  };
+
+  const errors = [];
+  // 1. Gọi thẳng danh sách model ưu tiên (0ms trễ tìm model!)
+  for (const model of primaryOrder.slice(0, instant ? 2 : 3)) {
+    const res = await requestGroqModel(groqKey, model, parts, expectJson, reqOpts);
+    if (res.ok) return { ok: true, data: res.data, model: res.model };
+    errors.push(res.error);
+  }
+
+  // 2. Chỉ dò thêm model trên tài khoản nếu tất cả model chính thất bại
+  if (!hasImages && !instant) {
+    const discovered = await discoverGroqModels(groqKey);
+    const extras = discovered.filter((m) => !preferred.includes(m));
+    for (const model of extras.slice(0, 2)) {
+      const res = await requestGroqModel(groqKey, model, parts, expectJson, reqOpts);
+      if (res.ok) return { ok: true, data: res.data, model: res.model };
+      errors.push(res.error);
+    }
+  }
+
+  return { ok: false, errors };
+}
+
+// =============================================================================
+// GEMINI ENGINE (DỰ PHÒNG)
+// =============================================================================
+async function discoverGeminiModels(apiKey, forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && cachedGeminiModels.models && now - cachedGeminiModels.at < 10 * 60 * 1000) {
+    return cachedGeminiModels.models;
   }
 
   try {
@@ -70,7 +264,7 @@ async function discoverAvailableModels(apiKey, forceRefresh = false) {
     const data = await res.json().catch(() => ({}));
 
     const blockedPattern =
-      /embedding|imagen|image|veo|tts|audio|robotics|omni|live|computer-use|deep-research|aqa|bison|gecko|learnlm|nano|thinking-exp/i;
+      /embedding|imagen|image|veo|tts|audio|robotics|omni|live|computer-use|deep-research|aqa|bison|gecko|learnlm|nano|thinking-exp|gemini-2\.5-flash$|gemini-2\.0/i;
 
     const allNames = (data.models || [])
       .filter(
@@ -78,26 +272,26 @@ async function discoverAvailableModels(apiKey, forceRefresh = false) {
           Array.isArray(m.supportedGenerationMethods) &&
           m.supportedGenerationMethods.includes('generateContent') &&
           typeof m.name === 'string' &&
-          !blockedPattern.test(m.name)
+          !blockedPattern.test(m.name.replace(/^models\//, ''))
       )
       .map((m) => m.name.replace(/^models\//, ''));
 
     const geminiLite = allNames.filter((n) => /^gemini/i.test(n) && /lite/i.test(n));
     const geminiFlash = allNames.filter((n) => /^gemini/i.test(n) && /flash/i.test(n) && !/lite/i.test(n));
-    const geminiOther = allNames.filter((n) => /^gemini/i.test(n) && !/flash/i.test(n));
     const gemmaBig = allNames
       .filter((n) => /^gemma-3-(27b|12b)/i.test(n))
       .sort((a, b) => (b.includes('27b') ? 1 : 0) - (a.includes('27b') ? 1 : 0));
+    const geminiOther = allNames.filter((n) => /^gemini/i.test(n) && !/flash/i.test(n));
 
-    const ordered = Array.from(new Set([...geminiLite, ...geminiFlash, ...geminiOther, ...gemmaBig]));
-    cachedDiscovered = { models: ordered, at: now };
+    const ordered = Array.from(new Set([...geminiLite, ...geminiFlash, ...gemmaBig, ...geminiOther]));
+    cachedGeminiModels = { models: ordered, at: now };
     return ordered;
   } catch {
     return [];
   }
 }
 
-async function requestModel(apiKey, model, parts, expectJson, timeoutMs = 25000) {
+async function requestGeminiModel(apiKey, model, parts, expectJson, timeoutMs = 45000) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
   const isGemma = /^gemma/i.test(model);
   const body = {
@@ -165,79 +359,85 @@ async function requestModel(apiKey, model, parts, expectJson, timeoutMs = 25000)
   }
 }
 
-async function callGemini({ parts, expectJson = true, preferReasoning = false }) {
-  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
-  if (!apiKey) {
-    throw new Error('Thiếu biến môi trường GEMINI_API_KEY trên Vercel.');
-  }
-
-  const discovered = await discoverAvailableModels(apiKey);
-  const preferred = preferReasoning ? REASONING_MODELS : LITE_FIRST_MODELS;
-
-  // Build ordered candidate list: discovered models prioritized cleanly + preferred defaults
-  const discoveredSet = new Set(discovered);
-  const candidates = [];
-
-  // 1. Preferred models that exist in discovered (or all preferred if discovery failed)
-  for (const m of preferred) {
-    if (!discovered.length || discoveredSet.has(m)) {
-      candidates.push(m);
-    }
-  }
-  // 2. Remaining discovered text models (including all flash-lite, pro, and gemma-3 fallback)
-  for (const m of discovered) {
-    if (!candidates.includes(m)) {
-      candidates.push(m);
-    }
-  }
-
-  const now = Date.now();
-  const readyNow = candidates.filter((m) => (modelCooldown.get(m) || 0) <= now);
-  const coolingDown = candidates.filter((m) => (modelCooldown.get(m) || 0) > now);
-  const orderedToTry = [...readyNow, ...coolingDown];
-
+async function callGemini({ parts, expectJson = true, preferReasoning = false, instant = false, maxTokens = 8000 }) {
+  const groqKey = (process.env.GROQ_API_KEY || '').trim();
+  const geminiKey = (process.env.GEMINI_API_KEY || '').trim();
   const errorLog = [];
-  for (const model of orderedToTry.slice(0, 8)) {
-    const res = await requestModel(apiKey, model, parts, expectJson);
-    if (res.ok) return res.data;
-    errorLog.push(res.error);
+
+  if (!groqKey && !geminiKey) {
+    throw new Error('Thiếu biến môi trường GROQ_API_KEY hoặc GEMINI_API_KEY trên Vercel.');
   }
 
-  throw new Error(`Không gọi được Gemini AI. Chi tiết: ${errorLog.slice(0, 3).join(' | ')}`);
+  // 1. Ưu tiên Groq (nhanh, ổn định, không bị 503)
+  if (groqKey) {
+    const groqRes = await callGroq({ parts, expectJson, preferReasoning, instant, maxTokens });
+    if (groqRes.ok) return groqRes.data;
+    errorLog.push(...groqRes.errors);
+  }
+
+  // 2. Dự phòng Google Gemini
+  if (geminiKey) {
+    const preferred = preferReasoning ? GEMINI_REASONING_MODELS : GEMINI_LITE_MODELS;
+    const now = Date.now();
+    const readyNow = preferred.filter((m) => (modelCooldown.get(m) || 0) <= now);
+    const coolingDown = preferred.filter((m) => (modelCooldown.get(m) || 0) > now);
+    const orderedToTry = [...readyNow, ...coolingDown];
+
+    for (const model of orderedToTry.slice(0, instant ? 2 : 5)) {
+      const res = await requestGeminiModel(geminiKey, model, parts, expectJson, instant ? 12000 : 45000);
+      if (res.ok) return res.data;
+      errorLog.push(res.error);
+    }
+  }
+
+  throw new Error(`Không gọi được AI. Chi tiết: ${errorLog.slice(0, 3).join(' | ')}`);
 }
 
 export default async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
 
-  // Health-check endpoint: mở https://lernplan-2028.vercel.app/api/gemini để xem toàn bộ model khả dụng
+  // Health-check: mở https://lernplan-2028.vercel.app/api/gemini để kiểm tra Groq + tốc độ phản hồi
   if (req.method === 'GET') {
-    const apiKey = (process.env.GEMINI_API_KEY || '').trim();
-    if (!apiKey) {
-      return res.status(200).json({ ok: false, error: 'Thiếu biến GEMINI_API_KEY trên Vercel' });
-    }
-    const discovered = await discoverAvailableModels(apiKey, true);
-    const probes = [];
-    let workingModel = null;
-    let workingReply = null;
+    const groqKey = (process.env.GROQ_API_KEY || '').trim();
+    const geminiKey = (process.env.GEMINI_API_KEY || '').trim();
+    const t0 = Date.now();
+    const report = {
+      ok: false,
+      activeEngine: null,
+      latencyMs: null,
+      groqConfigured: Boolean(groqKey),
+      geminiConfigured: Boolean(geminiKey),
+    };
 
-    for (const model of discovered.slice(0, 5)) {
-      const probe = await requestModel(apiKey, model, [{ text: 'Reply OK' }], false, 12000);
-      probes.push({ model, ok: probe.ok, reply: probe.ok ? probe.data : probe.error });
-      if (probe.ok) {
-        workingModel = model;
-        workingReply = probe.data;
-        break;
+    if (groqKey) {
+      const groqRes = await callGroq({ parts: [{ text: 'Reply OK' }], expectJson: false, instant: true });
+      report.latencyMs = Date.now() - t0;
+      report.groq = groqRes.ok
+        ? { ok: true, model: groqRes.model, reply: groqRes.data }
+        : { ok: false, errors: groqRes.errors };
+      if (groqRes.ok) {
+        report.ok = true;
+        report.activeEngine = groqRes.model;
       }
     }
 
-    return res.status(200).json({
-      ok: Boolean(workingModel),
-      keyPrefix: `${apiKey.slice(0, 6)}...`,
-      workingModel,
-      testReply: workingReply,
-      probes,
-      availableTextModels: discovered,
-    });
+    if (geminiKey && !report.ok) {
+      const discovered = await discoverGeminiModels(geminiKey, true);
+      const probes = [];
+      for (const model of discovered.slice(0, 4)) {
+        const probe = await requestGeminiModel(geminiKey, model, [{ text: 'Reply OK' }], false, 12000);
+        probes.push({ model, ok: probe.ok, reply: probe.ok ? probe.data : probe.error });
+        if (probe.ok) {
+          report.ok = true;
+          report.activeEngine = model;
+          report.latencyMs = Date.now() - t0;
+          break;
+        }
+      }
+      report.gemini = { probes, availableTextModels: discovered };
+    }
+
+    return res.status(200).json(report);
   }
 
   if (req.method !== 'POST') {
@@ -253,6 +453,7 @@ export default async function handler(req, res) {
 
     const adminActions = [
       'import_onenote',
+      'filter_pdf_pages',
       'import_exam_batch',
       'generate_more_cards',
       'generate_more_quiz',
@@ -266,6 +467,69 @@ export default async function handler(req, res) {
           error: `Chỉ tài khoản Admin (${ADMIN_EMAIL}) mới có quyền thêm hoặc tạo nội dung mới.`,
         });
       }
+    }
+
+    // =========================================================================
+    // ACTION 0: TỰ ĐỘNG LỌC TRANG NHÁP & GOM CHỦ ĐỀ TỪ FILE PDF ONENOTE
+    // =========================================================================
+    if (action === 'filter_pdf_pages') {
+      const { fileName = 'OneNote.pdf', pages = [], existingSubjects = [] } = payload || {};
+      if (!Array.isArray(pages) || pages.length === 0) {
+        return res.status(400).json({ error: 'File PDF không có trang nào để phân tích.' });
+      }
+
+      const subjectListText = existingSubjects.length
+        ? existingSubjects.map((s) => `- ${s.title_de} (${s.title_vn})`).join('\n')
+        : '(Chưa có môn nào)';
+
+      const pagesDigest = pages
+        .map(
+          (p) =>
+            `[Trang ${p.pageNum}] (${p.charCount} ký tự${p.isImageHeavy ? ', NHIỀU HÌNH ẢNH/CHỮ VIẾT TAY' : ''}):\n${(
+              p.textPreview || '(Không có chữ gõ máy — có thể là ảnh chụp bảng/sơ đồ hoặc trang trắng)'
+            ).slice(0, 700)}`
+        )
+        .join('\n---\n');
+
+      const prompt = `Du bist ein IHK-Fachlehrer für "Veranstaltungskaufmann" (Deutsch + Vietnamesisch).
+Ein Azubi hat einen OneNote-Abschnitt als PDF ("${fileName}", ${pages.length} Seiten) exportiert.
+Darin sind wichtige Theorie-Seiten, ABER AUCH unnötige Schmierzettel, Hausaufgaben-Notizen, leere Seiten oder lose Übungs-Fragmente.
+
+DEINE AUFGABE:
+1. SORTIERE JEDE EINZELNE SEITE (1 bis ${pages.length}) in eine von zwei Kategorien:
+   - BEHALTEN (in "groups"): Seiten mit prüfungsrelevanter Theorie, Definitionen, Gesetzen (§ BGB, VStättV, UrhG, GEMA...), Formeln, Kalkulationen, Prozess-Schemata, Tabellen ODER bildlastige Tafelbilder/Folien (isImageHeavy mit fachlichem Hinweis).
+   - AUSSORTIEREN (in "skipped_pages"): Leere Seiten, lose Schmierzettel ohne Zusammenhang, reine Termin-/Hausaufgaben-Zettel, Pausen-/Organisationsnotizen, unvollständige Kritzeleien.
+2. GRUPPIERE zusammengehörige behaltene Seiten zu sinnvollen Lektions-Paketen (maximal 3-4 Seiten pro Paket, damit jede Lektion sauber und vollständig verarbeitet wird).
+3. Bestehende Fächer in der App:
+${subjectListText}
+
+SEITEN-ÜBERSICHT:
+${pagesDigest}
+
+ANTWORTE NUR ALS VALIDES JSON:
+{
+  "summary_vn": "Tóm tắt ngắn gọn bằng tiếng Việt (VD: Phát hiện 3 cụm bài lý thuyết quan trọng, đã lọc bỏ 4 trang nháp/lịch học)",
+  "groups": [
+    {
+      "id": "g1",
+      "title_de": "Thementitel Deutsch",
+      "title_vn": "Tên bài học tiếng Việt",
+      "subject_hint": "Tên môn học phù hợp",
+      "pageNums": [1, 2],
+      "reason_vn": "Lý do giữ lại (ngắn gọn, rõ ràng)"
+    }
+  ],
+  "skipped_pages": [
+    {
+      "pageNum": 3,
+      "title_hint": "Tiêu đề ngắn hoặc mô tả trang",
+      "reason_vn": "Lý do loại bỏ (VD: Trang nháp rời rạc / Dặn dò bài tập về nhà / Trang trống)"
+    }
+  ]
+}`;
+
+      const result = await callGemini({ parts: [{ text: prompt }], expectJson: true, maxTokens: 4000 });
+      return res.status(200).json({ data: result });
     }
 
     // =========================================================================
@@ -567,7 +831,7 @@ ANTWORTE NUR ALS VALIDES JSON:
     }
 
     // =========================================================================
-    // ACTION 5: TRA TỪ ĐIỂN BẤM-ĐÂU-DỊCH-ĐÓ
+    // ACTION 5: TRA TỪ ĐIỂN BẤM-ĐÂU-DỊCH-ĐÓ (CHẾ ĐỘ SIÊU TỐC ~200ms)
     // =========================================================================
     if (action === 'lookup_word') {
       const { word = '', contextSentence = '' } = payload || {};
@@ -576,32 +840,19 @@ ANTWORTE NUR ALS VALIDES JSON:
         return res.status(400).json({ error: 'Thiếu từ cần tra.' });
       }
 
-      const prompt = `Du bist ein präzises Deutsch-Vietnamesisch Fachwörterbuch für Auszubildende im Beruf Veranstaltungskaufmann (B2-Niveau).
-Analysiere das angeklickte deutsche Wort im Kontext seines Satzes.
+      const ctx = (contextSentence || '').slice(0, 220);
+      const prompt = `Deutsch-Vietnamesisch Wörterbuch (Veranstaltungskaufmann IHK, B2).
+Wort: "${cleaned}"
+Satz: "${ctx}"
+Gib NUR JSON zurück:
+{"lemma_de":"Grundform ohne Artikel","article":"der|die|das oder leer bei Nicht-Nomen","plural":"die ... oder leer","word_type":"Nomen|Verb|Adjektiv|Adverb|Präposition|Abkürzung","meaning_vn":"Nghĩa tiếng Việt ngắn gọn, đúng ngữ cảnh","example_de":"1 câu ví dụ ngắn DE","example_vn":"Dịch ví dụ VN","grammar_note_vn":"1 dòng ghi chú giống/chia từ nếu cần"}`;
 
-Angeklicktes Wort: "${cleaned}"
-Kontext-Satz: "${(contextSentence || '').slice(0, 400)}"
-
-REGELN:
-- Bestimme die Grundform (Lemma) des Wortes.
-- Wenn es ein Nomen ist: gib zwingend den richtigen Artikel ("der", "die" oder "das") und den Plural ("die ...") an!
-- Wenn es kein Nomen ist: article: "", plural: "", und gib die genaue Wortart an ("Verb", "Adjektiv", "Adverb", "Präposition", "Konjunktion", "Abkürzung", "Pronomen").
-- Erkläre die Bedeutung präzise im Kontext des Satzes.
-- Gib 1 kurzes, praxisnahes Beispiel (DE + VN) und einen kompakten Grammatik-Hinweis.
-
-ANTWORTE NUR ALS VALIDES JSON:
-{
-  "lemma_de": "Grundform ohne Artikel",
-  "article": "der",
-  "plural": "die ...",
-  "word_type": "Nomen",
-  "meaning_vn": "Nghĩa tiếng Việt rõ ràng trong ngữ cảnh",
-  "example_de": "Kurzer Beispielsatz auf Deutsch",
-  "example_vn": "Bản dịch ví dụ tiếng Việt",
-  "grammar_note_vn": "Ghi chú ngắn về giống/chia động từ/cách dùng"
-}`;
-
-      const result = await callGemini({ parts: [{ text: prompt }], expectJson: true });
+      const result = await callGemini({
+        parts: [{ text: prompt }],
+        expectJson: true,
+        instant: true,
+        maxTokens: 320,
+      });
       return res.status(200).json({ data: result });
     }
 
