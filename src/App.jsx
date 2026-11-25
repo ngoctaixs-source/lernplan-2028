@@ -41,6 +41,7 @@ import {
   StickyNote,
   FolderInput,
   GraduationCap,
+  GitMerge,
 } from 'lucide-react';
 import { supabase, isSupabaseConfigured, ADMIN_EMAIL } from './lib/supabase';
 import { callGeminiApi } from './lib/api';
@@ -67,6 +68,75 @@ import SettingsView from './components/SettingsView';
 const LOCAL_PREFS_KEY = 'lernplan2028_prefs_v2';
 const LOCAL_GUEST_KEY = 'lernplan2028_guest_v2';
 const LOCAL_DICT_CACHE_KEY = 'lernplan2028_dict_cache_v2';
+
+// Bộ môn chuẩn theo khung Berufsschule (đã lược bỏ sạch tên viết tắt giáo viên như _ZeH, _HsA, _GeM, _MuC, _DoR...)
+const SCHOOL_SUBJECT_PRESETS = [
+  {
+    code: 'VKO',
+    title_de: 'VKO · Veranstaltungskonzeption & -organisation',
+    title_vn: 'Thiết kế & Tổ chức sự kiện',
+    description_de: 'Konzeption, Planung, Durchführung und Nachbereitung von Veranstaltungen',
+    description_vn: 'Lên ý tưởng, lập kế hoạch, vận hành và tổng kết sự kiện',
+  },
+  {
+    code: 'BWT',
+    title_de: 'BWT · Betriebswirtschaftliche Themen',
+    title_vn: 'Kinh tế doanh nghiệp & Quản trị',
+    description_de: 'Betriebswirtschaftliche Prozesse, Kalkulation und Unternehmenssteuerung',
+    description_vn: 'Quy trình kinh tế doanh nghiệp, quản trị và điều hành',
+  },
+  {
+    code: 'RW',
+    title_de: 'RW · Rechnungswesen',
+    title_vn: 'Kế toán & Sổ sách (Bilanz, T-Konto, GuV)',
+    description_de: 'Buchführung, Eröffnungsbilanz, Bestandskonten, Erfolgskonten, GuV und Schlussbilanz',
+    description_vn: 'Hạch toán, Bảng cân đối, Tài khoản chữ T, GuV và Thuế USt/VSt',
+  },
+  {
+    code: 'BuB',
+    title_de: 'BuB · Recht & Betriebliche Grundlagen',
+    title_vn: 'Luật sự kiện, BGB & Pháp lý doanh nghiệp',
+    description_de: 'Rechtsbereiche, Verträge (BGB), Rechtsformen, Handelsregister und Aufbauorganisation',
+    description_vn: 'Các lĩnh vực pháp luật, hợp đồng BGB, loại hình doanh nghiệp và cơ cấu tổ chức',
+  },
+  {
+    code: 'IuF',
+    title_de: 'IuF · Information & Finanzierung',
+    title_vn: 'Thông tin, Đầu tư & Tài chính',
+    description_de: 'Informationsverarbeitung, Finanzierung, Investition und Controlling',
+    description_vn: 'Xử lý thông tin, nguồn vốn, đầu tư và tài chính sự kiện',
+  },
+  {
+    code: 'Mt',
+    title_de: 'Mt · Märkte & Marketing',
+    title_vn: 'Thị trường, Giá cả & Marketing',
+    description_de: 'Preisbildung, Preiselastizität, Marktformen und Event-Marketing',
+    description_vn: 'Hình thành giá, độ co giãn của cầu, mô hình thị trường và Marketing',
+  },
+  {
+    code: 'PuG',
+    title_de: 'PuG · Politik und Gesellschaft',
+    title_vn: 'Chính trị & Xã hội Đức',
+    description_de: 'Strukturprinzipien der BRD, Grundgesetz, Demokratie, Sozialstaat und Wirtschaftspolitik',
+    description_vn: 'Hiến pháp Đức (GG), nguyên tắc nhà nước, chính trị và xã hội',
+  },
+  {
+    code: 'D',
+    title_de: 'D · Deutsch & Kommunikation',
+    title_vn: 'Tiếng Đức & Giao tiếp chuyên môn',
+    description_de: 'Geschäftskorrespondenz, Textanalyse, Präsentation und berufliche Kommunikation',
+    description_vn: 'Soạn thảo văn bản hành chính, thuyết trình và giao tiếp nghề nghiệp',
+  },
+];
+
+function parseSubjectTitle(titleDe = '') {
+  const raw = String(titleDe || '').trim();
+  const match = raw.match(/^([A-Za-zÄÖÜäöüß0-9]{1,6})\s*[·:\-|]\s*(.+)$/);
+  if (match) {
+    return { code: match[1].trim(), name: match[2].trim() };
+  }
+  return { code: '', name: raw };
+}
 
 export default function App() {
   // User Preferences (Dark Mode, Font Scale, Dict Mode, TTS, VN)
@@ -161,6 +231,19 @@ export default function App() {
   const [videoInputSectionId, setVideoInputSectionId] = useState(null);
   const [videoDraft, setVideoDraft] = useState({ title: '', url: '' });
   const [movingLessonId, setMovingLessonId] = useState(null);
+
+  // Subject Organization & Management State
+  const [importDefaultSubjectId, setImportDefaultSubjectId] = useState('');
+  const [subjectFilterId, setSubjectFilterId] = useState('all');
+  const [subjectLessonSearch, setSubjectLessonSearch] = useState('');
+  const [collapsedSubjectIds, setCollapsedSubjectIds] = useState({});
+  const [showCreateSubjectForm, setShowCreateSubjectForm] = useState(false);
+  const [showPresetSubjects, setShowPresetSubjects] = useState(false);
+  const [newSubjectDraft, setNewSubjectDraft] = useState({ code: '', title_de: '', title_vn: '' });
+  const [editingSubjectId, setEditingSubjectId] = useState(null);
+  const [editSubjectDraft, setEditSubjectDraft] = useState({ code: '', title_de: '', title_vn: '' });
+  const [mergingSubjectId, setMergingSubjectId] = useState(null);
+  const [busySubjectAction, setBusySubjectAction] = useState(false);
 
   // Toast & JSON Import
   const [toast, setToast] = useState(null);
@@ -651,7 +734,7 @@ export default function App() {
       throw new Error('AI không trả về bài học nào hợp lệ.');
     }
 
-    let subjectId = aiResult.existing_subject_id;
+    let subjectId = options.forcedSubjectId || aiResult.existing_subject_id;
     let subjectObj = subjects.find((s) => s.id === subjectId) || null;
     if (!subjectId || !subjectObj) {
       // Kiểm tra trong DB tránh tạo trùng môn khi nạp hàng loạt từ PDF
@@ -802,6 +885,187 @@ export default function App() {
     }
     if (firstCreatedLessonId) {
       openLesson(firstCreatedLessonId);
+    }
+  };
+
+  // ==================== ADMIN: QUẢN LÝ MÔN HỌC CHUẨN (TẠO, SỬA, GỘP, SẮP XẾP, XÓA) ====================
+  const handleCreateSubject = async ({ title_de, title_vn = '', description_de = '', description_vn = '' }) => {
+    if (!isAdmin || !supabase) throw new Error('Chỉ Admin mới có quyền tạo môn học.');
+    const cleanDe = String(title_de || '').trim();
+    if (!cleanDe) throw new Error('Tên môn học không được để trống.');
+
+    const { data, error } = await supabase
+      .from('subjects')
+      .insert({
+        title_de: cleanDe,
+        title_vn: String(title_vn || '').trim(),
+        description_de,
+        description_vn,
+        sort_order: subjects.length + 1,
+      })
+      .select()
+      .single();
+    if (error) throw error;
+    await loadCurriculum();
+    showToast(`Đã tạo môn học "${cleanDe}"!`);
+    return data;
+  };
+
+  const handleSubmitNewSubjectForm = async (e) => {
+    e.preventDefault();
+    const code = newSubjectDraft.code.trim();
+    const nameDe = newSubjectDraft.title_de.trim();
+    if (!code && !nameDe) {
+      showToast('Hãy nhập Mã môn (VD: VKO, PuG, RW) hoặc Tên môn tiếng Đức.', 'error');
+      return;
+    }
+    const fullDe = code && nameDe ? `${code} · ${nameDe}` : nameDe || code;
+    setBusySubjectAction(true);
+    try {
+      await handleCreateSubject({
+        title_de: fullDe,
+        title_vn: newSubjectDraft.title_vn.trim(),
+      });
+      setNewSubjectDraft({ code: '', title_de: '', title_vn: '' });
+      setShowCreateSubjectForm(false);
+    } catch (err) {
+      showToast(err.message || 'Không tạo được môn học.', 'error');
+    } finally {
+      setBusySubjectAction(false);
+    }
+  };
+
+  const handleInitPresetSubjects = async (presetsToAdd) => {
+    if (!isAdmin || !supabase || !presetsToAdd.length) return;
+    setBusySubjectAction(true);
+    try {
+      const existingLower = new Set(subjects.map((s) => (s.title_de || '').toLowerCase()));
+      const existingCodes = new Set(
+        subjects.map((s) => parseSubjectTitle(s.title_de).code.toLowerCase()).filter(Boolean)
+      );
+      const rows = presetsToAdd
+        .filter(
+          (p) =>
+            !existingLower.has(p.title_de.toLowerCase()) &&
+            !existingCodes.has(p.code.toLowerCase())
+        )
+        .map((p, idx) => ({
+          title_de: p.title_de,
+          title_vn: p.title_vn,
+          description_de: p.description_de,
+          description_vn: p.description_vn,
+          sort_order: subjects.length + idx + 1,
+        }));
+
+      if (!rows.length) {
+        showToast('Các môn học này đều đã tồn tại trong danh sách rồi!');
+        setShowPresetSubjects(false);
+        return;
+      }
+
+      const { error } = await supabase.from('subjects').insert(rows);
+      if (error) throw error;
+      await loadCurriculum();
+      setShowPresetSubjects(false);
+      showToast(`Đã tạo nhanh ${rows.length} môn học chuẩn trường nghề (đã bỏ tên giáo viên)!`);
+    } catch (err) {
+      showToast(err.message || 'Không khởi tạo được danh sách môn.', 'error');
+    } finally {
+      setBusySubjectAction(false);
+    }
+  };
+
+  const handleSaveEditedSubject = async (subId) => {
+    if (!isAdmin || !supabase) return;
+    const code = editSubjectDraft.code.trim();
+    const nameDe = editSubjectDraft.title_de.trim();
+    if (!code && !nameDe) {
+      showToast('Tên môn tiếng Đức không được để trống.', 'error');
+      return;
+    }
+    const fullDe = code && nameDe ? `${code} · ${nameDe}` : nameDe || code;
+    setBusySubjectAction(true);
+    try {
+      const { error } = await supabase
+        .from('subjects')
+        .update({
+          title_de: fullDe,
+          title_vn: editSubjectDraft.title_vn.trim(),
+        })
+        .eq('id', subId);
+      if (error) throw error;
+      setEditingSubjectId(null);
+      await loadCurriculum();
+      showToast('Đã cập nhật tên môn học!');
+    } catch (err) {
+      showToast(err.message || 'Không sửa được tên môn.', 'error');
+    } finally {
+      setBusySubjectAction(false);
+    }
+  };
+
+  const handleReorderSubject = async (idx, direction) => {
+    if (!isAdmin || !supabase) return;
+    const swapIdx = idx + direction;
+    if (swapIdx < 0 || swapIdx >= subjects.length) return;
+    const a = subjects[idx];
+    const b = subjects[swapIdx];
+    await Promise.all([
+      supabase.from('subjects').update({ sort_order: swapIdx + 1 }).eq('id', a.id),
+      supabase.from('subjects').update({ sort_order: idx + 1 }).eq('id', b.id),
+    ]);
+    await loadCurriculum();
+  };
+
+  const handleMergeSubject = async (sourceSubId, targetSubId) => {
+    if (!isAdmin || !supabase || !sourceSubId || !targetSubId || sourceSubId === targetSubId) return;
+    const sourceSub = subjects.find((s) => s.id === sourceSubId);
+    const targetSub = subjects.find((s) => s.id === targetSubId);
+    if (
+      !window.confirm(
+        `Gộp toàn bộ bài học, từ vựng và Flashcard từ "${sourceSub?.title_de}" sang "${targetSub?.title_de}", rồi xóa môn cũ "${sourceSub?.title_de}"?`
+      )
+    ) {
+      return;
+    }
+    setBusySubjectAction(true);
+    try {
+      await Promise.all([
+        supabase.from('lessons').update({ subject_id: targetSubId }).eq('subject_id', sourceSubId),
+        supabase.from('flashcards').update({ subject_id: targetSubId }).eq('subject_id', sourceSubId),
+        supabase.from('vocabularies').update({ subject_id: targetSubId }).eq('subject_id', sourceSubId),
+        supabase.from('user_wrong_questions').update({ subject_id: targetSubId }).eq('subject_id', sourceSubId),
+      ]);
+      await supabase.from('subjects').delete().eq('id', sourceSubId);
+      setMergingSubjectId(null);
+      if (subjectFilterId === sourceSubId) setSubjectFilterId(targetSubId);
+      await loadCurriculum();
+      showToast(`Đã gộp sạch vào môn "${targetSub?.title_de}"!`);
+    } catch (err) {
+      showToast(err.message || 'Lỗi khi gộp môn học.', 'error');
+    } finally {
+      setBusySubjectAction(false);
+    }
+  };
+
+  const handleDeleteSubject = async (sub) => {
+    if (!isAdmin || !supabase) return;
+    const cnt = lessons.filter((l) => l.subject_id === sub.id).length;
+    const msg =
+      cnt > 0
+        ? `CẢNH BÁO: Môn "${sub.title_de}" đang có ${cnt} bài học! Nếu xóa môn này, toàn bộ ${cnt} bài bên trong sẽ bị xóa theo (hãy dùng nút Gộp môn nếu muốn giữ bài). Vẫn chắc chắn xóa?`
+        : `Xóa môn trống "${sub.title_de}"?`;
+    if (!window.confirm(msg)) return;
+    setBusySubjectAction(true);
+    try {
+      await supabase.from('subjects').delete().eq('id', sub.id);
+      if (subjectFilterId === sub.id) setSubjectFilterId('all');
+      await loadCurriculum();
+      showToast(`Đã xóa môn "${sub.title_de}".`);
+    } catch (err) {
+      showToast(err.message || 'Không xóa được môn học.', 'error');
+    } finally {
+      setBusySubjectAction(false);
     }
   };
 
@@ -1069,9 +1333,11 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const triggerAddKnowledge = () => {
+  const triggerAddKnowledge = (preselectedSubjectId = '') => {
     setMobileMenuOpen(false);
+    const targetId = typeof preselectedSubjectId === 'string' ? preselectedSubjectId : '';
     if (isAdmin) {
+      setImportDefaultSubjectId(targetId);
       setShowImportModal(true);
     } else {
       setShowAuthModal(true);
@@ -1221,7 +1487,7 @@ export default function App() {
         {/* Primary Add CTA */}
         <div className="p-4">
           <button
-            onClick={triggerAddKnowledge}
+            onClick={() => triggerAddKnowledge('')}
             className="w-full py-2.5 px-3.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl shadow-sm transition flex items-center justify-center gap-2"
           >
             <Plus className="w-4 h-4" />
@@ -1319,7 +1585,7 @@ export default function App() {
 
             <div className="p-4">
               <button
-                onClick={triggerAddKnowledge}
+                onClick={() => triggerAddKnowledge('')}
                 className="w-full py-2.5 bg-indigo-600 text-white text-xs font-bold rounded-xl flex items-center justify-center gap-2"
               >
                 <Plus className="w-4 h-4" /> Thêm kiến thức mới
@@ -1519,21 +1785,272 @@ export default function App() {
 
           {/* ==================== VIEW 2: SUBJECTS & LESSONS CURRICULUM ==================== */}
           {view === 'subjects' && (
-            <div className="space-y-6">
-              <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="space-y-5">
+              {/* Header & Admin Quick Actions */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
                   <h1 className="text-2xl font-extrabold text-slate-900 dark:text-white">Môn học & Lộ trình kiến thức</h1>
                   <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                    Sắp xếp từ Nền tảng → Liên kết → Mở rộng · Admin có thể đổi thứ tự hoặc chuyển bài giữa các môn
+                    Quản lý gọn theo đúng mã môn trên trường (VKO, BWT, RW, BuB, IuF, Mt, PuG, D) — không dính tên giáo viên, không chia vụn
                   </p>
                 </div>
-                <button
-                  onClick={triggerAddKnowledge}
-                  className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 shadow-sm"
-                >
-                  <Plus className="w-4 h-4" /> Nạp OneNote / Ảnh bảng
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  {isAdmin && (
+                    <>
+                      <button
+                        onClick={() => {
+                          setShowPresetSubjects((v) => !v);
+                          setShowCreateSubjectForm(false);
+                        }}
+                        className="px-3 py-2 bg-emerald-50 dark:bg-emerald-950/60 hover:bg-emerald-100 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 text-xs font-bold rounded-xl flex items-center gap-1.5"
+                      >
+                        <Sparkles className="w-3.5 h-3.5" /> Bộ môn chuẩn
+                      </button>
+                      <button
+                        onClick={() => {
+                          setShowCreateSubjectForm((v) => !v);
+                          setShowPresetSubjects(false);
+                        }}
+                        className="px-3 py-2 bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 text-xs font-bold rounded-xl flex items-center gap-1.5"
+                      >
+                        <Plus className="w-3.5 h-3.5" /> Thêm môn
+                      </button>
+                    </>
+                  )}
+                  <button
+                    onClick={() => triggerAddKnowledge(subjectFilterId !== 'all' ? subjectFilterId : '')}
+                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 shadow-sm"
+                  >
+                    <Plus className="w-4 h-4" /> Nạp OneNote / PDF
+                  </button>
+                </div>
               </div>
+
+              {/* Admin hint if not logged in */}
+              {!isAdmin && (
+                <div className="bg-indigo-50/70 dark:bg-indigo-950/30 border border-indigo-200/80 dark:border-indigo-800/70 rounded-2xl px-4 py-2.5 flex items-center justify-between gap-3 text-xs">
+                  <span className="text-indigo-900 dark:text-indigo-200">
+                    Đăng nhập quyền Admin để tạo bộ môn chuẩn, đổi tên môn, gộp môn hoặc sắp xếp lại bài học.
+                  </span>
+                  <button
+                    onClick={() => setShowAuthModal(true)}
+                    className="px-3 py-1.5 bg-indigo-600 text-white font-bold rounded-lg shrink-0"
+                  >
+                    Đăng nhập Admin
+                  </button>
+                </div>
+              )}
+
+              {/* ADMIN: 1-Click School Subject Presets Drawer */}
+              {isAdmin && showPresetSubjects && (
+                <div className="bg-white dark:bg-slate-900 rounded-3xl border-2 border-emerald-300 dark:border-emerald-800 p-5 space-y-4 shadow-sm">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <h2 className="text-sm font-extrabold text-slate-900 dark:text-white">
+                        Khởi tạo nhanh danh sách môn học chuẩn (khớp OneNote, đã bỏ tên thầy cô)
+                      </h2>
+                      <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                        Bấm 1 nút để tạo toàn bộ các môn còn thiếu — hoặc bấm từng môn riêng lẻ bên dưới. Sau khi tạo xong, bạn có thể gộp/sửa 2 môn cũ vào đúng môn chuẩn.
+                      </p>
+                    </div>
+                    <button onClick={() => setShowPresetSubjects(false)} className="p-1 text-slate-400 hover:text-slate-600">
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    {SCHOOL_SUBJECT_PRESETS.map((preset) => {
+                      const alreadyExists = subjects.some(
+                        (s) =>
+                          (s.title_de || '').toLowerCase() === preset.title_de.toLowerCase() ||
+                          parseSubjectTitle(s.title_de).code.toLowerCase() === preset.code.toLowerCase()
+                      );
+                      return (
+                        <div
+                          key={preset.code}
+                          className={`p-3 rounded-2xl border flex items-center justify-between gap-2.5 ${
+                            alreadyExists
+                              ? 'bg-slate-50 dark:bg-slate-800/40 border-slate-200 dark:border-slate-800 opacity-65'
+                              : 'bg-emerald-50/40 dark:bg-emerald-950/20 border-emerald-200 dark:border-emerald-900/60'
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span className="px-2 py-0.5 rounded-md text-[10px] font-black bg-indigo-600 text-white">
+                                {preset.code}
+                              </span>
+                              <span className="text-xs font-extrabold text-slate-900 dark:text-white truncate">
+                                {parseSubjectTitle(preset.title_de).name}
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 truncate">{preset.title_vn}</p>
+                          </div>
+                          {alreadyExists ? (
+                            <span className="text-[10px] font-bold text-emerald-600 dark:text-emerald-400 shrink-0">Đã có</span>
+                          ) : (
+                            <button
+                              type="button"
+                              disabled={busySubjectAction}
+                              onClick={() => handleInitPresetSubjects([preset])}
+                              className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-800 border border-emerald-300 dark:border-emerald-700 text-[11px] font-bold text-emerald-700 dark:text-emerald-300 hover:bg-emerald-50 shrink-0"
+                            >
+                              + Thêm
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="flex justify-end gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setShowPresetSubjects(false)}
+                      className="px-3.5 py-2 text-xs font-bold text-slate-500"
+                    >
+                      Đóng
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busySubjectAction}
+                      onClick={() => handleInitPresetSubjects(SCHOOL_SUBJECT_PRESETS)}
+                      className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs font-bold rounded-xl shadow-sm"
+                    >
+                      {busySubjectAction ? 'Đang khởi tạo...' : 'Tạo tất cả các môn còn thiếu'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* ADMIN: Manual Create New Subject Form */}
+              {isAdmin && showCreateSubjectForm && (
+                <form
+                  onSubmit={handleSubmitNewSubjectForm}
+                  className="bg-white dark:bg-slate-900 rounded-3xl border border-indigo-200 dark:border-indigo-800 p-5 space-y-3 shadow-sm"
+                >
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-sm font-extrabold text-slate-900 dark:text-white">Tạo môn học mới</h2>
+                    <button type="button" onClick={() => setShowCreateSubjectForm(false)} className="text-slate-400 hover:text-slate-600">
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5">
+                    <input
+                      value={newSubjectDraft.code}
+                      onChange={(e) => setNewSubjectDraft({ ...newSubjectDraft, code: e.target.value })}
+                      placeholder="Mã môn (VD: VKO, PuG, RW)"
+                      className="sm:col-span-3 px-3 py-2 text-xs font-bold bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl"
+                    />
+                    <input
+                      value={newSubjectDraft.title_de}
+                      onChange={(e) => setNewSubjectDraft({ ...newSubjectDraft, title_de: e.target.value })}
+                      placeholder="Tên tiếng Đức (VD: Politik und Gesellschaft)"
+                      className="sm:col-span-5 px-3 py-2 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl"
+                    />
+                    <input
+                      value={newSubjectDraft.title_vn}
+                      onChange={(e) => setNewSubjectDraft({ ...newSubjectDraft, title_vn: e.target.value })}
+                      placeholder="Tên tiếng Việt (VD: Chính trị & Xã hội)"
+                      className="sm:col-span-4 px-3 py-2 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl"
+                    />
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowCreateSubjectForm(false)}
+                      className="px-3.5 py-2 text-xs font-bold text-slate-500"
+                    >
+                      Hủy
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={busySubjectAction}
+                      className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl"
+                    >
+                      {busySubjectAction ? 'Đang lưu...' : 'Lưu môn học'}
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {/* Subject Filter Pills & Quick Search Bar (Giữ giao diện gọn sạch kể cả khi có 8+ môn) */}
+              {!loadingData && subjects.length > 0 && (
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <button
+                      onClick={() => setSubjectFilterId('all')}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition ${
+                        subjectFilterId === 'all'
+                          ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm'
+                          : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-800 hover:border-indigo-400'
+                      }`}
+                    >
+                      Tất cả ({subjects.length} môn · {lessons.length} bài)
+                    </button>
+                    {subjects.map((sub) => {
+                      const parsed = parseSubjectTitle(sub.title_de);
+                      const count = lessons.filter((l) => l.subject_id === sub.id).length;
+                      const active = subjectFilterId === sub.id;
+                      return (
+                        <button
+                          key={sub.id}
+                          onClick={() => setSubjectFilterId(sub.id)}
+                          className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition inline-flex items-center gap-1.5 ${
+                            active
+                              ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm'
+                              : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-800 hover:border-indigo-400'
+                          }`}
+                        >
+                          <span>{parsed.code || parsed.name.slice(0, 18)}</span>
+                          <span
+                            className={`px-1.5 py-0.2 rounded-full text-[10px] ${
+                              active ? 'bg-white/20 text-white' : 'bg-slate-100 dark:bg-slate-800 text-slate-500'
+                            }`}
+                          >
+                            {count}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                    <div className="relative flex-1">
+                      <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        value={subjectLessonSearch}
+                        onChange={(e) => setSubjectLessonSearch(e.target.value)}
+                        placeholder="Lọc nhanh bài học theo tên (VD: GuV, Privatrecht, Strukturprinzipien, OHG...)"
+                        className="w-full pl-9 pr-8 py-2 text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                      />
+                      {subjectLessonSearch && (
+                        <button
+                          onClick={() => setSubjectLessonSearch('')}
+                          className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                    {subjectFilterId === 'all' && subjects.length > 2 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const anyExpanded = subjects.some((s) => !collapsedSubjectIds[s.id]);
+                          const next = {};
+                          subjects.forEach((s) => {
+                            next[s.id] = anyExpanded;
+                          });
+                          setCollapsedSubjectIds(next);
+                        }}
+                        className="px-3 py-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs font-bold text-slate-600 dark:text-slate-300 hover:border-indigo-400 shrink-0"
+                      >
+                        {subjects.some((s) => !collapsedSubjectIds[s.id]) ? 'Thu gọn tất cả' : 'Mở tất cả'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
 
               {loadingData ? (
                 <div className="py-16 text-center text-slate-500 flex flex-col items-center gap-3">
@@ -1546,153 +2063,358 @@ export default function App() {
                   <p className="text-base font-bold">Chưa có môn học nào.</p>
                 </div>
               ) : (
-                <div className="space-y-5">
-                  {subjects.map((sub) => {
-                    const subLessons = lessons
-                      .filter((l) => l.subject_id === sub.id)
-                      .sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
-                    const subCards = flashcards.filter((c) => c.subject_id === sub.id);
-                    const subMastered = subCards.filter((c) => progressMap[c.id]?.status === 'mastered').length;
-                    const subPct = subCards.length ? Math.round((subMastered / subCards.length) * 100) : 0;
+                <div className="space-y-4">
+                  {subjects
+                    .filter((sub) => subjectFilterId === 'all' || sub.id === subjectFilterId)
+                    .map((sub) => {
+                      const subIndex = subjects.findIndex((s) => s.id === sub.id);
+                      const parsed = parseSubjectTitle(sub.title_de);
+                      const query = subjectLessonSearch.trim().toLowerCase();
+                      const allSubLessons = lessons
+                        .filter((l) => l.subject_id === sub.id)
+                        .sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
+                      const subLessons = query
+                        ? allSubLessons.filter(
+                            (l) =>
+                              (l.title_de || '').toLowerCase().includes(query) ||
+                              (l.title_vn || '').toLowerCase().includes(query) ||
+                              (sub.title_de || '').toLowerCase().includes(query)
+                          )
+                        : allSubLessons;
 
-                    return (
-                      <section
-                        key={sub.id}
-                        className="bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 shadow-sm overflow-hidden"
-                      >
-                        <div className="p-5 sm:p-6 border-b border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                          <div className="space-y-1">
-                            <div className="flex items-center gap-2">
-                              <h2 className="text-lg font-extrabold text-slate-900 dark:text-white">{sub.title_de}</h2>
-                              <button onClick={() => speakGerman(sub.title_de, ttsRate)} className="p-1.5 text-slate-400 hover:text-indigo-600">
-                                <Volume2 className="w-4 h-4" />
-                              </button>
-                            </div>
-                            {showVn && sub.title_vn && (
-                              <p className="text-sm font-semibold text-indigo-600 dark:text-indigo-400">{sub.title_vn}</p>
-                            )}
-                          </div>
-                          <div className="text-right shrink-0">
-                            <p className="text-xs font-bold text-slate-700 dark:text-slate-300">
-                              {subMastered}/{subCards.length} Flashcards ({subPct}%)
-                            </p>
-                            <div className="w-32 h-2 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden mt-1 ml-auto">
-                              <div className="h-full bg-emerald-500 rounded-full" style={{ width: `${subPct}%` }} />
-                            </div>
-                          </div>
-                        </div>
+                      if (query && subLessons.length === 0) return null;
 
-                        <div className="divide-y divide-slate-100 dark:divide-slate-800">
-                          {subLessons.map((les, idx) => {
-                            const meta = LEVEL_META[les.level] || LEVEL_META.foundation;
-                            const lesVocabCount = vocabularies.filter((v) => v.lesson_id === les.id).length;
-                            const lesCardCount = flashcards.filter((c) => c.lesson_id === les.id).length;
-                            const lesQuizCount = quizQuestions.filter((q) => q.lesson_id === les.id).length;
-                            const latestAttempt = quizAttempts.find((a) => a.lesson_id === les.id);
+                      const subCards = flashcards.filter((c) => c.subject_id === sub.id);
+                      const subMastered = subCards.filter((c) => progressMap[c.id]?.status === 'mastered').length;
+                      const subPct = subCards.length ? Math.round((subMastered / subCards.length) * 100) : 0;
+                      const isCollapsed = !query && subjectFilterId === 'all' && Boolean(collapsedSubjectIds[sub.id]);
+                      const isEditingSub = editingSubjectId === sub.id;
+                      const isMergingSub = mergingSubjectId === sub.id;
 
-                            return (
-                              <div
-                                key={les.id}
-                                onClick={() => openLesson(les.id)}
-                                className="p-4 sm:px-6 hover:bg-indigo-50/40 dark:hover:bg-indigo-950/30 transition cursor-pointer flex items-center justify-between gap-3 group"
-                              >
-                                <div className="flex items-start gap-3.5 min-w-0">
-                                  <div className="w-8 h-8 rounded-xl bg-slate-100 dark:bg-slate-800 group-hover:bg-indigo-600 group-hover:text-white text-slate-700 dark:text-slate-300 font-bold text-xs flex items-center justify-center shrink-0 mt-0.5 transition">
-                                    {idx + 1}
-                                  </div>
-                                  <div className="min-w-0 space-y-1">
-                                    <div className="flex items-center gap-2 flex-wrap">
-                                      <span className={`px-2 py-0.5 rounded-full text-[11px] font-bold border ${meta.badgeClass}`}>
-                                        {meta.label}
+                      return (
+                        <section
+                          key={sub.id}
+                          className="bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 shadow-sm overflow-hidden"
+                        >
+                          {/* Subject Card Header */}
+                          <div className="p-5 sm:px-6 border-b border-slate-100 dark:border-slate-800 space-y-3">
+                            {isEditingSub ? (
+                              <div className="space-y-2.5">
+                                <div className="flex items-center justify-between">
+                                  <span className="text-xs font-extrabold uppercase text-indigo-600">Đổi tên môn học</span>
+                                  <button onClick={() => setEditingSubjectId(null)} className="text-xs text-slate-500">Hủy</button>
+                                </div>
+                                <div className="grid grid-cols-1 sm:grid-cols-12 gap-2">
+                                  <input
+                                    value={editSubjectDraft.code}
+                                    onChange={(e) => setEditSubjectDraft({ ...editSubjectDraft, code: e.target.value })}
+                                    placeholder="Mã (VD: RW, BuB, PuG)"
+                                    className="sm:col-span-3 px-3 py-2 text-xs font-bold bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl"
+                                  />
+                                  <input
+                                    value={editSubjectDraft.title_de}
+                                    onChange={(e) => setEditSubjectDraft({ ...editSubjectDraft, title_de: e.target.value })}
+                                    placeholder="Tên tiếng Đức"
+                                    className="sm:col-span-5 px-3 py-2 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl"
+                                  />
+                                  <input
+                                    value={editSubjectDraft.title_vn}
+                                    onChange={(e) => setEditSubjectDraft({ ...editSubjectDraft, title_vn: e.target.value })}
+                                    placeholder="Tên tiếng Việt"
+                                    className="sm:col-span-4 px-3 py-2 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl"
+                                  />
+                                </div>
+                                <div className="flex justify-end">
+                                  <button
+                                    type="button"
+                                    disabled={busySubjectAction}
+                                    onClick={() => handleSaveEditedSubject(sub.id)}
+                                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl flex items-center gap-1.5"
+                                  >
+                                    <Save className="w-3.5 h-3.5" /> Lưu tên môn
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                                <div
+                                  className="space-y-1 flex-1 min-w-0 cursor-pointer"
+                                  onClick={() =>
+                                    setCollapsedSubjectIds((prev) => ({ ...prev, [sub.id]: !prev[sub.id] }))
+                                  }
+                                >
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    {parsed.code && (
+                                      <span className="px-2.5 py-0.5 rounded-lg text-xs font-black bg-indigo-600 text-white tracking-wide">
+                                        {parsed.code}
                                       </span>
-                                      <span className="text-[11px] text-slate-400">
-                                        {lesVocabCount} từ · {lesCardCount} thẻ · {lesQuizCount} câu test
-                                      </span>
-                                      {latestAttempt && (
-                                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-emerald-50 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300">
-                                          <Award className="w-3 h-3" /> {latestAttempt.score_percent}%
-                                        </span>
-                                      )}
-                                    </div>
-                                    <h3 className="text-sm sm:text-base font-bold text-slate-900 dark:text-white group-hover:text-indigo-600 dark:group-hover:text-indigo-400 transition">
-                                      {les.title_de}
-                                    </h3>
-                                    {showVn && les.title_vn && (
-                                      <p className="text-xs text-slate-500 dark:text-slate-400">{les.title_vn}</p>
                                     )}
+                                    <h2 className="text-base sm:text-lg font-extrabold text-slate-900 dark:text-white">
+                                      {parsed.name}
+                                    </h2>
+                                    <span className="px-2 py-0.5 rounded-full text-[11px] font-bold bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400">
+                                      {allSubLessons.length} bài
+                                    </span>
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        speakGerman(parsed.name, ttsRate);
+                                      }}
+                                      className="p-1 text-slate-400 hover:text-indigo-600"
+                                      title="Nghe phát âm tên môn"
+                                    >
+                                      <Volume2 className="w-4 h-4" />
+                                    </button>
                                   </div>
+                                  {showVn && sub.title_vn && (
+                                    <p className="text-xs sm:text-sm font-semibold text-indigo-600 dark:text-indigo-400">
+                                      {sub.title_vn}
+                                    </p>
+                                  )}
                                 </div>
 
-                                <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+                                <div className="flex items-center justify-between sm:justify-end gap-2 shrink-0">
+                                  {/* Progress */}
+                                  <div className="text-left sm:text-right mr-1">
+                                    <p className="text-[11px] font-bold text-slate-600 dark:text-slate-300">
+                                      {subMastered}/{subCards.length} thẻ ({subPct}%)
+                                    </p>
+                                    <div className="w-24 h-1.5 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden mt-1 sm:ml-auto">
+                                      <div className="h-full bg-emerald-500 rounded-full" style={{ width: `${subPct}%` }} />
+                                    </div>
+                                  </div>
+
+                                  {/* Admin Subject Actions */}
                                   {isAdmin && (
-                                    <>
+                                    <div className="flex items-center gap-1">
                                       <button
-                                        onClick={() => handleReorderLesson(subLessons, idx, -1)}
-                                        disabled={idx === 0}
-                                        title="Đẩy lên trên"
+                                        onClick={() => triggerAddKnowledge(sub.id)}
+                                        title={`Nạp bài mới trực tiếp vào môn ${sub.title_de}`}
+                                        className="px-2.5 py-1.5 rounded-xl bg-indigo-50 dark:bg-indigo-950/70 hover:bg-indigo-100 text-indigo-700 dark:text-indigo-300 text-[11px] font-bold inline-flex items-center gap-1 border border-indigo-200 dark:border-indigo-800"
+                                      >
+                                        <Plus className="w-3.5 h-3.5" /> Nạp bài
+                                      </button>
+                                      <button
+                                        onClick={() => {
+                                          setEditingSubjectId(sub.id);
+                                          setEditSubjectDraft({
+                                            code: parsed.code,
+                                            title_de: parsed.name,
+                                            title_vn: sub.title_vn || '',
+                                          });
+                                        }}
+                                        title="Đổi tên môn học"
+                                        className="p-1.5 rounded-lg text-slate-400 hover:text-indigo-600 hover:bg-slate-100 dark:hover:bg-slate-800"
+                                      >
+                                        <Edit3 className="w-4 h-4" />
+                                      </button>
+                                      {subjects.length > 1 && (
+                                        <button
+                                          onClick={() => setMergingSubjectId(isMergingSub ? null : sub.id)}
+                                          title="Gộp toàn bộ bài của môn này sang môn khác"
+                                          className="p-1.5 rounded-lg text-slate-400 hover:text-amber-600 hover:bg-slate-100 dark:hover:bg-slate-800"
+                                        >
+                                          <GitMerge className="w-4 h-4" />
+                                        </button>
+                                      )}
+                                      <button
+                                        onClick={() => handleReorderSubject(subIndex, -1)}
+                                        disabled={subIndex === 0}
+                                        title="Đẩy môn lên trên"
                                         className="p-1.5 text-slate-400 hover:text-indigo-600 disabled:opacity-25"
                                       >
                                         <ChevronUp className="w-4 h-4" />
                                       </button>
                                       <button
-                                        onClick={() => handleReorderLesson(subLessons, idx, 1)}
-                                        disabled={idx === subLessons.length - 1}
-                                        title="Đẩy xuống dưới"
+                                        onClick={() => handleReorderSubject(subIndex, 1)}
+                                        disabled={subIndex === subjects.length - 1}
+                                        title="Đẩy môn xuống dưới"
                                         className="p-1.5 text-slate-400 hover:text-indigo-600 disabled:opacity-25"
                                       >
                                         <ChevronDown className="w-4 h-4" />
                                       </button>
-                                      {subjects.length > 1 && (
-                                        <button
-                                          onClick={() => setMovingLessonId(movingLessonId === les.id ? null : les.id)}
-                                          title="Chuyển sang môn khác"
-                                          className="p-1.5 text-slate-400 hover:text-amber-600"
-                                        >
-                                          <FolderInput className="w-4 h-4" />
-                                        </button>
-                                      )}
                                       <button
-                                        onClick={() => handleDeleteLesson(les.id, les.title_de)}
-                                        title="Xóa bài học"
-                                        className="p-1.5 text-slate-400 hover:text-rose-600"
+                                        onClick={() => handleDeleteSubject(sub)}
+                                        title="Xóa môn học"
+                                        className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-slate-100 dark:hover:bg-slate-800"
                                       >
                                         <Trash2 className="w-4 h-4" />
                                       </button>
-                                    </>
+                                    </div>
                                   )}
-                                  <ChevronRight
-                                    onClick={() => openLesson(les.id)}
-                                    className="w-5 h-5 text-slate-400 group-hover:text-indigo-600 ml-1"
-                                  />
+
+                                  {/* Collapse/Expand Arrow */}
+                                  {subjectFilterId === 'all' && !query && (
+                                    <button
+                                      onClick={() =>
+                                        setCollapsedSubjectIds((prev) => ({ ...prev, [sub.id]: !prev[sub.id] }))
+                                      }
+                                      title={isCollapsed ? 'Mở danh sách bài' : 'Thu gọn'}
+                                      className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+                                    >
+                                      {isCollapsed ? <ChevronDown className="w-4 h-4" /> : <ChevronUp className="w-4 h-4" />}
+                                    </button>
+                                  )}
                                 </div>
                               </div>
-                            );
-                          })}
-                        </div>
+                            )}
 
-                        {/* Inline Move Lesson Picker */}
-                        {movingLessonId && subLessons.some((l) => l.id === movingLessonId) && (
-                          <div className="p-4 bg-amber-50 dark:bg-amber-950/40 border-t border-amber-200 dark:border-amber-800 flex flex-wrap items-center gap-3 text-xs">
-                            <span className="font-bold text-amber-900 dark:text-amber-200">Chuyển bài này sang môn:</span>
-                            {subjects
-                              .filter((other) => other.id !== sub.id)
-                              .map((other) => (
-                                <button
-                                  key={other.id}
-                                  onClick={() => handleMoveLessonSubject(movingLessonId, other.id)}
-                                  className="px-3 py-1.5 bg-white dark:bg-slate-900 border border-amber-300 dark:border-amber-700 rounded-lg font-bold hover:bg-amber-100"
-                                >
-                                  {other.title_de}
-                                </button>
-                              ))}
-                            <button onClick={() => setMovingLessonId(null)} className="text-slate-500 ml-auto">
-                              Hủy
-                            </button>
+                            {/* Inline Merge Subject Picker */}
+                            {isAdmin && isMergingSub && (
+                              <div className="p-3.5 rounded-2xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 space-y-2 text-xs">
+                                <div className="flex items-center justify-between">
+                                  <span className="font-bold text-amber-900 dark:text-amber-200">
+                                    Gộp tất cả {allSubLessons.length} bài của "{sub.title_de}" vào môn nào?
+                                  </span>
+                                  <button onClick={() => setMergingSubjectId(null)} className="text-slate-500">Hủy</button>
+                                </div>
+                                <div className="flex flex-wrap gap-1.5">
+                                  {subjects
+                                    .filter((other) => other.id !== sub.id)
+                                    .map((other) => (
+                                      <button
+                                        key={other.id}
+                                        type="button"
+                                        disabled={busySubjectAction}
+                                        onClick={() => handleMergeSubject(sub.id, other.id)}
+                                        className="px-3 py-1.5 bg-white dark:bg-slate-900 border border-amber-300 dark:border-amber-700 rounded-lg font-bold hover:bg-amber-100 dark:hover:bg-amber-900/40"
+                                      >
+                                        → {other.title_de}
+                                      </button>
+                                    ))}
+                                </div>
+                              </div>
+                            )}
                           </div>
-                        )}
-                      </section>
-                    );
-                  })}
+
+                          {/* Lessons List inside Subject */}
+                          {!isCollapsed && (
+                            <div className="divide-y divide-slate-100 dark:divide-slate-800">
+                              {subLessons.length === 0 ? (
+                                <div className="p-5 text-center text-xs text-slate-400 flex flex-col sm:flex-row items-center justify-center gap-2">
+                                  <span>Môn này chưa có bài học nào.</span>
+                                  {isAdmin && (
+                                    <button
+                                      onClick={() => triggerAddKnowledge(sub.id)}
+                                      className="text-indigo-600 dark:text-indigo-400 font-bold hover:underline"
+                                    >
+                                      + Nạp bài đầu tiên vào môn này
+                                    </button>
+                                  )}
+                                </div>
+                              ) : (
+                                subLessons.map((les, idx) => {
+                                  const meta = LEVEL_META[les.level] || LEVEL_META.foundation;
+                                  const lesVocabCount = vocabularies.filter((v) => v.lesson_id === les.id).length;
+                                  const lesCardCount = flashcards.filter((c) => c.lesson_id === les.id).length;
+                                  const lesQuizCount = quizQuestions.filter((q) => q.lesson_id === les.id).length;
+                                  const latestAttempt = quizAttempts.find((a) => a.lesson_id === les.id);
+
+                                  return (
+                                    <div
+                                      key={les.id}
+                                      onClick={() => openLesson(les.id)}
+                                      className="p-4 sm:px-6 hover:bg-indigo-50/40 dark:hover:bg-indigo-950/30 transition cursor-pointer flex items-center justify-between gap-3 group"
+                                    >
+                                      <div className="flex items-start gap-3.5 min-w-0">
+                                        <div className="w-8 h-8 rounded-xl bg-slate-100 dark:bg-slate-800 group-hover:bg-indigo-600 group-hover:text-white text-slate-700 dark:text-slate-300 font-bold text-xs flex items-center justify-center shrink-0 mt-0.5 transition">
+                                          {idx + 1}
+                                        </div>
+                                        <div className="min-w-0 space-y-1">
+                                          <div className="flex items-center gap-2 flex-wrap">
+                                            <span className={`px-2 py-0.5 rounded-full text-[11px] font-bold border ${meta.badgeClass}`}>
+                                              {meta.label}
+                                            </span>
+                                            <span className="text-[11px] text-slate-400">
+                                              {lesVocabCount} từ · {lesCardCount} thẻ · {lesQuizCount} câu test
+                                            </span>
+                                            {latestAttempt && (
+                                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-emerald-50 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300">
+                                                <Award className="w-3 h-3" /> {latestAttempt.score_percent}%
+                                              </span>
+                                            )}
+                                          </div>
+                                          <h3 className="text-sm sm:text-base font-bold text-slate-900 dark:text-white group-hover:text-indigo-600 dark:group-hover:text-indigo-400 transition">
+                                            {les.title_de}
+                                          </h3>
+                                          {showVn && les.title_vn && (
+                                            <p className="text-xs text-slate-500 dark:text-slate-400">{les.title_vn}</p>
+                                          )}
+                                        </div>
+                                      </div>
+
+                                      <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+                                        {isAdmin && (
+                                          <>
+                                            <button
+                                              onClick={() => handleReorderLesson(allSubLessons, idx, -1)}
+                                              disabled={idx === 0}
+                                              title="Đẩy lên trên"
+                                              className="p-1.5 text-slate-400 hover:text-indigo-600 disabled:opacity-25"
+                                            >
+                                              <ChevronUp className="w-4 h-4" />
+                                            </button>
+                                            <button
+                                              onClick={() => handleReorderLesson(allSubLessons, idx, 1)}
+                                              disabled={idx === allSubLessons.length - 1}
+                                              title="Đẩy xuống dưới"
+                                              className="p-1.5 text-slate-400 hover:text-indigo-600 disabled:opacity-25"
+                                            >
+                                              <ChevronDown className="w-4 h-4" />
+                                            </button>
+                                            {subjects.length > 1 && (
+                                              <button
+                                                onClick={() => setMovingLessonId(movingLessonId === les.id ? null : les.id)}
+                                                title="Chuyển sang môn khác"
+                                                className="p-1.5 text-slate-400 hover:text-amber-600"
+                                              >
+                                                <FolderInput className="w-4 h-4" />
+                                              </button>
+                                            )}
+                                            <button
+                                              onClick={() => handleDeleteLesson(les.id, les.title_de)}
+                                              title="Xóa bài học"
+                                              className="p-1.5 text-slate-400 hover:text-rose-600"
+                                            >
+                                              <Trash2 className="w-4 h-4" />
+                                            </button>
+                                          </>
+                                        )}
+                                        <ChevronRight
+                                          onClick={() => openLesson(les.id)}
+                                          className="w-5 h-5 text-slate-400 group-hover:text-indigo-600 ml-1"
+                                        />
+                                      </div>
+                                    </div>
+                                  );
+                                })
+                              )}
+                            </div>
+                          )}
+
+                          {/* Inline Move Lesson Picker */}
+                          {movingLessonId && allSubLessons.some((l) => l.id === movingLessonId) && (
+                            <div className="p-4 bg-amber-50 dark:bg-amber-950/40 border-t border-amber-200 dark:border-amber-800 flex flex-wrap items-center gap-3 text-xs">
+                              <span className="font-bold text-amber-900 dark:text-amber-200">Chuyển bài này sang môn:</span>
+                              {subjects
+                                .filter((other) => other.id !== sub.id)
+                                .map((other) => (
+                                  <button
+                                    key={other.id}
+                                    onClick={() => handleMoveLessonSubject(movingLessonId, other.id)}
+                                    className="px-3 py-1.5 bg-white dark:bg-slate-900 border border-amber-300 dark:border-amber-700 rounded-lg font-bold hover:bg-amber-100"
+                                  >
+                                    {other.title_de}
+                                  </button>
+                                ))}
+                              <button onClick={() => setMovingLessonId(null)} className="text-slate-500 ml-auto">
+                                Hủy
+                              </button>
+                            </div>
+                          )}
+                        </section>
+                      );
+                    })}
                 </div>
               )}
             </div>
@@ -2285,7 +3007,12 @@ export default function App() {
       {showImportModal && (
         <ImportModal
           subjects={subjects}
-          onClose={() => setShowImportModal(false)}
+          defaultSubjectId={importDefaultSubjectId}
+          onCreateSubject={handleCreateSubject}
+          onClose={() => {
+            setShowImportModal(false);
+            setImportDefaultSubjectId('');
+          }}
           onSaveImportedData={handleSaveImportedData}
           onBatchComplete={handleBatchImportComplete}
         />
