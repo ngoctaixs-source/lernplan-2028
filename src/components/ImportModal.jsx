@@ -14,6 +14,9 @@ import {
   Layers,
   Check,
   CheckCheck,
+  Folder,
+  Plus,
+  Lock,
 } from 'lucide-react';
 import { callGeminiApi } from '../lib/api';
 
@@ -201,9 +204,23 @@ async function renderPdfPageToJpeg(pdfDoc, pageNum, maxWidth = 1400, quality = 0
   };
 }
 
-export default function ImportModal({ subjects = [], onClose, onSaveImportedData, onBatchComplete }) {
+export default function ImportModal({
+  subjects = [],
+  defaultSubjectId = '',
+  onCreateSubject,
+  onClose,
+  onSaveImportedData,
+  onBatchComplete,
+}) {
   // 'pdf' | 'text' | 'images'
   const [mode, setMode] = useState('pdf');
+  // Khóa môn học đích: '' = AI tự xếp vào môn có sẵn, còn lại là ID môn học cụ thể
+  const [selectedSubjectId, setSelectedSubjectId] = useState(defaultSubjectId || '');
+  const [showNewSubjectForm, setShowNewSubjectForm] = useState(false);
+  const [newSubCode, setNewSubCode] = useState('');
+  const [newSubDe, setNewSubDe] = useState('');
+  const [newSubVn, setNewSubVn] = useState('');
+  const [creatingSubject, setCreatingSubject] = useState(false);
 
   // Text & Photos state
   const [rawText, setRawText] = useState('');
@@ -225,6 +242,38 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
   const pdfDocRef = useRef(null);
   const pdfInputRef = useRef(null);
   const imgInputRef = useRef(null);
+
+  const selectedSubjectObj = subjects.find((s) => s.id === selectedSubjectId) || null;
+
+  const handleQuickCreateSubject = async () => {
+    const cleanDe = newSubDe.trim();
+    const cleanCode = newSubCode.trim().toUpperCase();
+    if (!cleanDe && !cleanCode) {
+      setError('Vui lòng nhập ít nhất Mã môn (VD: VKO, PuG, RW) hoặc Tên môn tiếng Đức.');
+      return;
+    }
+    if (!onCreateSubject) return;
+    setError('');
+    setCreatingSubject(true);
+    try {
+      const fullDe = cleanCode && cleanDe ? `${cleanCode} · ${cleanDe}` : cleanDe || cleanCode;
+      const created = await onCreateSubject({
+        title_de: fullDe,
+        title_vn: newSubVn.trim(),
+      });
+      if (created?.id) {
+        setSelectedSubjectId(created.id);
+      }
+      setNewSubCode('');
+      setNewSubDe('');
+      setNewSubVn('');
+      setShowNewSubjectForm(false);
+    } catch (err) {
+      setError(err.message || 'Không tạo được môn học mới.');
+    } finally {
+      setCreatingSubject(false);
+    }
+  };
 
   // ==================== HANDLER 1: ĐỌC PDF + OCR TỪNG TRANG ẢNH + PHÂN LOẠI 70B ====================
   const handleSelectPdf = async (file) => {
@@ -310,6 +359,7 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
       setStatusMsg(`AI đang tổng hợp & chia bài cho toàn bộ ${totalPages} trang...`);
       const filterRes = await callGeminiApi('filter_pdf_pages', {
         fileName: file.name,
+        targetSubjectName: selectedSubjectObj?.title_de || '',
         pages: extractedPages.map((p) => ({
           pageNum: p.pageNum,
           charCount: p.charCount,
@@ -518,9 +568,18 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
           rawText: combinedText,
           images: fallbackImages,
           existingSubjects: workingSubjects,
+          targetSubjectId: selectedSubjectId || null,
+          targetSubjectName: selectedSubjectObj?.title_de || '',
         });
 
-        const saved = await onSaveImportedData(aiResult, firstPhotoDataUrl, { silent: true });
+        if (selectedSubjectId && aiResult) {
+          aiResult.existing_subject_id = selectedSubjectId;
+        }
+
+        const saved = await onSaveImportedData(aiResult, firstPhotoDataUrl, {
+          silent: true,
+          forcedSubjectId: selectedSubjectId || null,
+        });
         if (saved?.firstCreatedLessonId && !firstCreatedLessonId) {
           firstCreatedLessonId = saved.firstCreatedLessonId;
         }
@@ -603,10 +662,18 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
         rawText: finalRawText,
         images: payloadImages,
         existingSubjects: subjects,
+        targetSubjectId: selectedSubjectId || null,
+        targetSubjectName: selectedSubjectObj?.title_de || '',
       });
 
+      if (selectedSubjectId && aiResult) {
+        aiResult.existing_subject_id = selectedSubjectId;
+      }
+
       const firstPhoto = mode === 'images' && images[0] ? images[0].dataUrl : '';
-      await onSaveImportedData(aiResult, firstPhoto);
+      await onSaveImportedData(aiResult, firstPhoto, {
+        forcedSubjectId: selectedSubjectId || null,
+      });
       onClose();
     } catch (err) {
       setError(err.message || 'Lỗi khi phân tích kiến thức.');
@@ -649,8 +716,86 @@ export default function ImportModal({ subjects = [], onClose, onSaveImportedData
           </button>
         </div>
 
+        {/* CHỌN MÔN HỌC ĐÍCH — Khóa cứng môn học để bài không bao giờ bị chia vụn hay lạc môn */}
+        <div className="px-5 pt-3.5 space-y-2">
+          <div className="p-3 rounded-2xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 space-y-2">
+            <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+              <div className="flex items-center gap-1.5 text-xs font-extrabold text-slate-700 dark:text-slate-200 shrink-0">
+                {selectedSubjectId ? (
+                  <Lock className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                ) : (
+                  <Folder className="w-3.5 h-3.5 text-indigo-500" />
+                )}
+                <span>Lưu vào môn:</span>
+              </div>
+
+              <select
+                value={selectedSubjectId}
+                disabled={loading || pdfStage === 'importing'}
+                onChange={(e) => setSelectedSubjectId(e.target.value)}
+                className="flex-1 px-3 py-2 text-xs font-bold bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              >
+                <option value="">✨ Tự động xếp vào môn chính có sẵn (AI tự nhận diện)</option>
+                {subjects.map((sub) => (
+                  <option key={sub.id} value={sub.id}>
+                    {sub.title_de}{sub.title_vn ? ` — ${sub.title_vn}` : ''}
+                  </option>
+                ))}
+              </select>
+
+              {onCreateSubject && (
+                <button
+                  type="button"
+                  disabled={loading || pdfStage === 'importing'}
+                  onClick={() => setShowNewSubjectForm((v) => !v)}
+                  className="px-3 py-2 rounded-xl text-xs font-bold bg-indigo-50 dark:bg-indigo-950/70 hover:bg-indigo-100 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 inline-flex items-center justify-center gap-1 shrink-0"
+                >
+                  <Plus className="w-3.5 h-3.5" /> Tạo môn mới
+                </button>
+              )}
+            </div>
+
+            {selectedSubjectObj && (
+              <p className="text-[11px] text-emerald-700 dark:text-emerald-300 font-semibold">
+                Đã khóa cố định vào môn <strong>{selectedSubjectObj.title_de}</strong> — AI sẽ không tự tạo nhánh môn phụ khác.
+              </p>
+            )}
+
+            {showNewSubjectForm && (
+              <div className="pt-2 border-t border-slate-200 dark:border-slate-700 grid grid-cols-1 sm:grid-cols-12 gap-2">
+                <input
+                  value={newSubCode}
+                  onChange={(e) => setNewSubCode(e.target.value)}
+                  placeholder="Mã (VD: VKO, PuG, RW)"
+                  className="sm:col-span-3 px-2.5 py-1.5 text-xs font-bold uppercase bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg"
+                />
+                <input
+                  value={newSubDe}
+                  onChange={(e) => setNewSubDe(e.target.value)}
+                  placeholder="Tên tiếng Đức (VD: Politik und Gesellschaft)"
+                  className="sm:col-span-4 px-2.5 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg"
+                />
+                <input
+                  value={newSubVn}
+                  onChange={(e) => setNewSubVn(e.target.value)}
+                  placeholder="Tên tiếng Việt (VD: Chính trị & Xã hội)"
+                  className="sm:col-span-3 px-2.5 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg"
+                />
+                <button
+                  type="button"
+                  disabled={creatingSubject}
+                  onClick={handleQuickCreateSubject}
+                  className="sm:col-span-2 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white text-xs font-bold rounded-lg"
+                >
+                  {creatingSubject ? 'Đang lưu...' : 'Lưu môn'}
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+
         {/* Mode Tabs */}
-        <div className="px-5 pt-4 flex flex-wrap gap-2">
+        <div className="px-5 pt-3 flex flex-wrap gap-2">
           {[
             { id: 'pdf', label: 'File PDF OneNote (OCR từng trang)', icon: Filter },
             { id: 'text', label: 'Dán chữ từ OneNote', icon: FileText },
