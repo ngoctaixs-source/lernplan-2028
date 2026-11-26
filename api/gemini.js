@@ -1013,7 +1013,7 @@ ANTWORTE NUR ALS VALIDES JSON:
     }
 
     // =========================================================================
-    // ACTION 4: CHẤM BÀI TỰ LUẬN & ẢNH GIẤY NHÁP
+    // ACTION 4: CHẤM BÀI TỰ LUẬN & ẢNH GIẤY NHÁP 2 TẦNG (VISION ĐỌC ẢNH -> 70B CHẤM CHUẨN TEILPUNKTE IHK)
     // =========================================================================
     if (action === 'grade_quiz') {
       const { essays = [] } = payload || {};
@@ -1021,57 +1021,95 @@ ANTWORTE NUR ALS VALIDES JSON:
         return res.status(200).json({ data: { results: [] } });
       }
 
-      const parts = [];
-      const essaySummaries = essays.map((e, idx) => ({
-        index: idx + 1,
-        question_id: e.question_id,
-        question_de: e.question_de,
-        model_answer_de: e.model_answer_de,
-        typed_answer: e.user_answer || '(Không gõ chữ)',
-        has_handwritten_image: Boolean(e.image_base64),
-      }));
+      // TẦNG 1: Nếu có ảnh chụp bài làm viết tay / giấy nháp -> dùng Vision AI CHỈ để chép nguyên văn từng dòng chữ, số, T-Konto, trục biểu đồ
+      const transcribedEssays = [];
+      for (let idx = 0; idx < essays.length; idx++) {
+        const e = essays[idx];
+        let handwrittenTranscript = '';
+        if (e.image_base64) {
+          try {
+            const ocrPrompt = `Du bist ein präzises OCR-System für handgeschriebene Prüfungsantworten (Veranstaltungskaufmann IHK: Rechenwege, Buchungssätze, T-Konten, Bilanz/GuV, Diagramme, Freitext).
+Schreibe ALLES, was der Prüfling auf diesem Lösungsblatt geschrieben oder gezeichnet hat, WORT- UND ZAHLENGETREU ab — korrigiere KEINE Fehler des Prüflings!
+- Gib jede Rechenzeile genau so wieder wie geschrieben (inkl. falscher Zahlen oder Rundungen).
+- Bei Buchungssätzen: exakt "Soll ... an Haben ..." notieren.
+- Bei T-Konten / Bilanz / GuV: Soll/Aktiva und Haben/Passiva zeilenweise auflisten.
+- Bei Diagrammen: Achsenbeschriftung, Kurven, Schnittpunkt und Werte genau beschreiben.
+- Falls Text durchgestrichen ist, vermerke [durchgestrichen].
+Antworte NUR mit der reinen Transkription.`;
 
-      parts.push({
-        text: `Du bist ein wohlwollender, aber fachlich genauer IHK-Prüfer für Veranstaltungskaufleute.
-Bewerte die folgenden offenen Aufgaben. Der Prüfling darf auf Deutsch, Vietnamesisch oder gemischt antworten — UND bei Rechenaufgaben/Diagrammen/T-Konten kann ein Foto eines handgeschriebenen Lösungsblatts beigefügt sein!
+            const ocrRaw = await callGemini({
+              parts: [
+                { text: ocrPrompt },
+                {
+                  inlineData: {
+                    mimeType: e.image_mime_type || 'image/jpeg',
+                    data: e.image_base64,
+                  },
+                },
+              ],
+              expectJson: false,
+              maxTokens: 2000,
+              temperature: 0.1,
+            });
+            handwrittenTranscript = String(ocrRaw || '').trim();
+          } catch {
+            handwrittenTranscript = '(Ảnh bài làm bị mờ hoặc lỗi đọc OCR tạm thời — chỉ chấm phần chữ đã gõ nếu có)';
+          }
+        }
 
-WICHTIG BEI FOTOS VON HANDSCHRIFTLICHEN LÖSUNGEN:
-- Lies den handgeschriebenen Rechenweg, Zahlen, Tabellen, T-Konten oder gezeichneten Diagramme (Achsen, Schnittpunkte, Kurven) sehr genau ab.
-- Vergib Teilpunkte für richtige Rechenwege, auch wenn am Ende ein kleiner Rundungsfehler passiert ist, und erkläre genau, in welcher Zeile/Achse der Fehler lag. Bei Rechenaufgaben füge in feedback_vn / musterloesung_vn kurz die richtige Casio fx-580VN X Tastenfolge ([ ■/□ ], [ Ans ], [ S⇔D ], SOLVE) hinzu.
+        transcribedEssays.push({
+          index: idx + 1,
+          question_id: e.question_id,
+          question_de: e.question_de || '',
+          model_answer_de: e.model_answer_de || '',
+          typed_answer: e.user_answer || '(Không gõ chữ)',
+          handwritten_transcript: handwrittenTranscript || null,
+        });
+      }
 
-Aufgabenliste:
-${JSON.stringify(essaySummaries, null, 2)}
+      // TẦNG 2: Model lớn 70B (text-only, không bị đẩy sang 17B Vision!) chấm khắt khe, công tâm chuẩn Teilpunkte IHK
+      const gradingPrompt = `Du bist ein erfahrener, fairer, aber fachlich sehr genauer **IHK-Prüfer** für "Veranstaltungskaufmann / Veranstaltungskauffrau" (Deutsch + Vietnamesisch).
+Bewerte die folgenden offenen Aufgaben streng nach echtem IHK-Teilpunkte-System!
+Der Prüfling darf auf Deutsch, Vietnamesisch oder gemischt antworten — und handgeschriebene Lösungsblätter wurden bereits exakt im Feld "handwritten_transcript" transkribiert.
 
-ANTWORTE NUR ALS VALIDES JSON:
+BEWERTUNGSKRITERIEN (IHK-TEILPUNKTE-SCHEMA):
+1. **Ansatz / Methode / Formel (Phương pháp & Công thức — ~40%):** Hat der Prüfling den richtigen rechtlichen/fachlichen Ansatz bzw. die richtige Formel/Kontenlogik gewählt?
+2. **Rechnung / Umsetzung / Begründung (Phép tính & Lập luận — ~40%):** Stimmen Rechenweg, Zahlen, Buchungssatz (Soll an Haben) und rechtliche Begründung? Bei Folgefehlern (Folgefehlerprinzip IHK!) trotzdem faire Teilpunkte für den richtigen Weiterrechenweg vergeben!
+3. **IHK-Fachbegriffe & Prüfungsdeutsch (Từ khóa tiếng Đức ăn điểm — ~20%):** Wurden wichtige deutsche Fachbegriffe/Paragraphen korrekt genannt?
+4. **Wenn die Antwort leer/völlig falsch/geraten ist:** Vergib realistisch 0 bis 15 Punkte (NICHT künstlich aufblasen!).
+
+PFLICHTINHALTE FÜR JEDE AUFGABE:
+- **"feedback_de":** Konkretes Prüfer-Feedback auf Deutsch (Lob für Richtiges + genaue Zeile/Stelle des Fehlers + wie der exakte IHK-Satz lauten muss).
+- **"feedback_vn":** Nhận xét cực chi tiết, sắc bén bằng tiếng Việt theo 3 ý rõ ràng:
+  * **Điểm thành phần (Teilpunkte):** Phương pháp/Công thức (...%) · Tính toán/Lập luận (...%) · Từ khóa IHK (...%)
+  * **Chỗ làm đúng & Chỗ sai/thiếu:** Chỉ đích danh dòng nào, số nào hoặc tài khoản nào bị nhầm và giải thích TẠI SAO.
+  * **Câu tiếng Đức chuẩn nên viết khi đi thi** (in đậm từ khóa ăn điểm) + nếu là bài tính toán, ghi rõ tổ hợp phím **Casio fx-580VN X** (\`[ ■/□ ]\`, \`[ ▼ ]\`, \`[ Ans ]\`, \`[ S⇔D ]\`, \`SOLVE\`).
+- **"musterloesung_de":** Vollständige, mustergültige IHK-Lösung auf Deutsch (mit sauberem Rechenweg / LaTeX \`$$...$$\` / Buchungssatz).
+- **"musterloesung_vn":** Bản dịch & giải thích từng bước đáp án mẫu bằng tiếng Việt (+ bấm máy Casio fx-580VN X nếu có tính toán).
+
+AUFGABENLISTE:
+${JSON.stringify(transcribedEssays, null, 2)}
+
+ANTWORTE AUSSCHLIESSLICH MIT VALIDEM JSON:
 {
   "results": [
     {
       "question_id": "exakte question_id",
       "score": 85,
-      "feedback_de": "Konkretes Feedback, Lob für Richtiges & genaue Fehlerkorrektur auf Deutsch",
-      "feedback_vn": "Nhận xét chi tiết bằng tiếng Việt (nêu rõ đúng chỗ nào, sai/thiếu dòng nào)",
+      "feedback_de": "Konkretes IHK-Prüferfeedback auf Deutsch",
+      "feedback_vn": "Nhận xét chi tiết theo Teilpunkte + chỉ rõ lỗi sai + cách bấm Casio fx-580VN X nếu có tính toán",
       "musterloesung_de": "Saubere IHK-Musterlösung auf Deutsch",
-      "musterloesung_vn": "Bài mẫu tiếng Việt"
+      "musterloesung_vn": "Bài mẫu giải thích chi tiết bằng tiếng Việt"
     }
   ]
-}`,
-      });
+}`;
 
-      essays.forEach((e, idx) => {
-        if (e.image_base64) {
-          parts.push({
-            text: `>>> HANDSCHRIFTLICHES LÖSUNGSFOTO ZU AUFGABE #${idx + 1} (question_id: "${e.question_id}"):`,
-          });
-          parts.push({
-            inlineData: {
-              mimeType: e.image_mime_type || 'image/jpeg',
-              data: e.image_base64,
-            },
-          });
-        }
+      const result = await callGemini({
+        parts: [{ text: gradingPrompt }],
+        expectJson: true,
+        preferReasoning: true,
+        maxTokens: 6000,
       });
-
-      const result = await callGemini({ parts, expectJson: true, preferReasoning: true });
       return res.status(200).json({ data: result });
     }
 
@@ -1211,10 +1249,13 @@ ANTWORTE NUR ALS VALIDES JSON:
         sectionContentVn = '',
         diagramJson = null,
         extraContext = '',
+        quotedText = '',
         history = [],
         userMessage = '',
         image = null,
       } = payload || {};
+
+      const cleanQuote = String(quotedText || '').trim().slice(0, 800);
 
       const cleanUserMsg = String(userMessage || '').trim();
       if (!cleanUserMsg && !image?.base64) {
@@ -1239,7 +1280,15 @@ ANTWORTE NUR ALS VALIDES JSON:
 
       const systemPrompt = `Bạn là **Gia sư AI riêng của LernPlan 2028**, chuyên gia giảng dạy và chấm thi IHK ngành **Veranstaltungskaufmann / Veranstaltungskauffrau** (Tổ chức sự kiện tại Đức). Học viên là người Việt đang học Ausbildung (trình độ tiếng Đức B2), chuẩn bị cho kỳ thi tốt nghiệp IHK 2028 và dùng máy tính cầm tay **Casio fx-580VN X**.
 
-NGỮ CẢNH CỐ ĐỊNH CỦA PHẦN HỌC HIỆN TẠI (${contextType === 'quiz' ? 'BÀI TEST' : contextType === 'mistakes' ? 'KHO CÂU SAI' : 'MỤC LÝ THUYẾT'}):
+NGỮ CẢNH CỐ ĐỊNH CỦA PHẦN HỌC HIỆN TẠI (${
+        contextType === 'quiz'
+          ? 'BÀI TEST'
+          : contextType === 'mistakes'
+          ? 'KHO CÂU SAI'
+          : contextType === 'exam'
+          ? 'PHÒNG THI THỬ ALTKLAUSUREN'
+          : 'MỤC LÝ THUYẾT'
+      }):
 ${contextBlock || '(Học viên đang hỏi câu hỏi chung trong ngành Veranstaltungskaufmann)'}
 
 NGUYÊN TẮC TRẢ LỜI BẮT BUỘC:
@@ -1256,7 +1305,8 @@ NGUYÊN TẮC TRẢ LỜI BẮT BUỘC:
 4. **Hỗ trợ kiểm tra chủ động & chấm ảnh bài làm:**
    - Nếu học viên yêu cầu *"hỏi ngược lại 1 câu kiểm tra"*: ra đúng 1 câu tình huống/trắc nghiệm ngắn kiểu IHK bám sát mục này, CHƯA tiết lộ đáp án ngay — đợi học viên trả lời ở lượt sau rồi mới chấm và giải thích.
    - Nếu học viên gửi ảnh chụp bài làm viết tay hoặc đề bài: soi kỹ từng dòng/số/định khoản trong ảnh, chỉ rõ dòng nào đúng, dòng nào sai và sửa lại chuẩn IHK.
-5. **Độ dài vừa phải, dễ đọc trên màn hình:** Chia mục rõ bằng gạch đầu dòng, chữ đậm và bảng khi cần; tránh viết một khối chữ dày đặc.`;
+5. **Khi học viên TÔ ĐEN (trích dẫn) một đoạn cụ thể để hỏi:** Tập trung xoáy sâu 100% vào đúng cụm từ / dòng tính / điều luật mà học viên vừa tô đen, mổ xẻ bản chất thật dễ hiểu thay vì giảng lan man lại toàn bộ bài!
+6. **Độ dài vừa phải, dễ đọc trên màn hình:** Chia mục rõ bằng gạch đầu dòng, chữ đậm và bảng khi cần; tránh viết một khối chữ dày đặc.`;
 
       // Chuẩn hóa lịch sử 12 tin nhắn gần nhất
       const safeHistory = (Array.isArray(history) ? history : [])
@@ -1267,12 +1317,18 @@ NGUYÊN TẮC TRẢ LỜI BẮT BUỘC:
           content: m.content.slice(0, 2600),
         }));
 
+      const formattedUserText = cleanQuote
+        ? `[ĐOẠN HỌC VIÊN VỪA TÔ ĐEN ĐỂ HỎI TẬP TRUNG]:\n"${cleanQuote}"\n\n[CÂU HỎI CỦA HỌC VIÊN VỀ ĐOẠN NÀY]:\n${
+            cleanUserMsg || 'Hãy giải thích thật dễ hiểu và chi tiết đúng đoạn tôi vừa tô đen ở trên.'
+          }`
+        : cleanUserMsg;
+
       const latestUserContent = image?.base64
         ? [
             {
               type: 'text',
               text:
-                cleanUserMsg ||
+                formattedUserText ||
                 'Hãy đọc kỹ ảnh bài làm / tài liệu này và giải thích chi tiết từng bước giúp tôi.',
             },
             {
@@ -1282,7 +1338,7 @@ NGUYÊN TẮC TRẢ LỜI BẮT BUỘC:
               },
             },
           ]
-        : cleanUserMsg;
+        : formattedUserText;
 
       const chatMessages = [
         { role: 'system', content: systemPrompt },
