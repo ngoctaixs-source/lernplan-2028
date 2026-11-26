@@ -122,16 +122,18 @@ async function requestGroqModel(
   model,
   parts,
   expectJson,
-  { timeoutMs = 45000, maxTokens = 8000, temperature = 0.25 } = {}
+  { timeoutMs = 45000, maxTokens = 8000, temperature = 0.25, chatMessages = null } = {}
 ) {
   const url = 'https://api.groq.com/openai/v1/chat/completions';
-  const content = partsToOpenAIContent(parts);
-  const messages = [
-    ...(expectJson
-      ? [{ role: 'system', content: 'Respond with valid JSON only. No markdown fences or extra text.' }]
-      : []),
-    { role: 'user', content },
-  ];
+  const messages =
+    Array.isArray(chatMessages) && chatMessages.length > 0
+      ? chatMessages
+      : [
+          ...(expectJson
+            ? [{ role: 'system', content: 'Respond with valid JSON only. No markdown fences or extra text.' }]
+            : []),
+          { role: 'user', content: partsToOpenAIContent(parts) },
+        ];
 
   const attempt = async (useJsonFormat) => {
     const controller = new AbortController();
@@ -198,16 +200,23 @@ async function requestGroqModel(
 }
 
 async function callGroq({
-  parts,
+  parts = [],
+  chatMessages = null,
   expectJson = true,
   preferReasoning = false,
   instant = false,
   maxTokens = 8000,
+  temperature = null,
 }) {
   const groqKey = (process.env.GROQ_API_KEY || '').trim();
   if (!groqKey) return { ok: false, errors: [] };
 
-  const hasImages = parts.some((p) => p.inlineData?.data);
+  const hasImagesInParts = Array.isArray(parts) && parts.some((p) => p.inlineData?.data);
+  const hasImagesInChat =
+    Array.isArray(chatMessages) &&
+    chatMessages.some((m) => Array.isArray(m.content) && m.content.some((c) => c.type === 'image_url'));
+  const hasImages = hasImagesInParts || hasImagesInChat;
+
   const preferred = hasImages
     ? GROQ_VISION_MODELS
     : instant
@@ -222,7 +231,8 @@ async function callGroq({
   const reqOpts = {
     timeoutMs: instant ? 12000 : 45000,
     maxTokens: instant ? Math.min(maxTokens, 360) : maxTokens,
-    temperature: instant ? 0.1 : 0.25,
+    temperature: temperature !== null ? temperature : instant ? 0.1 : 0.25,
+    chatMessages,
   };
 
   const errors = [];
@@ -291,13 +301,61 @@ async function discoverGeminiModels(apiKey, forceRefresh = false) {
   }
 }
 
-async function requestGeminiModel(apiKey, model, parts, expectJson, timeoutMs = 45000) {
+function openAIChatToGeminiBody(chatMessages, isGemma) {
+  let systemText = '';
+  const contents = [];
+
+  for (const m of chatMessages) {
+    if (m.role === 'system') {
+      systemText += (systemText ? '\n\n' : '') + (typeof m.content === 'string' ? m.content : '');
+      continue;
+    }
+    const role = m.role === 'assistant' ? 'model' : 'user';
+    const parts = [];
+    if (Array.isArray(m.content)) {
+      for (const item of m.content) {
+        if (item.type === 'image_url' && item.image_url?.url) {
+          const match = String(item.image_url.url).match(/^data:([^;]+);base64,(.+)$/);
+          if (match) {
+            parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
+          }
+        } else if (item.text) {
+          parts.push({ text: item.text });
+        }
+      }
+    } else if (typeof m.content === 'string' && m.content.trim()) {
+      parts.push({ text: m.content });
+    }
+    if (parts.length > 0) {
+      contents.push({ role, parts });
+    }
+  }
+
+  if (systemText) {
+    if (isGemma && contents.length > 0 && contents[0].role === 'user') {
+      contents[0].parts.unshift({ text: `[SYSTEM INSTRUCTION]\n${systemText}\n\n` });
+      return { contents };
+    }
+    return {
+      systemInstruction: { parts: [{ text: systemText }] },
+      contents,
+    };
+  }
+  return { contents };
+}
+
+async function requestGeminiModel(apiKey, model, parts, expectJson, timeoutMs = 45000, chatMessages = null) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
   const isGemma = /^gemma/i.test(model);
+  const basePayload =
+    Array.isArray(chatMessages) && chatMessages.length > 0
+      ? openAIChatToGeminiBody(chatMessages, isGemma)
+      : { contents: [{ role: 'user', parts }] };
+
   const body = {
-    contents: [{ role: 'user', parts }],
+    ...basePayload,
     generationConfig: {
-      temperature: 0.3,
+      temperature: 0.35,
       ...(expectJson && !isGemma ? { responseMimeType: 'application/json' } : {}),
     },
   };
@@ -359,7 +417,15 @@ async function requestGeminiModel(apiKey, model, parts, expectJson, timeoutMs = 
   }
 }
 
-async function callGemini({ parts, expectJson = true, preferReasoning = false, instant = false, maxTokens = 8000 }) {
+async function callGemini({
+  parts = [],
+  chatMessages = null,
+  expectJson = true,
+  preferReasoning = false,
+  instant = false,
+  maxTokens = 8000,
+  temperature = null,
+}) {
   const groqKey = (process.env.GROQ_API_KEY || '').trim();
   const geminiKey = (process.env.GEMINI_API_KEY || '').trim();
   const errorLog = [];
@@ -370,7 +436,7 @@ async function callGemini({ parts, expectJson = true, preferReasoning = false, i
 
   // 1. Ưu tiên Groq (nhanh, ổn định, không bị 503)
   if (groqKey) {
-    const groqRes = await callGroq({ parts, expectJson, preferReasoning, instant, maxTokens });
+    const groqRes = await callGroq({ parts, chatMessages, expectJson, preferReasoning, instant, maxTokens, temperature });
     if (groqRes.ok) return groqRes.data;
     errorLog.push(...groqRes.errors);
   }
@@ -384,7 +450,14 @@ async function callGemini({ parts, expectJson = true, preferReasoning = false, i
     const orderedToTry = [...readyNow, ...coolingDown];
 
     for (const model of orderedToTry.slice(0, instant ? 2 : 5)) {
-      const res = await requestGeminiModel(geminiKey, model, parts, expectJson, instant ? 12000 : 45000);
+      const res = await requestGeminiModel(
+        geminiKey,
+        model,
+        parts,
+        expectJson,
+        instant ? 12000 : 45000,
+        chatMessages
+      );
       if (res.ok) return res.data;
       errorLog.push(res.error);
     }
@@ -1086,6 +1159,112 @@ ANTWORTE NUR ALS VALIDES JSON:
 }`;
       const result = await callGemini({ parts: [{ text: prompt }], expectJson: true });
       return res.status(200).json({ data: result });
+    }
+
+    // =========================================================================
+    // ACTION 9: GIA SƯ AI RIÊNG THEO TỪNG MỤC HỌC / BÀI TEST / KHO CÂU SAI (LERNPLAN 2028 IHK TUTOR)
+    // =========================================================================
+    if (action === 'chat_tutor') {
+      const {
+        contextType = 'section',
+        subjectName = '',
+        lessonTitle = '',
+        sectionHeading = '',
+        sectionContentDe = '',
+        sectionContentVn = '',
+        diagramJson = null,
+        extraContext = '',
+        history = [],
+        userMessage = '',
+        image = null,
+      } = payload || {};
+
+      const cleanUserMsg = String(userMessage || '').trim();
+      if (!cleanUserMsg && !image?.base64) {
+        return res.status(400).json({ error: 'Vui lòng nhập câu hỏi hoặc đính kèm ảnh bài làm.' });
+      }
+
+      const diagramSummary = diagramJson
+        ? `\n[SƠ ĐỒ / T-KONTO / BIỂU ĐỒ CỦA MỤC NÀY]:\n${JSON.stringify(diagramJson).slice(0, 1600)}`
+        : '';
+
+      const contextBlock = [
+        subjectName ? `- Môn học: ${subjectName}` : '',
+        lessonTitle ? `- Bài học: ${lessonTitle}` : '',
+        sectionHeading ? `- Mục đang học: ${sectionHeading}` : '',
+        sectionContentDe ? `\n[NỘI DUNG GỐC TIẾNG ĐỨC]:\n${String(sectionContentDe).slice(0, 3500)}` : '',
+        sectionContentVn ? `\n[BẢN DỊCH / GIẢI THÍCH TIẾNG VIỆT]:\n${String(sectionContentVn).slice(0, 2600)}` : '',
+        diagramSummary,
+        extraContext ? `\n[DỮ LIỆU BỔ SUNG / CÂU HỎI LIÊN QUAN]:\n${String(extraContext).slice(0, 4200)}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      const systemPrompt = `Bạn là **Gia sư AI riêng của LernPlan 2028**, chuyên gia giảng dạy và chấm thi IHK ngành **Veranstaltungskaufmann / Veranstaltungskauffrau** (Tổ chức sự kiện tại Đức). Học viên là người Việt đang học Ausbildung (trình độ tiếng Đức B2), chuẩn bị cho kỳ thi tốt nghiệp IHK 2028 và dùng máy tính cầm tay **Casio fx-580VN X**.
+
+NGỮ CẢNH CỐ ĐỊNH CỦA PHẦN HỌC HIỆN TẠI (${contextType === 'quiz' ? 'BÀI TEST' : contextType === 'mistakes' ? 'KHO CÂU SAI' : 'MỤC LÝ THUYẾT'}):
+${contextBlock || '(Học viên đang hỏi câu hỏi chung trong ngành Veranstaltungskaufmann)'}
+
+NGUYÊN TẮC TRẢ LỜI BẮT BUỘC:
+1. **Đi thẳng vào vấn đề, dễ hiểu như một người anh/chị đi trước kèm 1-1:**
+   - Giải thích bằng tiếng Việt tự nhiên, sắc bén, rõ bản chất ("tại sao lại thế?"), tuyệt đối không mở đầu kiểu rập khuôn sáo rỗng.
+   - Bám sát 100% ngữ cảnh của mục đang học ở trên (trích dẫn đúng số liệu, tên tài khoản, điều luật hoặc câu hỏi mà học viên đang hỏi).
+2. **Giữ chuẩn từ khóa tiếng Đức thi IHK:**
+   - Luôn in đậm các thuật ngữ, điều luật và tên tài khoản gốc tiếng Đức (VD: **§ 631 BGB**, **Werkvertrag**, **Deckungsbeitrag**, **Soll an Haben**, **Vorsteuer**, **Schlussbilanzkonto (SBK)**, **Künstlersozialkasse (KSK)**) để học viên thuộc mặt chữ đi thi.
+   - Khi học viên xin ví dụ, ưu tiên ví dụ thực tế sống động trong ngành tổ chức sự kiện tại Đức (concert, club event, hội nghị, thuê sân khấu/âm thanh ánh sáng, catering, ticketing, GEMA...).
+3. **Trình bày chuẩn IHK cho Kế toán & Tính toán + HƯỚNG DẪN BẤM CASIO fx-580VN X:**
+   - Công thức toán: viết bằng LaTeX chuẩn (\`$$...$$\` cho công thức lớn, \`$...$\` cho ký hiệu trong dòng, dùng \`\\frac{tử}{mẫu}\`) để app hiển thị phân số đẹp.
+   - Định khoản kế toán (Buchungssatz): trình bày rõ **Soll an Haben** hoặc kẻ bảng Markdown (\`| Soll-Konto | Betrag | an | Haben-Konto | Betrag |\`).
+   - Hễ có phép tính (Netto/Brutto 19%/7%, USt/VSt, Break-even, Kalkulation, Saldo T-Konto, Preiselastizität, KSK...): tách rõ **Công thức → Thay số → Kết quả** và luôn kèm mục **Bấm máy Casio fx-580VN X:** bằng ký hiệu phím đặt trong backtick (VD: \`[ ■/□ ] [ 6000 ] [ ▼ ] [ 26 ] [ - ] [ 6 ] [ = ]\`, \`[ Ans ]\`, \`[ S⇔D ]\`, hoặc \`SOLVE\`: \`[ x ]\`, \`[ ALPHA ] [ CALC ]\`, \`[ SHIFT ] [ CALC ] [ = ]\`).
+4. **Hỗ trợ kiểm tra chủ động & chấm ảnh bài làm:**
+   - Nếu học viên yêu cầu *"hỏi ngược lại 1 câu kiểm tra"*: ra đúng 1 câu tình huống/trắc nghiệm ngắn kiểu IHK bám sát mục này, CHƯA tiết lộ đáp án ngay — đợi học viên trả lời ở lượt sau rồi mới chấm và giải thích.
+   - Nếu học viên gửi ảnh chụp bài làm viết tay hoặc đề bài: soi kỹ từng dòng/số/định khoản trong ảnh, chỉ rõ dòng nào đúng, dòng nào sai và sửa lại chuẩn IHK.
+5. **Độ dài vừa phải, dễ đọc trên màn hình:** Chia mục rõ bằng gạch đầu dòng, chữ đậm và bảng khi cần; tránh viết một khối chữ dày đặc.`;
+
+      // Chuẩn hóa lịch sử 12 tin nhắn gần nhất
+      const safeHistory = (Array.isArray(history) ? history : [])
+        .slice(-12)
+        .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.trim())
+        .map((m) => ({
+          role: m.role,
+          content: m.content.slice(0, 2600),
+        }));
+
+      const latestUserContent = image?.base64
+        ? [
+            {
+              type: 'text',
+              text:
+                cleanUserMsg ||
+                'Hãy đọc kỹ ảnh bài làm / tài liệu này và giải thích chi tiết từng bước giúp tôi.',
+            },
+            {
+              type: 'image_url',
+              image_url: {
+                url: `data:${image.mimeType || 'image/jpeg'};base64,${image.base64}`,
+              },
+            },
+          ]
+        : cleanUserMsg;
+
+      const chatMessages = [
+        { role: 'system', content: systemPrompt },
+        ...safeHistory,
+        { role: 'user', content: latestUserContent },
+      ];
+
+      const replyText = await callGemini({
+        chatMessages,
+        expectJson: false,
+        maxTokens: 2400,
+        temperature: 0.35,
+      });
+
+      return res.status(200).json({
+        data: {
+          reply: String(replyText || '').trim(),
+        },
+      });
     }
 
     return res.status(400).json({ error: `Action không hợp lệ: ${action}` });
