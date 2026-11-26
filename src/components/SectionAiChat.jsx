@@ -15,6 +15,7 @@ import {
   Cloud,
   HardDrive,
   RefreshCw,
+  CornerDownRight,
 } from 'lucide-react';
 import { callGeminiApi } from '../lib/api';
 import RichContent from './RichContent';
@@ -66,7 +67,7 @@ function formatChatTime(iso) {
 
 export default function SectionAiChat({
   contextKey,
-  contextType = 'section', // 'section' | 'quiz' | 'mistakes'
+  contextType = 'section', // 'section' | 'quiz' | 'mistakes' | 'exam'
   subjectName = '',
   lessonTitle = '',
   sectionHeading = '',
@@ -80,18 +81,35 @@ export default function SectionAiChat({
   onWordClick = null,
   isCloudSynced = false,
   onClose = null,
+  pendingQuote = '',
+  onClearPendingQuote = null,
 }) {
   const [input, setInput] = useState('');
+  const [quotedText, setQuotedText] = useState('');
   const [attachedImg, setAttachedImg] = useState(null);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
   const [chatDictMode, setChatDictMode] = useState(false);
   const [copiedId, setCopiedId] = useState(null);
   const [pinnedId, setPinnedId] = useState(null);
+  // Nút nổi "↳ Hỏi Gia sư AI" khi người dùng tô đen chữ trong khung chat
+  const [selectionPopup, setSelectionPopup] = useState(null); // null | { text, top, left }
 
   const listEndRef = useRef(null);
+  const messagesBoxRef = useRef(null);
   const fileInputRef = useRef(null);
   const textareaRef = useRef(null);
+
+  // Nhận đoạn tô đen truyền từ bên ngoài (từ nội dung bài học) vào thẳng khung chat
+  useEffect(() => {
+    if (pendingQuote && String(pendingQuote).trim()) {
+      setQuotedText(String(pendingQuote).trim().slice(0, 600));
+      if (onClearPendingQuote) onClearPendingQuote();
+      setTimeout(() => {
+        textareaRef.current?.focus();
+      }, 60);
+    }
+  }, [pendingQuote, onClearPendingQuote]);
 
   // Tự phát hiện mục có chứa tính toán / kế toán để gợi ý nút hỏi nhanh Casio phù hợp
   const isMathHeavy = useMemo(() => {
@@ -102,6 +120,14 @@ export default function SectionAiChat({
   }, [subjectName, lessonTitle, sectionHeading, sectionContentDe]);
 
   const quickPrompts = useMemo(() => {
+    if (contextType === 'exam') {
+      return [
+        { label: 'Phân tích bẫy của đề thi này', text: 'Trong bộ đề thi thử này, các câu nào hay có bẫy của IHK nhất? Chỉ rõ cách tránh mất điểm.' },
+        { label: 'Cách bấm Casio các câu tính toán', text: 'Liệt kê công thức và tổ hợp phím bấm Casio fx-580VN X cho các câu tính toán có trong đề thi này.' },
+        { label: 'Cách viết câu trả lời ăn trọn Teilpunkte', text: 'Hướng dẫn tao cách trình bày câu tự luận bằng tiếng Đức sao cho ăn tối đa Teilpunkte trong đề thi này.' },
+        { label: 'Hỏi ngược 1 câu mô phỏng thi thật', text: 'Ra cho tao 1 câu mô phỏng thi IHK dựa trên bộ đề này, chưa tiết lộ đáp án để tao tự trả lời trước.' },
+      ];
+    }
     if (contextType === 'quiz') {
       return [
         { label: 'Giải thích câu hay nhầm nhất', text: 'Trong bài test này, câu nào dễ dính bẫy IHK nhất? Giải thích rõ tại sao các đáp án nhiễu lại sai.' },
@@ -141,6 +167,76 @@ export default function SectionAiChat({
     }
   }, [messages.length, sending]);
 
+  // Ẩn nút nổi tô đen khi click ra ngoài hoặc bấm Esc
+  useEffect(() => {
+    if (!selectionPopup) return undefined;
+    const hideOnScrollOrKey = (e) => {
+      if (e.type === 'keydown' && e.key !== 'Escape') return;
+      setSelectionPopup(null);
+    };
+    window.addEventListener('keydown', hideOnScrollOrKey);
+    window.addEventListener('scroll', hideOnScrollOrKey, true);
+    return () => {
+      window.removeEventListener('keydown', hideOnScrollOrKey);
+      window.removeEventListener('scroll', hideOnScrollOrKey, true);
+    };
+  }, [selectionPopup]);
+
+  // Phát hiện khi người dùng tô đen một đoạn chữ trong khung tin nhắn chat -> bật nút "↳ Hỏi Gia sư AI"
+  const handleDetectChatSelection = () => {
+    setTimeout(() => {
+      const box = messagesBoxRef.current;
+      if (!box) return;
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+        setSelectionPopup(null);
+        return;
+      }
+      const selectedStr = sel.toString().replace(/\s+/g, ' ').trim();
+      if (selectedStr.length < 3) {
+        setSelectionPopup(null);
+        return;
+      }
+      const range = sel.getRangeAt(0);
+      const ancestor = range.commonAncestorContainer;
+      const anchorEl = ancestor.nodeType === 1 ? ancestor : ancestor.parentElement;
+      if (!anchorEl || !box.contains(anchorEl)) {
+        setSelectionPopup(null);
+        return;
+      }
+
+      const rect = range.getBoundingClientRect();
+      if (!rect || (rect.width === 0 && rect.height === 0)) {
+        setSelectionPopup(null);
+        return;
+      }
+
+      const top = rect.top > 56 ? rect.top - 44 : rect.bottom + 8;
+      const left = Math.min(Math.max(rect.left + rect.width / 2, 92), window.innerWidth - 92);
+      setSelectionPopup({
+        text: selectedStr.slice(0, 600),
+        top,
+        left,
+      });
+    }, 15);
+  };
+
+  const handleApplyChatSelectionQuote = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!selectionPopup?.text) return;
+    setQuotedText(selectionPopup.text);
+    setSelectionPopup(null);
+    try {
+      window.getSelection()?.removeAllRanges();
+    } catch {
+      // ignore
+    }
+    setTimeout(() => {
+      textareaRef.current?.focus();
+    }, 40);
+  };
+
   const handleAttachFile = async (file) => {
     if (!file) return;
     if (!file.type?.startsWith('image/')) {
@@ -175,17 +271,26 @@ export default function SectionAiChat({
   const handleSend = async (overrideText = null) => {
     const textToSend = (overrideText !== null ? overrideText : input).trim();
     const imgToSend = overrideText !== null ? null : attachedImg;
+    const quoteToSend = overrideText !== null ? '' : quotedText.trim();
 
-    if (!textToSend && !imgToSend) return;
+    if (!textToSend && !imgToSend && !quoteToSend) return;
     if (sending) return;
 
     setError('');
+    setSelectionPopup(null);
     setSending(true);
+
+    const effectiveUserText =
+      textToSend ||
+      (quoteToSend
+        ? 'Giải thích chi tiết và dễ hiểu giúp tao đúng đoạn này.'
+        : 'Hãy đọc ảnh bài làm / tài liệu này và giải thích giúp tôi.');
 
     const userMsgObj = {
       id: `u-${Date.now()}`,
       role: 'user',
-      content: textToSend || 'Hãy đọc ảnh bài làm / tài liệu này và giải thích giúp tôi.',
+      content: effectiveUserText,
+      ...(quoteToSend ? { quotedText: quoteToSend } : {}),
       hasImage: Boolean(imgToSend),
       createdAt: new Date().toISOString(),
     };
@@ -198,6 +303,7 @@ export default function SectionAiChat({
 
     if (overrideText === null) {
       setInput('');
+      setQuotedText('');
       setAttachedImg(null);
     }
 
@@ -211,8 +317,12 @@ export default function SectionAiChat({
         sectionContentVn,
         diagramJson,
         extraContext,
-        history: messages.slice(-12).map((m) => ({ role: m.role, content: m.content })),
-        userMessage: userMsgObj.content,
+        quotedText: quoteToSend,
+        history: messages.slice(-12).map((m) => ({
+          role: m.role,
+          content: m.quotedText ? `[Trích dẫn: "${m.quotedText}"]\n${m.content}` : m.content,
+        })),
+        userMessage: effectiveUserText,
         image: imgToSend ? { base64: imgToSend.base64, mimeType: imgToSend.mimeType } : null,
       });
 
@@ -233,13 +343,14 @@ export default function SectionAiChat({
         title: sectionHeading || lessonTitle || 'Hội thoại AI',
       });
     } catch (err) {
-      // Khôi phục lại danh sách trước tin nhắn lỗi và giữ lại chữ cho user bấm gửi lại
+      // Khôi phục lại danh sách trước tin nhắn lỗi và giữ lại chữ + trích dẫn cho user bấm gửi lại
       onUpdateMessages(contextKey, messages, {
         contextType,
         title: sectionHeading || lessonTitle || 'Hội thoại AI',
       });
       if (overrideText === null) {
         setInput(textToSend);
+        if (quoteToSend) setQuotedText(quoteToSend);
         if (imgToSend) setAttachedImg(imgToSend);
       }
       setError(err.message || 'Không kết nối được với Gia sư AI. Thử lại sau vài giây.');
@@ -276,7 +387,25 @@ export default function SectionAiChat({
   };
 
   return (
-    <div className="mt-3 rounded-2xl border-2 border-indigo-200 dark:border-indigo-800/80 bg-gradient-to-b from-indigo-50/50 to-white dark:from-slate-900 dark:to-slate-950 overflow-hidden shadow-sm">
+    <div className="section-ai-chat-root mt-3 rounded-2xl border-2 border-indigo-200 dark:border-indigo-800/80 bg-gradient-to-b from-indigo-50/50 to-white dark:from-slate-900 dark:to-slate-950 overflow-hidden shadow-sm">
+      {/* Floating Highlight-to-Ask Pill (giống nút "↳ Hỏi Gemini") */}
+      {selectionPopup && (
+        <button
+          type="button"
+          onMouseDown={handleApplyChatSelectionQuote}
+          onTouchStart={handleApplyChatSelectionQuote}
+          style={{
+            top: `${selectionPopup.top}px`,
+            left: `${selectionPopup.left}px`,
+            transform: 'translateX(-50%)',
+          }}
+          className="fixed z-[80] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-full bg-slate-900 dark:bg-slate-800 hover:bg-indigo-600 text-white text-xs font-bold shadow-2xl border border-slate-700/80 transition animate-fadeIn whitespace-nowrap"
+        >
+          <CornerDownRight className="w-3.5 h-3.5 text-indigo-300" />
+          Hỏi Gia sư AI
+        </button>
+      )}
+
       {/* Header */}
       <div className="px-4 py-3 bg-indigo-600/10 dark:bg-indigo-950/60 border-b border-indigo-200/80 dark:border-indigo-800/70 flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2.5 min-w-0">
@@ -301,7 +430,7 @@ export default function SectionAiChat({
               </span>
             </div>
             <p className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
-              Đã nắm sẵn nội dung &ldquo;{sectionHeading || lessonTitle}&rdquo; · Không lẫn với các mục khác
+              Tô đen bất kỳ đoạn nào để bấm &ldquo;↳ Hỏi Gia sư AI&rdquo; · Lưu tách biệt cho &ldquo;{sectionHeading || lessonTitle}&rdquo;
             </p>
           </div>
         </div>
@@ -350,7 +479,12 @@ export default function SectionAiChat({
       </div>
 
       {/* Messages Viewport */}
-      <div className="p-3.5 sm:p-4 max-h-[28rem] overflow-y-auto space-y-3">
+      <div
+        ref={messagesBoxRef}
+        onMouseUp={handleDetectChatSelection}
+        onTouchEnd={handleDetectChatSelection}
+        className="p-3.5 sm:p-4 max-h-[28rem] overflow-y-auto space-y-3"
+      >
         {messages.length === 0 ? (
           <div className="space-y-3 py-1">
             <div className="flex items-start gap-2.5">
@@ -359,10 +493,10 @@ export default function SectionAiChat({
               </div>
               <div className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed space-y-1">
                 <p className="font-bold text-slate-800 dark:text-slate-100">
-                  Vướng chỗ nào cứ hỏi thẳng ở đây — tao đã đọc sẵn toàn bộ mục này rồi!
+                  Vướng chỗ nào cứ tô đen hoặc hỏi thẳng ở đây — tao đã đọc sẵn toàn bộ mục này rồi!
                 </p>
                 <p>
-                  Mày có thể hỏi ngắn kiểu <em>&ldquo;tại sao dòng này lại ghi bên Haben?&rdquo;</em>, nhờ chỉ bấm <strong>Casio fx-580VN X</strong>, hoặc nhấn <strong>Command + V</strong> dán thẳng ảnh chụp bài làm vào để tao kiểm tra từng dòng.
+                  Mày có thể <strong>tô đen bất kỳ câu/công thức nào</strong> ở bài học phía trên (hoặc trong câu trả lời của tao) rồi bấm <strong>↳ Hỏi Gia sư AI</strong>, nhờ chỉ bấm <strong>Casio fx-580VN X</strong>, hoặc nhấn <strong>Command + V</strong> dán thẳng ảnh chụp bài làm vào để tao kiểm tra.
                 </p>
               </div>
             </div>
@@ -389,7 +523,15 @@ export default function SectionAiChat({
               return (
                 <div key={msg.id} className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
                   {isUser ? (
-                    <div className="max-w-[88%] sm:max-w-[80%] rounded-2xl rounded-tr-sm bg-indigo-600 text-white px-3.5 py-2.5 text-xs sm:text-sm space-y-1 shadow-sm">
+                    <div className="max-w-[88%] sm:max-w-[80%] rounded-2xl rounded-tr-sm bg-indigo-600 text-white px-3.5 py-2.5 text-xs sm:text-sm space-y-1.5 shadow-sm">
+                      {msg.quotedText && (
+                        <div className="rounded-xl bg-white/12 border-l-2 border-amber-300 px-2.5 py-1.5 text-[11px] text-indigo-100 space-y-0.5">
+                          <span className="inline-flex items-center gap-1 text-[10px] font-bold text-amber-200">
+                            <CornerDownRight className="w-3 h-3" /> Đoạn đang hỏi:
+                          </span>
+                          <p className="italic line-clamp-3">&ldquo;{msg.quotedText}&rdquo;</p>
+                        </div>
+                      )}
                       {msg.hasImage && (
                         <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-white/15 text-[10px] font-bold">
                           <ImageIcon className="w-3 h-3" /> Đã gửi kèm ảnh bài làm
@@ -402,7 +544,7 @@ export default function SectionAiChat({
                     </div>
                   ) : (
                     <div className="max-w-[96%] sm:max-w-[90%] rounded-2xl rounded-tl-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-4 py-3 shadow-sm space-y-2.5">
-                      <div className="text-xs sm:text-sm text-slate-800 dark:text-slate-100">
+                      <div className="text-xs sm:text-sm text-slate-800 dark:text-slate-100 select-text">
                         <RichContent
                           text={msg.content}
                           isGerman={chatDictMode}
@@ -414,7 +556,7 @@ export default function SectionAiChat({
                       {/* Footer Actions on AI Reply */}
                       <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2 flex-wrap">
                         <span className="text-[10px] text-slate-400">
-                          Gia sư IHK {msg.createdAt ? `· ${formatChatTime(msg.createdAt)}` : ''}
+                          Gia sư IHK {msg.createdAt ? `· ${formatChatTime(msg.createdAt)}` : ''} · Tô đen chữ để hỏi sâu thêm
                         </span>
                         <div className="flex items-center gap-1.5">
                           {onPinToNote && (
@@ -493,6 +635,31 @@ export default function SectionAiChat({
         </div>
       )}
 
+      {/* Highlighted Quote Focus Chip (hiển thị đoạn vừa tô đen ngay trên khung gõ) */}
+      {quotedText && (
+        <div className="mx-3.5 mb-2 px-3 py-2 rounded-xl bg-indigo-50 dark:bg-indigo-950/60 border border-indigo-300 dark:border-indigo-700/80 flex items-start justify-between gap-2.5">
+          <div className="min-w-0 flex items-start gap-2">
+            <CornerDownRight className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400 shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <p className="text-[10px] font-extrabold uppercase tracking-wider text-indigo-700 dark:text-indigo-300">
+                Đang hỏi tập trung vào đoạn đã tô đen:
+              </p>
+              <p className="text-xs text-slate-700 dark:text-slate-200 italic line-clamp-2 mt-0.5">
+                &ldquo;{quotedText}&rdquo;
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setQuotedText('')}
+            className="p-1 rounded-lg text-slate-400 hover:text-rose-600 shrink-0"
+            title="Bỏ đoạn trích dẫn"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* Attached Image Preview */}
       {attachedImg && (
         <div className="mx-3.5 mb-2 p-2 rounded-xl bg-indigo-50/70 dark:bg-indigo-950/40 border border-indigo-200 dark:border-indigo-800 flex items-center justify-between gap-2">
@@ -557,13 +724,17 @@ export default function SectionAiChat({
               handleSend();
             }
           }}
-          placeholder="Hỏi sâu về mục này... (Enter gửi · Shift+Enter xuống dòng · Cmd+V dán ảnh)"
+          placeholder={
+            quotedText
+              ? 'Nhập câu hỏi về đoạn vừa tô đen (hoặc nhấn Enter để AI giải thích ngay)...'
+              : 'Hỏi sâu về mục này... (Enter gửi · Shift+Enter xuống dòng · Cmd+V dán ảnh)'
+          }
           className="flex-1 resize-none px-3.5 py-2.5 text-xs sm:text-sm bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 max-h-28"
         />
 
         <button
           type="button"
-          disabled={sending || (!input.trim() && !attachedImg)}
+          disabled={sending || (!input.trim() && !attachedImg && !quotedText.trim())}
           onClick={() => handleSend()}
           className="px-3.5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white text-xs font-bold shadow-sm transition inline-flex items-center gap-1.5 shrink-0"
         >
