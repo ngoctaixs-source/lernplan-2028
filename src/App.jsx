@@ -73,6 +73,7 @@ import MistakesAnalyticsView from './components/MistakesAnalyticsView';
 import SearchModal from './components/SearchModal';
 import SettingsView from './components/SettingsView';
 import SectionAiChat from './components/SectionAiChat';
+import LessonUpgradeModal from './components/LessonUpgradeModal';
 
 const LOCAL_PREFS_KEY = 'lernplan2028_prefs_v2';
 const LOCAL_GUEST_KEY = 'lernplan2028_guest_v2';
@@ -234,6 +235,7 @@ export default function App() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [showSearchModal, setShowSearchModal] = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
+  const [showUpgradeLessonModal, setShowUpgradeLessonModal] = useState(false);
 
   // Active lesson state
   const [activeLessonId, setActiveLessonId] = useState(null);
@@ -1167,6 +1169,317 @@ ${cleanReply}`;
     if (firstCreatedLessonId) {
       openLesson(firstCreatedLessonId);
     }
+  };
+
+  // ==================== ADMIN: CẬP NHẬT / NÂNG CẤP BÀI HỌC TẠI CHỖ (KHÔNG CẦN XÓA LÀM LẠI) ====================
+  const handleApplyLessonUpgrade = async ({
+    lessonId,
+    updateMode = 'rewrite',
+    studyPackMode = 'merge',
+    keepOriginalTitle = true,
+    upgradedLesson,
+    studyPack = null,
+    newlyArchivedPhotos = [],
+  }) => {
+    if (!supabase || !isAdmin) throw new Error('Chỉ Admin mới có quyền cập nhật bài học.');
+    const targetLesson = lessons.find((l) => l.id === lessonId);
+    if (!targetLesson) throw new Error('Không tìm thấy bài học cần cập nhật.');
+
+    const existingLessonSections = sections
+      .filter((s) => s.lesson_id === lessonId)
+      .sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
+
+    // 1. Gộp ảnh bản gốc cũ + ảnh mới tải lên (tối đa 10 trang)
+    const oldPhotos = parseSourceImages(targetLesson.source_image_url);
+    const mergedPhotos = [...oldPhotos, ...parseSourceImages(newlyArchivedPhotos)].slice(0, 10);
+    const serializedPhotos = serializeSourceImages(mergedPhotos);
+
+    // 2. Cập nhật metadata của chính bài học đang có (giữ nguyên ID, môn học, sort_order)
+    const lessonUpdatePayload = {
+      source_image_url: serializedPhotos,
+    };
+    if (updateMode === 'rewrite') {
+      if (!keepOriginalTitle && upgradedLesson?.title_de) {
+        lessonUpdatePayload.title_de = upgradedLesson.title_de;
+        lessonUpdatePayload.title_vn = upgradedLesson.title_vn || targetLesson.title_vn || '';
+      }
+      if (upgradedLesson?.overview_de) {
+        lessonUpdatePayload.overview_de = upgradedLesson.overview_de;
+      }
+      if (upgradedLesson?.overview_vn) {
+        lessonUpdatePayload.overview_vn = upgradedLesson.overview_vn;
+      }
+    }
+    const { error: lesUpdErr } = await supabase
+      .from('lessons')
+      .update(lessonUpdatePayload)
+      .eq('id', lessonId);
+    if (lesUpdErr) throw lesUpdErr;
+
+    // 3. Cập nhật lesson_sections (có cơ chế di chuyển bảo toàn Ghi chú cá nhân & Lịch sử chat Gia sư AI!)
+    const incomingSections = Array.isArray(upgradedLesson?.sections) ? upgradedLesson.sections : [];
+    if (incomingSections.length > 0) {
+      if (updateMode === 'rewrite') {
+        // Sao lưu Ghi chú cá nhân và Lịch sử chat AI của từng mục cũ trước khi thay
+        const savedNotesList = existingLessonSections
+          .map((sec, idx) => ({
+            idx,
+            heading: sec.heading_de || `Mục ${idx + 1}`,
+            text: (sectionNotes[sec.id] || '').trim(),
+          }))
+          .filter((item) => item.text);
+
+        const savedChatsList = existingLessonSections
+          .map((sec, idx) => ({
+            idx,
+            oldKey: `section:${sec.id}`,
+            heading: sec.heading_de || `Mục ${idx + 1}`,
+            messages: aiChatsMap[`section:${sec.id}`] || [],
+          }))
+          .filter((item) => item.messages.length > 0);
+
+        // Xóa mục cũ & chèn mục mới chuẩn hóa
+        const { error: delSecErr } = await supabase
+          .from('lesson_sections')
+          .delete()
+          .eq('lesson_id', lessonId);
+        if (delSecErr) throw delSecErr;
+
+        const secRows = incomingSections.map((s, idx) => ({
+          lesson_id: lessonId,
+          sort_order: idx + 1,
+          heading_de: s.heading_de || `Abschnitt ${idx + 1}`,
+          heading_vn: s.heading_vn || '',
+          content_de: s.content_de || '',
+          content_vn: s.content_vn || '',
+          diagram_json: s.diagram_json || null,
+          video_keywords: Array.isArray(s.video_keywords) ? s.video_keywords : [],
+          video_urls: [],
+        }));
+
+        const { data: insertedSecs, error: insSecErr } = await supabase
+          .from('lesson_sections')
+          .insert(secRows)
+          .select()
+          .order('sort_order', { ascending: true });
+        if (insSecErr) throw insSecErr;
+
+        // Khôi phục Ghi chú cá nhân & Lịch sử chat Gia sư AI sang ID mục mới
+        if (Array.isArray(insertedSecs) && insertedSecs.length > 0) {
+          const noteBuckets = {};
+          savedNotesList.forEach((item) => {
+            const targetSec = insertedSecs[Math.min(item.idx, insertedSecs.length - 1)];
+            if (!targetSec) return;
+            noteBuckets[targetSec.id] = noteBuckets[targetSec.id]
+              ? `${noteBuckets[targetSec.id]}
+
+[${item.heading}]:
+${item.text}`
+              : item.text;
+          });
+          for (const [newSecId, noteText] of Object.entries(noteBuckets)) {
+            await handleSaveSectionNote(newSecId, noteText);
+          }
+
+          const chatBuckets = {};
+          savedChatsList.forEach((item) => {
+            const targetSec = insertedSecs[Math.min(item.idx, insertedSecs.length - 1)];
+            if (!targetSec) return;
+            const newKey = `section:${targetSec.id}`;
+            if (!chatBuckets[newKey]) {
+              chatBuckets[newKey] = {
+                title: targetSec.heading_de || targetLesson.title_de,
+                messages: [],
+              };
+            }
+            chatBuckets[newKey].messages.push(...item.messages);
+            // Xóa khóa cũ đã mồ côi
+            handleUpdateAiChat(item.oldKey, [], { contextType: 'section' });
+          });
+          for (const [newKey, bundle] of Object.entries(chatBuckets)) {
+            handleUpdateAiChat(newKey, bundle.messages, {
+              contextType: 'section',
+              title: bundle.title,
+            });
+          }
+        }
+      } else {
+        // Chế độ NỐI THÊM vào cuối bài -> giữ nguyên 100% các mục cũ, ghi chú & chat cũ
+        const baseOrder = existingLessonSections.length;
+        const secRows = incomingSections.map((s, idx) => ({
+          lesson_id: lessonId,
+          sort_order: baseOrder + idx + 1,
+          heading_de: s.heading_de || `Abschnitt ${baseOrder + idx + 1}`,
+          heading_vn: s.heading_vn || '',
+          content_de: s.content_de || '',
+          content_vn: s.content_vn || '',
+          diagram_json: s.diagram_json || null,
+          video_keywords: Array.isArray(s.video_keywords) ? s.video_keywords : [],
+          video_urls: [],
+        }));
+        const { error: appendSecErr } = await supabase.from('lesson_sections').insert(secRows);
+        if (appendSecErr) throw appendSecErr;
+      }
+    }
+
+    // 4. Cập nhật Từ vựng, Flashcards & Bài Test theo chế độ người dùng chọn
+    let addedVocab = 0;
+    let addedCards = 0;
+    let addedQuiz = 0;
+
+    if (studyPackMode !== 'keep_only' && studyPack) {
+      const subjectId = targetLesson.subject_id;
+      const newVocabsRaw = Array.isArray(studyPack.vocabularies) ? studyPack.vocabularies : [];
+      const newCardsRaw = Array.isArray(studyPack.flashcards) ? studyPack.flashcards : [];
+      const newQuizRaw = Array.isArray(studyPack.quiz_questions) ? studyPack.quiz_questions : [];
+
+      if (studyPackMode === 'replace') {
+        await Promise.all([
+          supabase.from('vocabularies').delete().eq('lesson_id', lessonId),
+          supabase.from('flashcards').delete().eq('lesson_id', lessonId),
+          supabase.from('quiz_questions').delete().eq('lesson_id', lessonId),
+        ]);
+
+        if (newVocabsRaw.length > 0) {
+          await supabase.from('vocabularies').insert(
+            newVocabsRaw.map((v) => ({
+              subject_id: subjectId,
+              lesson_id: lessonId,
+              word_de: v.word_de || '',
+              article: v.article || '',
+              plural: v.plural || '',
+              word_type: v.word_type || 'Nomen',
+              meaning_vn: v.meaning_vn || '',
+              example_de: v.example_de || '',
+              example_vn: v.example_vn || '',
+              grammar_note_vn: v.grammar_note_vn || '',
+            }))
+          );
+          addedVocab = newVocabsRaw.length;
+        }
+        if (newCardsRaw.length > 0) {
+          await supabase.from('flashcards').insert(
+            newCardsRaw.map((f) => ({
+              lesson_id: lessonId,
+              subject_id: subjectId,
+              category: f.category || 'Fachbegriff',
+              front_de: f.front_de || '',
+              hint_vn: f.hint_vn || '',
+              back_de: f.back_de || '',
+              back_vn: f.back_vn || '',
+              example_de: f.example_de || '',
+              example_vn: f.example_vn || '',
+            }))
+          );
+          addedCards = newCardsRaw.length;
+        }
+        if (newQuizRaw.length > 0) {
+          await supabase.from('quiz_questions').insert(
+            newQuizRaw.map((q, idx) => ({
+              lesson_id: lessonId,
+              sort_order: idx + 1,
+              q_type: q.q_type === 'essay' ? 'essay' : 'mc',
+              question_de: q.question_de || '',
+              question_vn: q.question_vn || '',
+              options: q.q_type === 'mc' ? q.options || [] : [],
+              correct_index: q.q_type === 'mc' ? Number(q.correct_index ?? 0) : null,
+              model_answer_de: q.model_answer_de || '',
+              model_answer_vn: q.model_answer_vn || '',
+              explanation_de: q.explanation_de || '',
+              explanation_vn: q.explanation_vn || '',
+            }))
+          );
+          addedQuiz = newQuizRaw.length;
+        }
+      } else {
+        // Chế độ MERGE: giữ nguyên cũ (bảo toàn 100% SRS Flashcards) & chỉ chèn thêm mục chưa trùng
+        const existingVocabSet = new Set(
+          vocabularies.filter((v) => v.lesson_id === lessonId).map((v) => (v.word_de || '').trim().toLowerCase())
+        );
+        const existingCardSet = new Set(
+          flashcards.filter((c) => c.lesson_id === lessonId).map((c) => (c.front_de || '').trim().toLowerCase())
+        );
+        const existingQuizList = quizQuestions.filter((q) => q.lesson_id === lessonId);
+        const existingQuizSet = new Set(
+          existingQuizList.map((q) => (q.question_de || '').trim().toLowerCase().slice(0, 70))
+        );
+
+        const vocabsToAdd = newVocabsRaw.filter(
+          (v) => v.word_de && !existingVocabSet.has(v.word_de.trim().toLowerCase())
+        );
+        const cardsToAdd = newCardsRaw.filter(
+          (f) => f.front_de && !existingCardSet.has(f.front_de.trim().toLowerCase())
+        );
+        const quizToAdd = newQuizRaw.filter(
+          (q) => q.question_de && !existingQuizSet.has(q.question_de.trim().toLowerCase().slice(0, 70))
+        );
+
+        if (vocabsToAdd.length > 0) {
+          await supabase.from('vocabularies').insert(
+            vocabsToAdd.map((v) => ({
+              subject_id: subjectId,
+              lesson_id: lessonId,
+              word_de: v.word_de || '',
+              article: v.article || '',
+              plural: v.plural || '',
+              word_type: v.word_type || 'Nomen',
+              meaning_vn: v.meaning_vn || '',
+              example_de: v.example_de || '',
+              example_vn: v.example_vn || '',
+              grammar_note_vn: v.grammar_note_vn || '',
+            }))
+          );
+          addedVocab = vocabsToAdd.length;
+        }
+        if (cardsToAdd.length > 0) {
+          await supabase.from('flashcards').insert(
+            cardsToAdd.map((f) => ({
+              lesson_id: lessonId,
+              subject_id: subjectId,
+              category: f.category || 'Fachbegriff',
+              front_de: f.front_de || '',
+              hint_vn: f.hint_vn || '',
+              back_de: f.back_de || '',
+              back_vn: f.back_vn || '',
+              example_de: f.example_de || '',
+              example_vn: f.example_vn || '',
+            }))
+          );
+          addedCards = cardsToAdd.length;
+        }
+        if (quizToAdd.length > 0) {
+          const baseOrder = existingQuizList.length;
+          await supabase.from('quiz_questions').insert(
+            quizToAdd.map((q, idx) => ({
+              lesson_id: lessonId,
+              sort_order: baseOrder + idx + 1,
+              q_type: q.q_type === 'essay' ? 'essay' : 'mc',
+              question_de: q.question_de || '',
+              question_vn: q.question_vn || '',
+              options: q.q_type === 'mc' ? q.options || [] : [],
+              correct_index: q.q_type === 'mc' ? Number(q.correct_index ?? 0) : null,
+              model_answer_de: q.model_answer_de || '',
+              model_answer_vn: q.model_answer_vn || '',
+              explanation_de: q.explanation_de || '',
+              explanation_vn: q.explanation_vn || '',
+            }))
+          );
+          addedQuiz = quizToAdd.length;
+        }
+      }
+    }
+
+    setOpenExplainIds({});
+    await loadCurriculum();
+    const extraSummary =
+      studyPackMode === 'keep_only'
+        ? ''
+        : ` · +${addedVocab} từ, +${addedCards} thẻ, +${addedQuiz} câu test`;
+    showToast(
+      updateMode === 'rewrite'
+        ? `Đã nâng cấp bài học lên chuẩn AI mới nhất (${incomingSections.length} mục${extraSummary})!`
+        : `Đã nối thêm ${incomingSections.length} mục mới vào cuối bài${extraSummary}!`
+    );
   };
 
   // ==================== ADMIN: QUẢN LÝ MÔN HỌC CHUẨN (TẠO, SỬA, GỘP, SẮP XẾP, XÓA) ====================
@@ -2727,7 +3040,18 @@ ${cleanReply}`;
                 >
                   <ArrowLeft className="w-4 h-4" /> Quay lại Môn học
                 </button>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  {isAdmin && (
+                    <button
+                      type="button"
+                      onClick={() => setShowUpgradeLessonModal(true)}
+                      title="Nâng cấp bài học này theo chuẩn AI mới nhất hoặc bổ sung thêm trang tài liệu mới mà không cần xóa bài cũ"
+                      className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/60 hover:bg-emerald-100 dark:hover:bg-emerald-900/60 px-3 py-2 rounded-xl border border-emerald-200 dark:border-emerald-800 transition"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      Cập nhật bài
+                    </button>
+                  )}
                   {activeSourceImages.length > 0 && (
                     <button
                       onClick={() => setShowBoardPhoto((s) => !s)}
@@ -3741,6 +4065,21 @@ ${cleanReply}`;
           }}
           onSaveImportedData={handleSaveImportedData}
           onBatchComplete={handleBatchImportComplete}
+        />
+      )}
+
+      {showUpgradeLessonModal && activeLesson && (
+        <LessonUpgradeModal
+          lesson={activeLesson}
+          subject={activeSubject}
+          subjects={subjects}
+          sections={activeSections}
+          sourceImages={activeSourceImages}
+          vocabCount={activeVocabs.length}
+          cardCount={activeCards.length}
+          quizCount={activeQuiz.length}
+          onClose={() => setShowUpgradeLessonModal(false)}
+          onApplyUpgrade={handleApplyLessonUpgrade}
         />
       )}
 
