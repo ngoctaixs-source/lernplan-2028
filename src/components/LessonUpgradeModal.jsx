@@ -413,6 +413,17 @@ export default function LessonUpgradeModal({
       setProgressPct(95);
       setStatusMsg('Đang lưu bản cập nhật vào Supabase (bảo toàn Ghi chú cá nhân & Lịch sử Gia sư AI)...');
 
+      const addedSourceFiles = [];
+      if (newPdfFile?.name) {
+        addedSourceFiles.push(newPdfFile.name.trim());
+      } else if (newImages.length > 0) {
+        newImages
+          .map((im) => (im.name || '').trim())
+          .filter(Boolean)
+          .slice(0, 2)
+          .forEach((n) => addedSourceFiles.push(n));
+      }
+
       await onApplyUpgrade({
         lessonId: lesson.id,
         updateMode,
@@ -424,6 +435,7 @@ export default function LessonUpgradeModal({
         },
         studyPack,
         newlyArchivedPhotos,
+        addedSourceFiles,
       });
 
       setProgressPct(100);
