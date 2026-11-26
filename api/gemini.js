@@ -527,6 +527,7 @@ export default async function handler(req, res) {
     const adminActions = [
       'ocr_pdf_page',
       'import_onenote',
+      'generate_study_pack',
       'filter_pdf_pages',
       'import_exam_batch',
       'generate_more_cards',
@@ -552,25 +553,20 @@ export default async function handler(req, res) {
         return res.status(400).json({ error: 'Thiếu dữ liệu ảnh trang PDF để đọc OCR.' });
       }
 
-      const prompt = `Du bist ein hochpräzises OCR-System für deutsche Berufsschul-Unterlagen (Veranstaltungskaufmann IHK — inkl. Rechnungswesen, Kalkulation, Recht, BWL/VWL).
+      const prompt = `Du bist ein hochpräzises OCR-System für deutsche Berufsschul-Unterlagen (Veranstaltungskaufmann IHK — inkl. Rechnungswesen, Kalkulation, Recht, BWL/VWL, KSK).
 Lies diese EINE Seite (Seite ${pageNum}) VOLLSTÄNDIG, WORTGETREU und LÜCKENLOS aus!
 
 STRENGE REGELN:
-1. GEDRUCKTER TEXT + HANDSCHRIFTLICHE NOTIZEN (BLAUE/ROTE/LILA TINTE):
-   - Lies SOWOHL den gedruckten Arbeitsblatt-Text ALS AUCH ALLE darüber oder an den Rand geschriebenen handschriftlichen Lösungen, Pfeile, Markierungen, Häkchen und Korrekturen der Lehrkraft vollständig aus!
-   - Kennzeichne handschriftliche Lehrer-Notizen klar mit [Handschrift: ...], damit die Lösung der Lehrkraft exakt erhalten bleibt.
-2. RECHNUNGSWESEN, T-KONTEN, BILANZ, GuV & BUCHUNGSSÄTZE:
-   - Übernimm JEDE Zahl exakt im deutschen Format (z. B. 360.000,00 €, 14.328,50 €, 19% netto/brutto) — runde oder verändere NIEMALS Zahlen!
-   - Bei Buchungssätzen: exakt notieren (z. B. "Wareneingang 400,00 + Vorsteuer 76,00 an Verbindlichkeiten LL 476,00").
-   - Bei T-Konten / Bilanz / GuV / Schlussbilanzkonto: strukturiere klar nach Kontoname, Soll (links) vs. Haben (rechts) bzw. Aktiva vs. Passiva, inklusive AB, SBK, GuV-Saldo und Endsumme!
-3. PRAXISFÄLLE & AUFGABEN:
-   - Wenn auf der Seite "Situation 1, 2, 3, 4", "Fall A / Fall B", "Geschäftsfälle 1–11" oder Rechenaufgaben stehen, schreibe JEDEN einzelnen Punkt vollständig und ungekürzt ab!
-4. SCHEMATA / DIAGRAMME / KURVEN:
-   - Beschreibe Achsen, Kurven (Angebot/Nachfrage, Kosten/Erlöse, Break-even), Werte und Pfeilverbindungen präzise.
-5. Wenn die Seite wirklich KOMPLETT leer ist, antworte exakt mit: [[EMPTY_PAGE]]
-6. Antworte NUR mit dem sauber strukturierten deutschen Text (kein JSON, keine Einleitung).${
+1. NICHTS KÜRZEN UND NICHTS ÜBERSPRINGEN:
+   - Lies JEDE Überschrift, JEDEN Theorie-Absatz, JEDE Aufzählung (z. B. "Was gehört dazu / Was gehört NICHT dazu"), JEDE Situation, JEDE einzelne Aufgabe (Aufgabe 1, 2, 3, 4, 5, 6, 7...) und JEDES Formular/Schaubild komplett ab!
+   - Lies SOWOHL gedruckten Text ALS AUCH alle darüber oder an den Rand geschriebenen handschriftlichen Notizen (blaue/rote/lila Tinte) aus und kennzeichne Handschrift klar mit [Handschrift: ...].
+2. ZAHLEN, DATEN, ZEITSTRAHLEN & RECHNUNGSWESEN:
+   - Übernimm JEDE Zahl, JEDES Datum (z. B. 01.04.–31.03., 31. März, 300.000,00 €, 4,1%, 950,00 €/mtl.) und JEDEN Paragraphen (§ 25 KSVG, § 28p SGB IV...) EXAKT ohne Rundung oder Veränderung!
+   - Bei Zeitstrahlen/Diagrammen/T-Konten/Bilanz/GuV: beschreibe alle Zeiträume, Pfeile, Soll/Haben-Einträge und Summen präzise.
+3. Wenn die Seite wirklich KOMPLETT leer ist (nur leeres Karopapier ohne Aufgabe/Text), antworte exakt mit: [[EMPTY_PAGE]]
+4. Antworte NUR mit dem sauber strukturierten deutschen Originaltext (kein JSON, keine Einleitung).${
         existingText?.trim()
-          ? `\n\nBereits maschinell erkannter Teiltext (bitte um alle fehlenden handschriftlichen Notizen, T-Konten, Zahlen & Diagramme ergänzen):\n${existingText.trim().slice(0, 1200)}`
+          ? `\n\nBereits maschinell erkannter Teiltext (bitte VOLLSTÄNDIG erhalten und um alle fehlenden Bild-, Tabellen-, Zeitstrahl-, Formular- & Handschrift-Teile ergänzen):\n${existingText.trim().slice(0, 2600)}`
           : ''
       }`;
 
@@ -584,7 +580,7 @@ STRENGE REGELN:
         },
       ];
 
-      const text = await callGemini({ parts, expectJson: false, maxTokens: 3500 });
+      const text = await callGemini({ parts, expectJson: false, maxTokens: 4000 });
       const cleanedText = String(text || '').trim();
       const isEmpty = cleanedText === '[[EMPTY_PAGE]]' || cleanedText.length < 10;
       return res.status(200).json({
@@ -613,7 +609,7 @@ STRENGE REGELN:
         .map((p) => {
           const textBody = (p.textPreview || '').trim();
           const status = p.isBlank || !textBody ? 'TRANG TRẮNG' : `${p.charCount || textBody.length} ký tự`;
-          return `[Trang ${p.pageNum}] (${status}):\n${textBody ? textBody.slice(0, 1100) : '(Trang trống hoàn toàn)'}`;
+          return `[Trang ${p.pageNum}] (${status}):\n${textBody ? textBody.slice(0, 1400) : '(Trang trống hoàn toàn)'}`;
         })
         .join('\n---\n');
 
@@ -622,14 +618,14 @@ Ein Azubi hat Seiten aus OneNote als PDF ("${fileName}", ${pages.length} Seiten)
 
 DEINE AUFGABE — SORTIERE JEDE SEITE (1 bis ${pages.length}) PRÄZISE:
 1. IMMER BEHALTEN (in "groups"):
-   - Jede Seite mit Theorie, Definitionen, Gesetzen (§ BGB, VStättV, UrhG, GEMA...), Schemata, Tabellen, Diagrammen.
+   - Jede Seite mit Theorie, Definitionen, Gesetzen (§ BGB, KSVG, VStättV, UrhG, GEMA...), Schemata, Tabellen, Formularen, Diagrammen.
    - EXTREM WICHTIG: Jede Seite mit PRAXISFÄLLEN, SITUATIONEN, RECHENAUFGABEN, BUCHUNGSSÄTZEN, T-KONTEN, BILANZ/GuV oder HANDSCHRIFTLICHEN LEHRER-LÖSUNGEN!
 2. NUR AUSSORTIEREN (in "skipped_pages"):
-   - Komplett leere Seiten ("TRANG TRẮNG").
-   - Reine Organisations-/Terminnotizen (Pausen, "Hausaufgabe bis Montag", Sitzordnung ohne Fachstoff) oder völlig zusammenhanglose Kritzeleien.
-3. SMARTE GRUPPIERUNG (DAMIT NICHTS ABGESCHNITTEN WIRD):
-   - Packe maximal 2–3 dichte Seiten in EIN Paket!
-   - Wenn eine Datei sowohl Theorie/Aufgabenstellung als auch umfangreiche Lösungen (T-Konten, GuV, Schlussbilanz oder Situation 1–4) enthält, teile sie sinnvoll auf (oder halte Aufgabenstellung + zugehörige Musterlösung in einem klaren Paket <= 3 Seiten), damit die KI JEDEN Rechenschritt ausführlich erklären kann!
+   - Komplett leere Seiten ("TRANG TRẮNG") oder reines leeres Karopapier ohne neue Theorie/Aufgabe.
+   - Reine Organisations-/Terminnotizen (Pausen, "Hausaufgabe bis Montag", Sitzordnung ohne Fachstoff).
+3. SMARTE GRUPPIERUNG (DAMIT DIE LEHRKRAFT-ERKLÄRUNG AUSFÜHRLICH BLEIBT):
+   - Packe maximal 1–2 sehr dichte Seiten (oder bis zu 3 lockere Seiten) in EIN Paket!
+   - Wenn eine Seite extrem viel Theorie + eine Situation enthält (z. B. Seite 1 mit Theorie + Situation + Organisation/Meldefristen) und Seite 2 eine eigene Rechen-Situation mit Aufgabe 1–7 hat -> mache daraus am besten 2 getrennte Pakete, damit JEDES Paket zu 100% vollständig gelehrt, übersetzt, analysiert und gelöst wird (nichts wird gekürzt!).
 
 FACHZUORDNUNG (SEHR WICHTIG):
 ${
@@ -654,20 +650,20 @@ ${pagesDigest}
 
 ANTWORTE NUR ALS VALIDES JSON:
 {
-  "summary_vn": "Tóm tắt ngắn gọn bằng tiếng Việt (nêu rõ giữ mấy bài/tình huống/bài tính toán, bỏ mấy trang trống/nháp)",
+  "summary_vn": "Tóm tắt ngắn gọn bằng tiếng Việt (nêu rõ giữ mấy bài lý thuyết/bài tập, bỏ mấy trang trống/nháp)",
   "groups": [
     {
       "id": "g1",
       "title_de": "Thementitel Deutsch",
       "title_vn": "Tên bài học tiếng Việt",
       "subject_hint": "Tên môn học phù hợp",
-      "pageNums": [1, 2],
+      "pageNums": [1],
       "reason_vn": "Mô tả cụ thể nội dung của các trang này"
     }
   ],
   "skipped_pages": [
     {
-      "pageNum": 5,
+      "pageNum": 3,
       "title_hint": "Mô tả ngắn trang bị bỏ",
       "reason_vn": "Lý do loại bỏ cụ thể"
     }
@@ -679,7 +675,7 @@ ANTWORTE NUR ALS VALIDES JSON:
     }
 
     // =========================================================================
-    // ACTION 1: NHẬP KIẾN THỨC ONENOTE / PDF / RECHNUNGSWESEN + CHUẨN IHK + BẤM MÁY CASIO
+    // ACTION 1: NHẬP KIẾN THỨC CHẾ ĐỘ GIÁO VIÊN KÈM 1-1 (ĐỌC HẾT FILE -> DỊCH -> PHÂN TÍCH ĐỀ -> GIẢNG & GIẢI TỪNG BƯỚC)
     // =========================================================================
     if (action === 'import_onenote') {
       const {
@@ -688,6 +684,7 @@ ANTWORTE NUR ALS VALIDES JSON:
         existingSubjects = [],
         targetSubjectId = null,
         targetSubjectName = '',
+        teachingOnly = false,
       } = payload || {};
 
       if (!rawText.trim() && (!Array.isArray(images) || images.length === 0)) {
@@ -698,86 +695,73 @@ ANTWORTE NUR ALS VALIDES JSON:
         ? existingSubjects.map((s) => `- ID: "${s.id}" | DE: "${s.title_de}" | VN: "${s.title_vn}"`).join('\n')
         : '(Chưa có môn học nào)';
 
-      const prompt = `Du bist ein erfahrener IHK-Prüfer und Fachlehrer für "Veranstaltungskaufmann / Veranstaltungskauffrau" in Deutschland, der perfekt Deutsch und Vietnamesisch spricht.
+      const prompt = `Du bist ein herausragender, geduldiger und extrem gründlicher **Privatlehrer (IHK-Fachlehrer)** für "Veranstaltungskaufmann / Veranstaltungskauffrau" in Deutschland, der perfekt Deutsch und Vietnamesisch spricht.
 
-AUFGABE:
-Verarbeite das GESAMTE bereitgestellte Unterrichtsmaterial (ALLE Seiten, gedruckten Text UND handschriftliche Lehrer-Lösungen) vollständig zu hochwertigem, IHK-prüfungstauglichem Lernmaterial!
+WICHTIGSTER GRUNDSATZ (BITTE GENAU VERSTEHEN!):
+Der Schüler hat das hochgeladene PDF/Foto **NOCH KEIN EINZIGES WORT SELBST GELESEN**!
+Deine Aufgabe ist NICHT, wie ein Lösungs-Bot nur kurz das Endergebnis auszuspucken!
+Deine Aufgabe ist es, **das GESAMTE Dokument stellvertretend für den Schüler komplett aufzubereiten, zu übersetzen, wie ein echter Lehrer verständlich zu erklären, Aufgabenstellungen vollständig wiederzugeben & zu analysieren, und erst DANN Schritt für Schritt jede einzelne Aufgabe zu lösen!**
 
-PFLICHTREGELN (SEHR WICHTIG):
-1. ALLE SEITEN & HANDSCHRIFTLICHE LÖSUNGEN VOLLSTÄNDIG VERARBEITEN:
-   - Lies JEDE Seite bis zum allerletzten Satz durch — stoppe NIEMALS nach Seite 1!
-   - Wenn handschriftliche Lösungen der Lehrkraft enthalten sind (z. B. Eröffnungsbilanz, Buchungssätze, T-Konten, GuV, Schlussbilanz, Kalkulationen), prüfe jede Zahl rechnerisch nach und übernimm das exakte IHK-/Lehrer-Lösungsschema!
-   - Korrigiere Abkürzungen (VA, TN, MA, RO, AB, SBK, EBK, GuV, VSt, USt, VLL, FLL, DB, Kf, Kv...) zu sauberem IHK-Prüfungsdeutsch, aber nenne die übliche Abkürzung in Klammern mit.
-2. RECHENFÄCHER, BUCHFÜHRUNG & KALKULATION (EXTREM WICHTIG — IHK-STANDARD + SCHRITT-FÜR-SCHRITT + CASIO-TASCHENRECHNER):
-   Wenn das Material Berechnungen, Buchführung (Rechnungswesen), Kalkulation, Prozent-/USt-Rechnung, Break-even, Preisbildung oder Preiselastizität enthält:
-   a) **IHK-Norm-Darstellung:**
-      - Buchungssätze IMMER als saubere Markdown-Tabelle im Grundbuch-Format:
-        | Nr. | Soll-Konto | Betrag (€) | an | Haben-Konto | Betrag (€) | Begründung (Netto/USt/Brutto) |
-      - Kalkulationsschemata (Handelskalkulation, Zuschlagskalkulation, Deckungsbeitragsrechnung) IMMER als saubere Markdown-Tabelle mit Spalten für Position, %, Rechenweg und Betrag (€).
-      - Bilanz, GuV und T-Konten IMMER visuell über "diagram_json" (Typ "t_konto" oder "multi_t_konto") darstellen!
-   b) **Kristallklare Schritt-für-Schritt-Erklärung (DE + VN):**
-      - Erkläre JEDEN Rechenschritt so einfach, dass ein Azubi ihn sofort nachvollziehen kann:
-        1. **Công thức (Formel):** z. B. Eigenkapital = Summe Aktiva − Schulden (Fremdkapital)
-        2. **Thay số (Einsetzen):** 573.000 € − (195.000 € + 42.000 €)
-        3. **Kết quả (Ergebnis):** = **336.000,00 €**
-        4. **Giải thích bản chất (Warum?):** Warum steht das im Soll/Haben? Warum × 1,19 bzw. ÷ 1,19?
-   c) **HƯỚNG DẪN BẤM MÁY TÍNH CASIO fx-580VN X (CHUẨN PHÍM MÁY THẬT — BẮT BUỘC KHI CÓ TÍNH TOÁN!):**
-      - Der Azubi nutzt exakt das Modell **Casio fx-580VN X** (baugleich mit Casio fx-991DE X ClassWiz).
-      - Füge bei JEDEM Rechenabschnitt im Text (besonders klar in content_vn, und kurz in content_de) einen eigenen Block **"Bấm máy Casio fx-580VN X:"** ein mit der EXAKTEN Tastenfolge in eckigen Klammern!
-      - Nutze gezielt die Stärken des **Casio fx-580VN X**:
-        * **Phím phân số \`[ ■/□ ]\`** (+ \`[ ▼ ]\` xuống mẫu, \`[ ▶ ]\` thoát phân số) cho mọi công thức chia / Break-even / Preiselastizität / Kalkulationsfaktor thay vì lồng nhiều dấu ngoặc rối mắt!
-        * **Phím \`[ Ans ]\`** để nối phép tính liên tiếp (ví dụ tính Netto xong bấm thẳng \`[ × ] [ 0.19 ] [ = ]\` ra thuế mà không cần gõ lại số).
-        * **Phím \`[ S⇔D ]\`** nhắc chuyển phân số sang số thập phân (nếu máy đang ở chế độ ToánV/ToánR).
-        * **Tính năng \`SOLVE\`** (\`[ x ]\` để nhập ẩn, \`[ ALPHA ] [ CALC ]\` để gõ dấu \`=\`, rồi \`[ SHIFT ] [ CALC ]\` → \`[ = ]\`) cho các bài tính ngược tìm ẩn (VD: tìm giá bán p, tìm Eigenkapital, tính ngược Rabatt / Skonto, hoặc dò lại đáp án).
-        * **Phím lưu biến \`[ STO ] [ A ]\`** (và gọi lại bằng \`[ ALPHA ] [ A ]\`) khi bài kế toán / BAB / Handelskalkulation có số trung gian phải dùng lại nhiều lần.
-      - Beispiele für exakte **Casio fx-580VN X** Tastenfolgen:
-        * Netto → 19% USt/VSt → Brutto nối bằng Ans: \`[ 5250 ] [ × ] [ 0.19 ] [ = ]\` → \`997,50 €\` (hiện phân số bấm \`[ S⇔D ]\`), hoặc tính thẳng Brutto: \`[ 5250 ] [ × ] [ 1.19 ] [ = ]\` → \`6.247,50 €\`
-        * Brutto → Netto rồi lấy ngay thuế bằng Ans: \`[ 476 ] [ ÷ ] [ 1.19 ] [ = ]\` → \`400,00 €\`, bấm tiếp \`[ × ] [ 0.19 ] [ = ]\` → \`76,00 €\` (Lưu ý: tuyệt đối KHÔNG bấm \`- 19%\`!)
-        * Break-even bằng phím phân số: \`[ ■/□ ] [ 6000 ] [ ▼ ] [ 26 ] [ - ] [ 6 ] [ = ]\` → \`300\`
-        * Preiselastizität bằng phím phân số lồng nhau: \`[ ■/□ ] [ ■/□ ] [ x2 - x1 ] [ ▼ ] [ x1 ] [ ▼ ] [ ■/□ ] [ p2 - p1 ] [ ▼ ] [ p1 ] [ = ] [ S⇔D ]\`
-        * Tính ngược / dò ẩn x bằng SOLVE (VD tìm giá vé p hòa vốn ở 300 vé): nhập \`[ 300 ] [ × ] [ ( ] [ x ] [ - ] [ 6 ] [ ) ] [ ALPHA ] [ CALC ] [ 6000 ]\`, bấm \`[ SHIFT ] [ CALC ] [ = ]\` → \`x = 26\`
-3. PRAXISFÄLLE & SITUATIONEN VOLLSTÄNDIG LÖSEN:
-   - Wenn das Material konkrete Fälle/Situationen enthält ("Situation 1–4", "Fall A/B", "Geschäftsfälle 1–11"), bearbeite JEDEN einzelnen Fall konkret mit Sachverhalt, IHK-Lösung und Begründung (DE + VN)!
-4. VISUELLE DIAGRAMME, T-KONTEN & KURVEN ("diagram_json"):
-   Nutze "diagram_json" aktiv für jeden Abschnitt, in dem ein Diagramm, eine Bilanz, ein GuV-Konto, mehrere T-Konten oder eine Marktkurve hilft! Erlaubte Formate (sonst null):
-   a) **Einzelnes T-Konto / Bilanz / GuV** (mit IHK-Buchhalternase & Doppellinie):
-      {"type":"t_konto","title":"Schlussbilanzkonto (SBK)","account":"Schlussbilanz","leftHeader":"Aktiva (Soll)","rightHeader":"Passiva (Haben)","soll":[{"label":"Betriebsgebäude","amount":"360.000,00 €"},{"label":"BGA","amount":"43.000,00 €"}],"haben":[{"label":"Eigenkapital","amount":"328.700,00 €"},{"label":"Darlehen","amount":"195.000,00 €"}],"totalLeft":"568.611,50 €","totalRight":"568.611,50 €"}
-   b) **Mehrere T-Konten nebeneinander** (ideal für Hauptbuch-Übungen im Rechnungswesen!):
-      {"type":"multi_t_konto","title":"Hauptbuch: Bestandskonten & GuV","accounts":[{"account":"Bank","leftHeader":"Soll","rightHeader":"Haben","soll":[{"label":"AB","amount":"18.000,00 €"},{"label":"4) Zinsen","amount":"1.500,00 €"}],"haben":[{"label":"3) Darlehen","amount":"10.000,00 €"},{"label":"SBK","amount":"14.328,50 €"}],"totalLeft":"26.640,00 €","totalRight":"26.640,00 €"},{"account":"GuV","leftHeader":"Soll (Aufwand)","rightHeader":"Haben (Ertrag)","soll":[{"label":"Löhne","amount":"1.200,00 €"}],"haben":[{"label":"Zinserträge","amount":"1.500,00 €"},{"label":"EK (Verlust)","amount":"7.300,00 €"}],"totalLeft":"8.800,00 €","totalRight":"8.800,00 €"}]}
-   c) **Break-even-Point / Gewinnschwelle:**
-      {"type":"break_even","title":"Break-even-Analyse","kf":6000,"kv":6,"price":26,"unit":"Tickets","currency":"€"}
-   d) **Preisbildung / Angebot & Nachfrage / Marktgleichgewicht:**
-      {"type":"supply_demand","title":"Marktpreisbildung & Gleichgewicht","xLabel":"Menge (Stück)","yLabel":"Preis (€)","eqPrice":50,"eqQty":400,"maxPrice":100,"maxQty":800,"priceLine":{"label":"Mindestpreis","value":70}}
-   e) **Prozess / Ablauf / Kalkulations-Schritte:**
-      {"type":"flow","title":"Ablauf Geschäftsgang (IHK)","steps":[{"title":"1. Eröffnungsbilanz","subtitle":"Aktiva = Passiva, EK berechnen","badge":"Schritt 1"},{"title":"2. Bestandskonten öffnen","subtitle":"AB eintragen","badge":"Schritt 2"}]}
-   f) **Balkendiagramm / Kostenvergleich:**
-      {"type":"bar","title":"Kostenstruktur","unit":"€","items":[{"label":"Miete","value":4000},{"label":"Technik","value":2500}]}
-5. STRENGE FACHZUORDNUNG & LEKTIONEN (KEINE ZERSPLITTERUNG!):
+PFLICHT-AUFBAU DER ABSCHNITTE ("sections") — STRIKT EINHALTEN:
+Erstelle für das Material **3 bis 6 klar strukturierte, tiefgehende Abschnitte** in dieser logischen Lehrer-Reihenfolge (je nachdem, was im Dokument vorkommt):
+
+1. **THEORIE-ABSCHNITTE (wenn das Dokument Theorie, Definitionen, Gesetze, Listen, Fristen, Organisation, Regeln enthält):**
+   - **NICHTS WEGLASSEN!** Übernimm JEDEN wichtigen Themenblock aus dem Dokument in eigene, übersichtliche Abschnitte (z. B. Abschnitt 1: *Bemessungsgrundlage — Was gehört dazu & was NICHT?*; Abschnitt 2: *Organisation der KSK, Meldebogen & Betriebsprüfung durch die DRV*).
+   - **In "content_de":** Präsentiere das komplette deutsche Fachwissen aus dem Dokument sauber geordnet (mit Zwischenüberschriften \`###\`, Aufzählungen oder Markdown-Tabellen, z. B. \`| Gehört zur BMG (Tính phí) | Gehört NICHT zur BMG (Không tính phí) |\`), inklusive aller Paragraphen (§), Fristen und Beträge!
+   - **In "content_vn":**
+     * **Bản dịch đầy đủ sang tiếng Việt** (sát nghĩa từng ý trong phần tiếng Đức, không cắt bớt).
+     * **Giáo viên giảng dễ hiểu (Hiểu bản chất):** Giải thích lại bằng ngôn ngữ đời thường gần gũi (*"Nói nôm na là..."*, *"Tại sao luật lại quy định như vậy?"*, *"Mẹo phân biệt nhanh để không bị lừa khi đi thi"*).
+
+2. **AUFGABENSTELLUNG & DE-ANALYSE (IMMER Pflicht, sobald im Dokument eine Situation, ein Fall, Zahlen/Daten oder Aufgaben 1..N stehen!):**
+   - Erstelle dafür einen **EIGENEN Abschnitt** (z. B. *"Original-Situation & Aufgabenstellung aus dem Dokument / Nguyên văn Đề bài & Phân tích đề"*), BEVOR du die Lösung zeigst!
+   - **In "content_de":**
+     * Gib die **VOLLSTÄNDIGE Original-Situation**, ALLE gegebenen Daten/Zahlen/Zeiträume (am besten übersichtlich als Liste oder Tabelle!) und **JEDE EINZELNE Aufgabenfrage** (Aufgabe 1, Aufgabe 2, ..., Aufgabe 7 bzw. Fall A, Fall B) originalgetreu wieder!
+   - **In "content_vn":**
+     * **Dịch trọn vẹn 100% Tình huống, Bảng dữ kiện & từng câu hỏi Aufgabe 1..N sang tiếng Việt** để học viên đọc hiểu đề mà không cần mở file PDF gốc.
+     * **Phân tích đề bài (Góc nhìn giáo viên):** Chỉ rõ đề bài đang yêu cầu làm gì, đâu là **dữ kiện dùng để tính**, đâu là **thông tin bẫy/nhiễu phải loại bỏ**, và những quy tắc ngầm phải chú ý trước khi bấm máy (VD: *kỳ đóng ứng trước KSK chạy từ 01.04 đến 31.03 chứ không phải 01.01*, hay *chi phí nào thuộc BMG, chi phí nào loại*).
+
+3. **SCHRITT-FÜR-SCHRITT-LÖSUNG ZU JEDER EINZELNEN AUFGABE (Giải chi tiết từng câu, không bỏ sót câu nào!):**
+   - Erstelle danach **1 bis 2 eigene Lösungs-Abschnitte** (z. B. *"Schritt-für-Schritt-Lösung: Aufgabe 1–4 (Abrechnung Jahr X)"* und *"Schritt-für-Schritt-Lösung: Aufgabe 5–7 (Abrechnung Jahr Y)"* oder *"Ausführliche Lösung der Situation"*).
+   - **VERBOTE:** Löse NIEMALS nur 1 Beispielaufgabe und lasse die anderen weg! Bearbeite **JEDE EINZELNE Aufgabe / JEDEN einzelnen Posten** aus dem Dokument der Reihe nach!
+   - Für JEDE Aufgabe / JEDEN Rechenschritt zeige klar:
+     1) **Yêu cầu câu hỏi** (nhắc lại ngắn câu đang giải)
+     2) **Công thức / Quy tắc áp dụng** (dùng LaTeX chuẩn \`$$...$$\` hoặc \`$...$\` để app hiển thị phân số đẹp)
+     3) **Thay số & Kết quả** (định dạng số kiểu Đức chính xác, VD: \`12.000,00 €\`)
+     4) **Giải thích TẠI SAO làm bước này** (như giáo viên giảng cặn kẽ)
+     5) **Bấm máy Casio fx-580VN X:** ghi chính xác tổ hợp phím trong backtick, tận dụng phím phân số \`[ ■/□ ]\` + \`[ ▼ ]\`, nối phép tính bằng \`[ Ans ]\`, chuyển thập phân \`[ S⇔D ]\`, và \`SOLVE\` (\`[ x ]\`, \`[ ALPHA ] [ CALC ]\`, \`[ SHIFT ] [ CALC ] [ = ]\`) cho bài tìm ẩn!
+
+4. **RECHNUNGSWESEN, TABELLEN & DIAGRAMME ("diagram_json"):**
+   - Buchungssätze als Markdown-Tabelle im Grundbuch-Format (\`| Nr. | Soll-Konto | Betrag (€) | an | Haben-Konto | Betrag (€) | Begründung |\`).
+   - Vergleiche & Kalkulationen als saubere Markdown-Tabellen.
+   - Nutze "diagram_json" aktiv, wenn ein Schaubild, eine Bilanz/GuV/T-Konto, ein Ablauf/Zeitstrahl ("flow") oder ein Diagramm das Verständnis erleichtert (sonst null):
+     a) Einzelnes T-Konto / Bilanz / GuV: {"type":"t_konto","title":"...","account":"...","leftHeader":"Soll","rightHeader":"Haben","soll":[{"label":"...","amount":"..."}],"haben":[{"label":"...","amount":"..."}],"totalLeft":"...","totalRight":"..."}
+     b) Mehrere T-Konten: {"type":"multi_t_konto","title":"...","accounts":[...]}
+     c) Break-even: {"type":"break_even","title":"...","kf":6000,"kv":6,"price":26,"unit":"Tickets","currency":"€"}
+     d) Angebot & Nachfrage: {"type":"supply_demand","title":"...","xLabel":"Menge","yLabel":"Preis (€)","eqPrice":50,"eqQty":400,"maxPrice":100,"maxQty":800}
+     e) Prozess / Zeitstrahl / Ablauf: {"type":"flow","title":"...","steps":[{"title":"...","subtitle":"...","badge":"..."}]}
+     f) Balkendiagramm: {"type":"bar","title":"...","unit":"€","items":[{"label":"...","value":4000}]}
+
+5. **STRENGE FACHZUORDNUNG (KEINE ZERSPLITTERUNG!):**
    ${
      targetSubjectId
-       ? `- FESTES ZIELFACH: Der Schüler hat das Fach ID "${targetSubjectId}" (${targetSubjectName || 'ausgewähltes Fach'}) verbindlich gewählt!
-   - Setze "existing_subject_id" ZWINGEND auf "${targetSubjectId}" und erfinde KEIN neues Fach!`
+       ? `- FESTES ZIELFACH: Setze "existing_subject_id" ZWINGEND auf "${targetSubjectId}" (${targetSubjectName || 'ausgewähltes Fach'}) und erfinde KEIN neues Fach!`
        : `- Wähle ZWINGEND eines der bestehenden Hauptfächer aus der Liste unten, wenn es thematisch passt!
-   - Erstelle ein neues Fach NUR, wenn es ein komplett eigenes Schulfach ist (z. B. PuG, VKO, BWT, RW, BuB, IuF, Mt, D).
-   - VERBOTEN:
-     * Erfinde NIEMALS enge Unterthemen als Fachname (z. B. NICHT "Privatrecht", NICHT "GuV-Konto", NICHT "Veranstaltungsrecht & Verträge", wenn ein Hauptfach wie "BuB · Recht & Betriebliche Grundlagen" oder "RW · Rechnungswesen" existiert!).
-     * Übernimm NIEMALS Lehrerkürzel wie "_ZeH", "_HsA", "_GeM", "_MuC", "_DoR", "_ScT", "_MaS", "_KiK" in den Fachnamen!
-     * Nutze bei einem neuen Schulfach immer das saubere Format "KÜRZEL · Voller Fachname" (z. B. "PuG · Politik und Gesellschaft", "VKO · Veranstaltungskonzeption & -organisation", "BWT · Betriebswirtschaftliche Themen", "RW · Rechnungswesen", "BuB · Recht & Betriebliche Grundlagen", "IuF · Information & Finanzierung", "Mt · Märkte & Marketing", "D · Deutsch & Kommunikation").`
+   - Erstelle ein neues Fach NUR, wenn es ein eigenes Schulfach ist, im Format "KÜRZEL · Voller Fachname" (VKO, BWT, RW, BuB, IuF, Mt, PuG, D).
+   - VERBOTEN: Keine engen Unterthemen als Fachname und NIEMALS Lehrerkürzel ("_ZeH", "_HsA", "_GeM", "_MuC", "_DoR", "_ScT", "_MaS", "_KiK")!`
    }
    Bestehende Fächer:
    ${subjectListText}
-   - Erstelle 1 bis 2 logisch aufgebaute Lektionen ("foundation" -> "connected" -> "advanced").
-6. YOUTUBE-LERNVIDEOS:
-   - Gib pro Abschnitt 2 präzise deutsche YouTube-Suchbegriffe in "video_keywords" an (z. B. "Geschäftsgang mit Erfolgskonten einfach erklärt", "GuV Konto abschließen Studyflix").
-7. FACHWORTSCHATZ (VOKABELN) PRO LEKTION:
-   - Extrahiere 8 bis 14 wichtige deutsche Fachwörter/Verben/Abkürzungen aus ALLEN Seiten:
-     * Bei Nomen IMMER exakten Artikel ("der" / "die" / "das") und Pluralform ("die ...") angeben.
-     * Bei anderen Wortarten article: "", plural: "", word_type genau benennen ("Verb", "Adjektiv", "Abkürzung", "Redewendung").
-     * Immer mit vietnamesischer Bedeutung, konkretem Praxisbeispiel (DE + VN) und Grammatik-/Prüfungshinweis.
-8. UMFASSENDE TESTFRAGEN (INKL. RECHEN- & BUCHUNGSAUFGABEN):
-   - Erstelle 6 bis 10 abwechslungsreiche Fragen (Mix aus "mc" und "essay"), inklusive konkreter Buchungssätze, Rechenaufgaben und Praxisfälle aus dem Material (in der Musterlösung ebenfalls Rechenweg + Casio-Tastenfolge angeben!).
-9. FLASHCARDS:
-   - Erstelle 6 bis 10 präzise zweisprachige Flashcards (inkl. Formeln, Kontenregeln, Buchungsregeln).
+
+6. **LEKTIONSAUFBAU & YOUTUBE:**
+   - Erstelle **genau 1 vollständige, tiefgehende Lektion** für dieses Paket (mit **mindestens 3 bis 6 ausführlichen Abschnitten** in "sections" — NIEMALS nur 1 kurzer Abschnitt!).
+   - Gib pro Abschnitt 2 präzise deutsche YouTube-Suchbegriffe in "video_keywords" an.
+${
+  teachingOnly
+    ? `7. **FOKUS NUR AUF DEN LEHRINHALT:**
+   - Lasse "vocabularies", "flashcards" und "quiz_questions" als leere Arrays [] — diese werden direkt im nächsten Schritt separat in voller Länge erzeugt, damit du JETZT 100% deiner Kraft in das gründliche Lehren, Übersetzen, Analysieren und Schritt-für-Schritt-Lösen stecken kannst!`
+    : `7. **VOKABELN, FLASHCARDS & TESTFRAGEN:**
+   - Extrahiere 8–12 wichtige deutsche Fachwörter ("vocabularies", Nomen IMMER mit der/die/das & Plural), 6–8 zweisprachige "flashcards" und 6–8 "quiz_questions" (Mix aus "mc" und "essay").`
+}
 
 ANTWORTE AUSSCHLIESSLICH MIT VALIDEM JSON:
 {
@@ -790,76 +774,47 @@ ANTWORTE AUSSCHLIESSLICH MIT VALIDEM JSON:
   },
   "lessons": [
     {
-      "title_de": "Lektionstitel Deutsch",
-      "title_vn": "Tiêu đề bài tiếng Việt",
+      "title_de": "Aussagekräftiger Lektionstitel Deutsch",
+      "title_vn": "Tiêu đề bài học rõ ràng tiếng Việt",
       "level": "foundation",
-      "overview_de": "Überblick auf Deutsch",
-      "overview_vn": "Tổng quan tiếng Việt",
+      "overview_de": "Klarer Überblick: Was lernst du in dieser Lektion und welche Aufgaben/Theorie enthält das Dokument? (2-3 Sätze DE)",
+      "overview_vn": "Tổng quan kiểu giáo viên: Bài này gồm những phần kiến thức & bài tập nào, học xong sẽ làm được gì (2-3 câu VN)",
       "sections": [
         {
-          "heading_de": "1. Überschrift",
-          "heading_vn": "1. Tiêu đề",
-          "content_de": "Ausführlicher Fachtext im IHK-Standard (inkl. Markdown-Tabellen, Rechenwegen & Casio fx-580VN X Tastenfolge)",
-          "content_vn": "Giải thích từng bước cực dễ hiểu bằng tiếng Việt (kèm bảng, cách tính và hướng dẫn bấm máy Casio fx-580VN X cụ thể)",
+          "heading_de": "1. Theorie & Grundlagen aus dem Dokument (bzw. konkreter Thementitel)",
+          "heading_vn": "1. Kiến thức cốt lõi trong tài liệu (tiêu đề cụ thể)",
+          "content_de": "Vollständige, sauber strukturierte deutsche Theorie aus dem Dokument (Markdown-Tabellen, Aufzählungen, Paragraphen, KEINE Kürzung!)",
+          "content_vn": "Bản dịch đầy đủ sang tiếng Việt + Giảng giải bình dân cực dễ hiểu như giáo viên kèm 1-1",
           "diagram_json": null,
           "video_keywords": [
-            {"label": "Video giải thích ngắn", "query": "exakte deutsche YouTube Suchanfrage"}
+            {"label": "Video giải thích ngắn", "query": "deutsche YouTube Suchanfrage"}
           ]
-        }
-      ],
-      "vocabularies": [
-        {
-          "word_de": "Grundform ohne Artikel",
-          "article": "der",
-          "plural": "die ...",
-          "word_type": "Nomen",
-          "meaning_vn": "Nghĩa tiếng Việt chính xác",
-          "example_de": "Beispielsatz im Event-Kontext",
-          "example_vn": "Dịch ví dụ tiếng Việt",
-          "grammar_note_vn": "Ghi chú ngữ pháp / mẹo nhớ"
-        }
-      ],
-      "flashcards": [
-        {
-          "category": "Fachbegriff",
-          "front_de": "Begriff / Formel",
-          "hint_vn": "Gợi ý ngắn VN",
-          "back_de": "IHK-Definition / Formel DE",
-          "back_vn": "Định nghĩa / Công thức VN",
-          "example_de": "Beispiel / Buchungssatz DE",
-          "example_vn": "Ví dụ / Giải thích VN"
-        }
-      ],
-      "quiz_questions": [
-        {
-          "q_type": "mc",
-          "question_de": "Frage DE",
-          "question_vn": "Câu hỏi VN",
-          "options": [
-            {"de": "A", "vn": "A"},
-            {"de": "B", "vn": "B"},
-            {"de": "C", "vn": "C"},
-            {"de": "D", "vn": "D"}
-          ],
-          "correct_index": 0,
-          "explanation_de": "Begründung / Rechenweg DE",
-          "explanation_vn": "Giải thích / Cách bấm Casio fx-580VN X VN"
         },
         {
-          "q_type": "essay",
-          "question_de": "Situations-/Rechen-/Buchungsaufgabe DE",
-          "question_vn": "Tình huống / Bài toán / Định khoản VN",
-          "model_answer_de": "IHK-Musterlösung inkl. Rechenweg DE",
-          "model_answer_vn": "Đáp án mẫu chi tiết + hướng dẫn bấm Casio fx-580VN X VN",
-          "explanation_de": "Bewertungshinweis DE",
-          "explanation_vn": "Lưu ý ăn điểm / tránh bẫy IHK VN"
+          "heading_de": "2. Original-Situation & Aufgabenstellung aus dem Dokument",
+          "heading_vn": "2. Nguyên văn Đề bài / Tình huống & Phân tích đề",
+          "content_de": "Vollständiger Originaltext der Situation, ALLE gegebenen Zahlen/Daten/Tabellen und JEDE Aufgabenstellung (Aufgabe 1, 2, 3...)",
+          "content_vn": "Dịch trọn vẹn 100% đề bài & bảng số liệu sang tiếng Việt + Giáo viên phân tích đề (chỉ rõ dữ kiện nào dùng, bẫy IHK nào cần tránh)",
+          "diagram_json": null,
+          "video_keywords": []
+        },
+        {
+          "heading_de": "3. Schritt-für-Schritt-Lösung zu jeder Aufgabe",
+          "heading_vn": "3. Hướng dẫn giải chi tiết từng câu + Bấm Casio fx-580VN X",
+          "content_de": "Ausführliche Lösung für JEDE einzelne Aufgabe (Aufgabe 1, 2, 3...) mit Formeln in LaTeX ($$...$$), Rechenweg, Ergebnis und Begründung",
+          "content_vn": "Giải chi tiết lần lượt từng câu một (Công thức -> Thay số -> Kết quả -> Giải thích TẠI SAO -> Bấm máy Casio fx-580VN X)",
+          "diagram_json": null,
+          "video_keywords": []
         }
-      ]
+      ],
+      "vocabularies": [],
+      "flashcards": [],
+      "quiz_questions": []
     }
   ]
 }
 
-${rawText.trim() ? `VOLLSTÄNDIGES UNTERRICHTSMATERIAL (BITTE ALLE SEITEN, HANDSCHRIFTLICHEN LÖSUNGEN, RECHENWEGE & FÄLLE VERARBEITEN):\n${rawText.trim()}` : 'Lies alle angehängten Fotos vollständig aus (OCR), übernimm alle handschriftlichen Lösungen, erkläre jeden Rechenschritt inkl. Casio-Tastenfolge und stelle T-Konten/Bilanz/Diagramme im IHK-Standard dar.'}`;
+${rawText.trim() ? `VOLLSTÄNDIGES ORIGINALMATERIAL AUS DEM DOKUMENT (BITTE ALLES VOLLSTÄNDIG LEHREN, ÜBERSETZEN, ANALYSIEREN & LÖSEN — NICHTS ÜBERSPRINGEN!):\n${rawText.trim()}` : 'Lies alle angehängten Fotos vollständig aus (OCR), stelle erst Theorie & Original-Aufgabenstellung vollständig zweisprachig dar, analysiere die Aufgabe wie ein Lehrer und löse dann JEDEN einzelnen Punkt Schritt für Schritt inkl. Casio fx-580VN X.'}`;
 
       const parts = [{ text: prompt }];
       if (Array.isArray(images)) {
@@ -876,16 +831,98 @@ ${rawText.trim() ? `VOLLSTÄNDIGES UNTERRICHTSMATERIAL (BITTE ALLE SEITEN, HANDS
       }
 
       const result = await callGemini({ parts, expectJson: true, maxTokens: 8000 });
-      // Khóa cứng môn học đích ở backend để AI tuyệt đối không thể tự tạo môn mới hay xếp nhầm môn
       if (targetSubjectId && result && typeof result === 'object') {
         result.existing_subject_id = targetSubjectId;
       } else if (result?.subject?.title_de) {
-        // Loại bỏ sạch hậu tố tên viết tắt giáo viên (VD: _ZeH, _HsA, _GeM, _MuC, _DoR...) nếu AI lỡ dính vào
         result.subject.title_de = String(result.subject.title_de)
           .replace(/[_-][A-ZÄÖÜ][a-zäöüß]{1,2}[A-ZÄÖÜ]\b/g, '')
           .replace(/\s+/g, ' ')
           .trim();
       }
+      return res.status(200).json({ data: result });
+    }
+
+    // =========================================================================
+    // ACTION 1B: TẠO TRỌN BỘ LUYỆN TẬP ĐẦY ĐỦ (TỪ VỰNG + FLASHCARDS + BÀI TEST) TỪ BÀI HỌC VỪA SOẠN
+    // (Tách riêng bước này để Phase 1 dồn 100% token cho giảng bài sâu, không bao giờ bị lỗi "1 từ · 1 thẻ · 1 câu"!)
+    // =========================================================================
+    if (action === 'generate_study_pack') {
+      const { lessonTitle = '', sectionsText = '' } = payload || {};
+      if (!sectionsText.trim()) {
+        return res.status(400).json({ error: 'Thiếu nội dung bài học để tạo bộ từ vựng, Flashcards & Test.' });
+      }
+
+      const prompt = `Du bist ein erfahrener IHK-Prüfer und Fachlehrer für "Veranstaltungskaufmann" (Deutsch + Vietnamesisch).
+Erstelle auf Basis der folgenden vollständig ausgearbeiteten Lektion ein UMFANGREICHES ÜBUNGSPACKET (Vokabeln + Flashcards + Testfragen)!
+
+LEKTION: "${lessonTitle}"
+
+LEKTIONSINHALT:
+${sectionsText.slice(0, 7500)}
+
+STRENGE MINDESTMENGEN (BITTE UNBEDINGT EINHALTEN — NIEMALS NUR 1 EINTRAG!):
+1. **"vocabularies"**: GENAU **8 bis 12** zentrale deutsche Fachbegriffe, Verben, Gesetzesbegriffe oder Abkürzungen aus dem Text:
+   - Bei Nomen IMMER exakten Artikel ("der" / "die" / "das") und Plural ("die ...") angeben.
+   - Bei anderen Wortarten article: "", plural: "", word_type genau benennen ("Verb", "Adjektiv", "Abkürzung", "Redewendung").
+   - Immer mit präziser vietnamesischer Bedeutung, Event-Praxisbeispiel (DE + VN) und Grammatik-/Prüfungshinweis.
+2. **"flashcards"**: GENAU **6 bis 8** prüfungsrelevante zweisprachige Flashcards (Definitionen, Regeln "Was zählt dazu / nicht dazu?", Fristen, Formeln, Kontenregeln).
+3. **"quiz_questions"**: GENAU **6 bis 8** abwechslungsreiche Prüfungsfragen (4–5 Multiple-Choice "mc" mit je 4 Optionen + 2–3 offene Praxisfall-/Rechenaufgaben "essay"):
+   - Bei Rechenaufgaben in "model_answer_vn" und "explanation_vn" IMMER den klaren Rechenweg UND die **Casio fx-580VN X** Tastenfolge (\`[ ■/□ ]\`, \`[ ▼ ]\`, \`[ Ans ]\`, \`[ S⇔D ]\`, \`SOLVE\`) angeben!
+   - Nutze für mathematische Formeln sauberes LaTeX (\`$...$\` oder \`$$...$$\`).
+
+ANTWORTE AUSSCHLIESSLICH MIT VALIDEM JSON:
+{
+  "vocabularies": [
+    {
+      "word_de": "Bemessungsgrundlage",
+      "article": "die",
+      "plural": "die Bemessungsgrundlagen",
+      "word_type": "Nomen",
+      "meaning_vn": "Cơ sở tính phí / căn cứ tính thuế",
+      "example_de": "Die Bemessungsgrundlage der KSK umfasst alle Entgelte an selbstständige Künstler.",
+      "example_vn": "Cơ sở tính phí KSK bao gồm mọi khoản thù lao trả cho nghệ sĩ tự do.",
+      "grammar_note_vn": "Danh từ ghép giống cái (die Grundlage), hay viết tắt là BMG."
+    }
+  ],
+  "flashcards": [
+    {
+      "category": "Fachbegriff",
+      "front_de": "Begriff / Frage / Formel DE",
+      "hint_vn": "Gợi ý ngắn VN",
+      "back_de": "Präzise IHK-Antwort DE",
+      "back_vn": "Giải thích & công thức VN",
+      "example_de": "Praxisbeispiel DE",
+      "example_vn": "Ví dụ VN"
+    }
+  ],
+  "quiz_questions": [
+    {
+      "q_type": "mc",
+      "question_de": "IHK-Frage DE",
+      "question_vn": "Câu hỏi VN",
+      "options": [
+        {"de": "Option A", "vn": "Dịch A"},
+        {"de": "Option B", "vn": "Dịch B"},
+        {"de": "Option C", "vn": "Dịch C"},
+        {"de": "Option D", "vn": "Dịch D"}
+      ],
+      "correct_index": 0,
+      "explanation_de": "Begründung DE",
+      "explanation_vn": "Giải thích chi tiết (+ phím Casio fx-580VN X nếu có tính toán) VN"
+    },
+    {
+      "q_type": "essay",
+      "question_de": "Situations-/Rechenaufgabe DE",
+      "question_vn": "Tình huống / Bài toán VN",
+      "model_answer_de": "IHK-Musterlösung mit Rechenweg DE",
+      "model_answer_vn": "Bài mẫu chi tiết + cách bấm Casio fx-580VN X VN",
+      "explanation_de": "Bewertungshinweis DE",
+      "explanation_vn": "Mẹo ăn điểm & tránh bẫy IHK VN"
+    }
+  ]
+}`;
+
+      const result = await callGemini({ parts: [{ text: prompt }], expectJson: true, maxTokens: 7000 });
       return res.status(200).json({ data: result });
     }
 
