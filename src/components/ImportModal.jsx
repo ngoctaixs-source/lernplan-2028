@@ -24,11 +24,23 @@ import {
   ChevronRight,
   Maximize2,
   RotateCw,
+  Tag,
+  ExternalLink,
 } from 'lucide-react';
 import { callGeminiApi } from '../lib/api';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeFileKey(name = '') {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/\.pdf$/i, '')
+    .replace(/\.(png|jpe?g|webp|heic)$/i, '')
+    .replace(/\s*\(tr\.?[^)]*\)\s*$/i, '')
+    .replace(/[\s_\-]+/g, ' ')
+    .trim();
 }
 
 // Chống lỗi 429 Rate Limit / timeout khi nạp liên tục nhiều trang PDF trên gói Groq miễn phí
@@ -240,8 +252,10 @@ async function renderPdfPageToJpeg(pdfDoc, pageNum, maxWidth = 1400, quality = 0
 
 export default function ImportModal({
   subjects = [],
+  existingLessons = [],
   defaultSubjectId = '',
   onCreateSubject,
+  onOpenExistingLesson = null,
   onClose,
   onSaveImportedData,
   onBatchComplete,
@@ -256,9 +270,11 @@ export default function ImportModal({
   const [newSubVn, setNewSubVn] = useState('');
   const [creatingSubject, setCreatingSubject] = useState(false);
 
-  // Text & Photos state
+  // Text & Photos state + Nhãn tên file / mã trang OneNote để dễ đối chiếu
   const [rawText, setRawText] = useState('');
+  const [manualSourceTag, setManualSourceTag] = useState('');
   const [images, setImages] = useState([]);
+  const [showImportedFilesList, setShowImportedFilesList] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [statusMsg, setStatusMsg] = useState('');
@@ -382,6 +398,35 @@ export default function ImportModal({
   };
 
   const selectedSubjectObj = subjects.find((s) => s.id === selectedSubjectId) || null;
+
+  // Đối chiếu tên file đang chọn / gõ với danh sách bài đã nạp để cảnh báo trùng
+  const activeCandidateName = mode === 'pdf' ? pdfFileName : manualSourceTag;
+  const duplicateMatches = (() => {
+    const key = normalizeFileKey(activeCandidateName);
+    if (!key || key.length < 3) return [];
+    return (existingLessons || []).filter((les) => {
+      const files = Array.isArray(les.sourceFiles) ? les.sourceFiles : [];
+      return files.some((f) => {
+        const fk = normalizeFileKey(f);
+        return fk && (fk === key || fk.includes(key) || key.includes(fk));
+      });
+    });
+  })();
+
+  // Danh sách các file đã gắn nhãn (lọc theo môn đang chọn nếu đã khóa môn)
+  const importedFilesOverview = (() => {
+    const scoped = selectedSubjectId
+      ? (existingLessons || []).filter((l) => l.subject_id === selectedSubjectId)
+      : existingLessons || [];
+    const items = [];
+    scoped.forEach((les) => {
+      const files = Array.isArray(les.sourceFiles) ? les.sourceFiles : [];
+      if (files.length > 0) {
+        files.forEach((f) => items.push({ fileName: f, lessonId: les.id, lessonTitle: les.title_de }));
+      }
+    });
+    return items.sort((a, b) => a.fileName.localeCompare(b.fileName, 'de', { numeric: true }));
+  })();
 
   const handleQuickCreateSubject = async () => {
     const cleanDe = newSubDe.trim();
@@ -833,9 +878,17 @@ export default function ImportModal({
           });
         });
 
+        const cleanPdfBase = String(pdfFileName || '').trim();
+        const pageRangeTag =
+          chosen.length > 1 && group.pageNums?.length
+            ? ` (Tr. ${group.pageNums.join(', ')})`
+            : '';
+        const batchSourceFiles = cleanPdfBase ? [`${cleanPdfBase}${pageRangeTag}`] : [];
+
         const saved = await onSaveImportedData(aiResult, groupSourcePhotos, {
           silent: true,
           forcedSubjectId: selectedSubjectId || null,
+          sourceFiles: batchSourceFiles,
         });
         if (saved?.firstCreatedLessonId && !firstCreatedLessonId) {
           firstCreatedLessonId = saved.firstCreatedLessonId;
@@ -943,8 +996,20 @@ export default function ImportModal({
               label: im.name ? `Ảnh ${idx + 1} · ${im.name}` : `Ảnh ${idx + 1}`,
             }))
           : [];
+      const autoImgNames =
+        mode === 'images' && images.length > 0
+          ? images
+              .map((im) => (im.name || '').trim())
+              .filter(Boolean)
+              .slice(0, 3)
+          : [];
+      const finalSourceFiles = manualSourceTag.trim()
+        ? [manualSourceTag.trim()]
+        : autoImgNames;
+
       await onSaveImportedData(aiResult, allUploadedPhotos, {
         forcedSubjectId: selectedSubjectId || null,
+        sourceFiles: finalSourceFiles,
       });
       onClose();
     } catch (err) {
@@ -1145,6 +1210,53 @@ export default function ImportModal({
                       Bấm <strong>File → Save as PDF</strong> (hoặc chỉnh <strong>Shift + Command + P</strong> sang khổ ngang 1 lần duy nhất). Chỉ cần chữ không bị cắt mất mép phải là AI đọc ngon 100%!
                     </p>
                   </div>
+
+                  {/* Danh sách nhanh các file đã nạp trong môn để dễ đối chiếu với OneNote */}
+                  {importedFilesOverview.length > 0 && (
+                    <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-2xl p-3.5 space-y-2">
+                      <button
+                        type="button"
+                        onClick={() => setShowImportedFilesList((v) => !v)}
+                        className="w-full flex items-center justify-between gap-2 text-xs font-extrabold text-slate-700 dark:text-slate-200"
+                      >
+                        <span className="flex items-center gap-1.5">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0" />
+                          Đã nạp {importedFilesOverview.length} file{selectedSubjectObj ? ` trong môn ${selectedSubjectObj.title_de.split('·')[0].trim()}` : ''} (bấm để đối chiếu OneNote)
+                        </span>
+                        <span className="text-[11px] font-bold text-indigo-600 dark:text-indigo-400">
+                          {showImportedFilesList ? 'Thu gọn' : 'Xem danh sách'}
+                        </span>
+                      </button>
+
+                      {showImportedFilesList && (
+                        <div className="max-h-40 overflow-y-auto space-y-1 pt-1 border-t border-slate-100 dark:border-slate-800">
+                          {importedFilesOverview.map((item, idx) => (
+                            <div
+                              key={`${item.lessonId}-${idx}`}
+                              className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-slate-50 dark:bg-slate-800/70 text-[11px]"
+                            >
+                              <div className="min-w-0">
+                                <span className="font-bold text-emerald-700 dark:text-emerald-300">✓ {item.fileName}</span>
+                                <span className="text-slate-400 ml-1.5">→ {item.lessonTitle}</span>
+                              </div>
+                              {onOpenExistingLesson && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    onClose();
+                                    onOpenExistingLesson(item.lessonId);
+                                  }}
+                                  className="text-indigo-600 dark:text-indigo-400 font-bold hover:underline shrink-0 inline-flex items-center gap-0.5"
+                                >
+                                  Mở <ExternalLink className="w-3 h-3" />
+                                </button>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </>
               )}
 
@@ -1175,6 +1287,39 @@ export default function ImportModal({
 
               {pdfStage === 'review' && (
                 <div className="space-y-4">
+                  {/* Cảnh báo nếu file PDF này đã từng được nạp vào web rồi */}
+                  {duplicateMatches.length > 0 && (
+                    <div className="bg-amber-50 dark:bg-amber-950/50 border-2 border-amber-400 dark:border-amber-700 rounded-2xl p-3.5 space-y-2 text-xs">
+                      <div className="flex items-start gap-2 text-amber-900 dark:text-amber-200 font-extrabold">
+                        <AlertCircle className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                        <span>
+                          File &ldquo;{pdfFileName}&rdquo; có vẻ ĐÃ TỪNG ĐƯỢC NẠP RỒI! Kiểm tra trước để khỏi bị trùng bài:
+                        </span>
+                      </div>
+                      <div className="space-y-1.5 pl-6">
+                        {duplicateMatches.map((dup) => (
+                          <div key={dup.id} className="flex items-center justify-between gap-2 flex-wrap">
+                            <span className="text-slate-700 dark:text-slate-200 font-semibold truncate">
+                              • {dup.title_de}
+                            </span>
+                            {onOpenExistingLesson && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  onClose();
+                                  onOpenExistingLesson(dup.id);
+                                }}
+                                className="px-2.5 py-1 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-[11px] font-bold shrink-0 inline-flex items-center gap-1"
+                              >
+                                Mở bài này (để xem / Cập nhật) <ExternalLink className="w-3 h-3" />
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   {/* Summary Banner */}
                   <div className="bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-2xl p-4 flex items-start justify-between gap-3">
                     <div className="space-y-1">
@@ -1418,6 +1563,43 @@ export default function ImportModal({
           {/* ==================== TAB 2: TEXT PASTE FROM ONENOTE ==================== */}
           {mode === 'text' && (
             <div className="space-y-3">
+              <div className="flex items-center gap-2 bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2">
+                <Tag className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
+                <input
+                  value={manualSourceTag}
+                  onChange={(e) => setManualSourceTag(e.target.value)}
+                  placeholder="Nhãn file / Mã trang OneNote (tùy chọn, VD: 2.4 S_Bemessungsgrundlage)"
+                  className="flex-1 bg-transparent text-xs font-semibold text-slate-800 dark:text-slate-100 focus:outline-none"
+                />
+                {manualSourceTag && (
+                  <button
+                    type="button"
+                    onClick={() => setManualSourceTag('')}
+                    className="text-slate-400 hover:text-rose-500"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+              {duplicateMatches.length > 0 && (
+                <div className="px-3 py-2 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 text-[11px] text-amber-900 dark:text-amber-200 flex items-center justify-between gap-2 flex-wrap">
+                  <span>
+                    ⚠️ Mã/file này đã có ở bài: <strong>{duplicateMatches[0].title_de}</strong>
+                  </span>
+                  {onOpenExistingLesson && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onClose();
+                        onOpenExistingLesson(duplicateMatches[0].id);
+                      }}
+                      className="font-bold text-amber-700 dark:text-amber-300 underline"
+                    >
+                      Mở bài đó
+                    </button>
+                  )}
+                </div>
+              )}
               <div className="flex items-center justify-between gap-2 flex-wrap">
                 <button
                   type="button"
@@ -1449,6 +1631,24 @@ export default function ImportModal({
           {/* ==================== TAB 3: BOARD / HANDWRITING PHOTOS ==================== */}
           {mode === 'images' && (
             <div className="space-y-3">
+              <div className="flex items-center gap-2 bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2">
+                <Tag className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
+                <input
+                  value={manualSourceTag}
+                  onChange={(e) => setManualSourceTag(e.target.value)}
+                  placeholder="Nhãn file / Mã trang OneNote (để trống sẽ tự lấy tên file ảnh, VD: 2.5 S_Aufgaben)"
+                  className="flex-1 bg-transparent text-xs font-semibold text-slate-800 dark:text-slate-100 focus:outline-none"
+                />
+                {manualSourceTag && (
+                  <button
+                    type="button"
+                    onClick={() => setManualSourceTag('')}
+                    className="text-slate-400 hover:text-rose-500"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
               <div
                 onClick={() => images.length < 5 && imgInputRef.current?.click()}
                 className="border-2 border-dashed border-slate-300 dark:border-slate-700 hover:border-indigo-400 rounded-2xl p-6 text-center cursor-pointer transition space-y-2"
