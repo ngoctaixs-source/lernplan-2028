@@ -47,6 +47,8 @@ import {
   ChevronLeft,
   Maximize2,
   RotateCw,
+  Bot,
+  MessageCircle,
 } from 'lucide-react';
 import { supabase, isSupabaseConfigured, ADMIN_EMAIL } from './lib/supabase';
 import { callGeminiApi } from './lib/api';
@@ -69,10 +71,12 @@ import MockExamCenter from './components/MockExamCenter';
 import MistakesAnalyticsView from './components/MistakesAnalyticsView';
 import SearchModal from './components/SearchModal';
 import SettingsView from './components/SettingsView';
+import SectionAiChat from './components/SectionAiChat';
 
 const LOCAL_PREFS_KEY = 'lernplan2028_prefs_v2';
 const LOCAL_GUEST_KEY = 'lernplan2028_guest_v2';
 const LOCAL_DICT_CACHE_KEY = 'lernplan2028_dict_cache_v2';
+const LOCAL_AI_CHATS_KEY = 'lernplan2028_ai_chats_v3';
 
 // Bộ môn chuẩn theo khung Berufsschule (đã lược bỏ sạch tên viết tắt giáo viên như _ZeH, _HsA, _GeM, _MuC, _DoR...)
 const SCHOOL_SUBJECT_PRESETS = [
@@ -252,6 +256,16 @@ export default function App() {
   const [quizAttempts, setQuizAttempts] = useState([]);
   const [sectionNotes, setSectionNotes] = useState({}); // { [sectionId]: string }
   const [wrongQuestions, setWrongQuestions] = useState([]);
+  // Hội thoại Gia sư AI lưu riêng biệt theo từng contextKey (section:<id>, quiz:<lessonId>, mistakes:global)
+  const [aiChatsMap, setAiChatsMap] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem(LOCAL_AI_CHATS_KEY) || '{}') || {};
+    } catch {
+      return {};
+    }
+  });
+  const [aiChatCloudReady, setAiChatCloudReady] = useState(false);
+  const [openChatKeys, setOpenChatKeys] = useState({});
 
   // Dictionary Cache & Popover State (lưu sẵn localStorage để tra lại mất 0ms)
   const [dictCache, setDictCache] = useState(() => {
@@ -401,11 +415,12 @@ export default function App() {
   useEffect(() => {
     const loadPrivate = async () => {
       if (user && supabase) {
-        const [fcProg, qaRes, notesRes, wrongRes] = await Promise.all([
+        const [fcProg, qaRes, notesRes, wrongRes, chatsRes] = await Promise.all([
           supabase.from('user_flashcard_progress').select('*').eq('user_id', user.id),
           supabase.from('user_quiz_attempts').select('*').eq('user_id', user.id).order('created_at', { ascending: false }).limit(80),
           supabase.from('user_section_notes').select('*').eq('user_id', user.id),
           supabase.from('user_wrong_questions').select('*').eq('user_id', user.id).order('created_at', { ascending: false }),
+          supabase.from('user_ai_chats').select('context_key, messages, updated_at').eq('user_id', user.id),
         ]);
 
         const pMap = {};
@@ -431,7 +446,27 @@ export default function App() {
         if (!wrongRes.error) {
           setWrongQuestions(wrongRes.data || []);
         }
+        if (!chatsRes.error) {
+          setAiChatCloudReady(true);
+          setAiChatsMap((prev) => {
+            const merged = { ...prev };
+            (chatsRes.data || []).forEach((row) => {
+              if (row?.context_key && Array.isArray(row.messages)) {
+                merged[row.context_key] = row.messages;
+              }
+            });
+            try {
+              localStorage.setItem(LOCAL_AI_CHATS_KEY, JSON.stringify(merged));
+            } catch {
+              // ignore storage quota
+            }
+            return merged;
+          });
+        } else {
+          setAiChatCloudReady(false);
+        }
       } else {
+        setAiChatCloudReady(false);
         try {
           const g = JSON.parse(localStorage.getItem(LOCAL_GUEST_KEY) || '{}');
           setProgressMap(g.progressMap || {});
@@ -715,6 +750,70 @@ export default function App() {
       persistGuest({ sectionNotes: next });
     }
     showToast('Đã lưu ghi chú cá nhân.');
+  };
+
+  // ==================== AI TUTOR CHAT PERSISTENCE (TÁCH BIỆT THEO TỪNG MỤC HỌC) ====================
+  const handleUpdateAiChat = (contextKey, nextMessages, meta = {}) => {
+    const safeList = Array.isArray(nextMessages) ? nextMessages : [];
+    setAiChatsMap((prev) => {
+      const next = { ...prev };
+      if (safeList.length === 0) {
+        delete next[contextKey];
+      } else {
+        next[contextKey] = safeList;
+      }
+      try {
+        localStorage.setItem(LOCAL_AI_CHATS_KEY, JSON.stringify(next));
+      } catch {
+        // ignore storage quota
+      }
+      return next;
+    });
+
+    if (user && supabase) {
+      if (safeList.length === 0) {
+        supabase
+          .from('user_ai_chats')
+          .delete()
+          .eq('user_id', user.id)
+          .eq('context_key', contextKey)
+          .then(({ error }) => {
+            if (!error) setAiChatCloudReady(true);
+          });
+      } else {
+        supabase
+          .from('user_ai_chats')
+          .upsert(
+            {
+              user_id: user.id,
+              context_key: contextKey,
+              context_type: meta.contextType || 'section',
+              title: String(meta.title || '').slice(0, 180),
+              messages: safeList,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'user_id,context_key' }
+          )
+          .then(({ error }) => {
+            if (!error) setAiChatCloudReady(true);
+          });
+      }
+    }
+  };
+
+  const handlePinAiReplyToSectionNote = async (sectionId, replyText) => {
+    const cleanReply = String(replyText || '').trim();
+    if (!cleanReply) return;
+    const existing = (sectionNotes[sectionId] || '').trim();
+    const combined = existing
+      ? `${existing}
+
+--- Ghi chú từ Gia sư AI ---
+${cleanReply}`
+      : `[Gia sư AI]:
+${cleanReply}`;
+    await handleSaveSectionNote(sectionId, combined);
+    showToast('Đã ghim câu trả lời của Gia sư AI vào Ghi chú cá nhân!');
   };
 
   // ==================== SECTION EXPLANATION & INLINE ADMIN EDIT & VIDEO EMBED ====================
@@ -1356,6 +1455,7 @@ export default function App() {
       mock_exams: mockExams,
       mock_exam_questions: mockExamQuestions,
       progressMap,
+      aiChatsMap,
     };
     const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -1379,6 +1479,17 @@ export default function App() {
       if (parsed.quiz_questions?.length) await supabase.from('quiz_questions').upsert(parsed.quiz_questions);
       if (parsed.mock_exams?.length) await supabase.from('mock_exams').upsert(parsed.mock_exams);
       if (parsed.mock_exam_questions?.length) await supabase.from('mock_exam_questions').upsert(parsed.mock_exam_questions);
+      if (parsed.aiChatsMap && typeof parsed.aiChatsMap === 'object') {
+        setAiChatsMap((prev) => {
+          const merged = { ...prev, ...parsed.aiChatsMap };
+          try {
+            localStorage.setItem(LOCAL_AI_CHATS_KEY, JSON.stringify(merged));
+          } catch {
+            // ignore
+          }
+          return merged;
+        });
+      }
       await loadCurriculum();
       showToast('Đã khôi phục toàn bộ dữ liệu từ file JSON!');
     } catch (err) {
@@ -1396,6 +1507,7 @@ export default function App() {
     setActiveLessonId(lessonId);
     setLessonTab(tab);
     setOpenExplainIds({});
+    setOpenChatKeys({});
     setShowBoardPhoto(false);
     setBoardLightboxIndex(null);
     setBoardLightboxZoom(1);
@@ -2689,6 +2801,9 @@ export default function App() {
                     const isEditing = editingSectionId === sec.id;
                     const videos = Array.isArray(sec.video_urls) ? sec.video_urls : [];
                     const videoKeywords = Array.isArray(sec.video_keywords) ? sec.video_keywords : [];
+                    const secChatKey = `section:${sec.id}`;
+                    const secChatMessages = aiChatsMap[secChatKey] || [];
+                    const isChatOpen = Boolean(openChatKeys[secChatKey]);
 
                     return (
                       <article
@@ -2813,6 +2928,33 @@ export default function App() {
                                     <Lightbulb className="w-4 h-4" />
                                     {isExplainOpen ? 'Ẩn giải thích' : 'Giải thích dễ hiểu & Ví dụ'}
                                   </>
+                                )}
+                              </button>
+
+                              {/* Nút mở Gia sư AI riêng cho mục học này */}
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setOpenChatKeys((prev) => ({ ...prev, [secChatKey]: !prev[secChatKey] }))
+                                }
+                                className={`inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-xs font-bold border transition ${
+                                  isChatOpen
+                                    ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm'
+                                    : 'bg-indigo-50 dark:bg-indigo-950/60 hover:bg-indigo-100 text-indigo-700 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800'
+                                }`}
+                              >
+                                <Bot className="w-4 h-4" />
+                                <span>{isChatOpen ? 'Ẩn Gia sư AI' : 'Hỏi Gia sư AI'}</span>
+                                {secChatMessages.length > 0 && (
+                                  <span
+                                    className={`px-1.5 py-0.5 rounded-full text-[10px] font-black leading-none ${
+                                      isChatOpen
+                                        ? 'bg-white/20 text-white'
+                                        : 'bg-indigo-600 text-white'
+                                    }`}
+                                  >
+                                    {secChatMessages.length}
+                                  </span>
                                 )}
                               </button>
 
@@ -2955,6 +3097,28 @@ export default function App() {
                               </div>
                             )}
 
+                            {/* Embedded Dedicated AI Tutor Chat (lưu riêng cho từng mục học) */}
+                            {isChatOpen && (
+                              <SectionAiChat
+                                contextKey={secChatKey}
+                                contextType="section"
+                                subjectName={activeSubject?.title_de || ''}
+                                lessonTitle={activeLesson?.title_de || ''}
+                                sectionHeading={sec.heading_de || ''}
+                                sectionContentDe={sec.content_de || ''}
+                                sectionContentVn={sec.content_vn || ''}
+                                diagramJson={sec.diagram_json || null}
+                                messages={secChatMessages}
+                                onUpdateMessages={handleUpdateAiChat}
+                                onPinToNote={(replyText) => handlePinAiReplyToSectionNote(sec.id, replyText)}
+                                onWordClick={handleWordClick}
+                                isCloudSynced={aiChatCloudReady}
+                                onClose={() =>
+                                  setOpenChatKeys((prev) => ({ ...prev, [secChatKey]: false }))
+                                }
+                              />
+                            )}
+
                             {/* Personal Notes (Eigene Notizen) */}
                             <details className="pt-2 border-t border-slate-100 dark:border-slate-800">
                               <summary className="text-xs font-bold text-slate-500 dark:text-slate-400 hover:text-indigo-600 cursor-pointer flex items-center gap-1.5 list-none">
@@ -3017,19 +3181,99 @@ export default function App() {
               )}
 
               {/* TAB 4: LESSON QUIZ */}
-              {lessonTab === 'quiz' && (
-                <QuizPanel
-                  questions={activeQuiz}
-                  showVn={showVn}
-                  ttsRate={ttsRate}
-                  dictMode={dictMode}
-                  onWordClick={handleWordClick}
-                  isAdmin={isAdmin}
-                  onSaveAttempt={handleSaveQuizAttempt}
-                  onLogMistakes={(m) => handleLogMistakes(m, 'lesson')}
-                  onAppendMoreQuiz={handleAppendMoreQuiz}
-                />
-              )}
+              {lessonTab === 'quiz' && (() => {
+                const quizChatKey = `quiz:${activeLesson.id}`;
+                const quizChatMessages = aiChatsMap[quizChatKey] || [];
+                const isQuizChatOpen = Boolean(openChatKeys[quizChatKey]);
+                const quizContextDigest = activeQuiz
+                  .map((q, idx) => {
+                    const opts = Array.isArray(q.options) && q.options.length
+                      ? q.options
+                          .map((o, oi) => `${String.fromCharCode(65 + oi)}) ${o.de}${oi === q.correct_index ? ' [ĐÚNG]' : ''}`)
+                          .join(' | ')
+                      : '';
+                    return `Câu ${idx + 1} (${q.q_type}): ${q.question_de}${opts ? `\nĐáp án: ${opts}` : ''}${
+                      q.model_answer_de ? `\nBài mẫu: ${q.model_answer_de}` : ''
+                    }${q.explanation_vn ? `\nGiải thích: ${q.explanation_vn}` : ''}`;
+                  })
+                  .join('\n---\n');
+
+                return (
+                  <div className="space-y-5">
+                    <QuizPanel
+                      questions={activeQuiz}
+                      showVn={showVn}
+                      ttsRate={ttsRate}
+                      dictMode={dictMode}
+                      onWordClick={handleWordClick}
+                      isAdmin={isAdmin}
+                      onSaveAttempt={handleSaveQuizAttempt}
+                      onLogMistakes={(m) => handleLogMistakes(m, 'lesson')}
+                      onAppendMoreQuiz={handleAppendMoreQuiz}
+                    />
+
+                    {/* Gia sư AI riêng cho Bài Test của bài học này */}
+                    <div className="bg-white dark:bg-slate-900 rounded-3xl border border-indigo-200 dark:border-indigo-800/80 p-4 sm:p-5 shadow-sm">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div className="w-10 h-10 rounded-2xl bg-indigo-600 text-white flex items-center justify-center shrink-0">
+                            <Bot className="w-5 h-5" />
+                          </div>
+                          <div className="min-w-0">
+                            <h3 className="text-sm font-extrabold text-slate-900 dark:text-white">
+                              Gia sư AI giải đáp riêng cho Bài Test này
+                            </h3>
+                            <p className="text-xs text-slate-500 dark:text-slate-400">
+                              Kẹt câu số mấy cứ hỏi thẳng (VD: &ldquo;Câu 3 tại sao B sai?&rdquo; hay &ldquo;Câu 5 bấm Casio kiểu gì?&rdquo;) — lưu riêng cho bài test này
+                            </p>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setOpenChatKeys((prev) => ({ ...prev, [quizChatKey]: !prev[quizChatKey] }))
+                          }
+                          className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold border transition shrink-0 ${
+                            isQuizChatOpen
+                              ? 'bg-indigo-600 text-white border-indigo-600'
+                              : 'bg-indigo-50 dark:bg-indigo-950/70 hover:bg-indigo-100 text-indigo-700 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800'
+                          }`}
+                        >
+                          <MessageCircle className="w-4 h-4" />
+                          {isQuizChatOpen ? 'Thu gọn khung chat' : 'Mở Gia sư AI'}
+                          {quizChatMessages.length > 0 && (
+                            <span
+                              className={`px-1.5 py-0.5 rounded-full text-[10px] font-black ${
+                                isQuizChatOpen ? 'bg-white/20 text-white' : 'bg-indigo-600 text-white'
+                              }`}
+                            >
+                              {quizChatMessages.length}
+                            </span>
+                          )}
+                        </button>
+                      </div>
+
+                      {isQuizChatOpen && (
+                        <SectionAiChat
+                          contextKey={quizChatKey}
+                          contextType="quiz"
+                          subjectName={activeSubject?.title_de || ''}
+                          lessonTitle={activeLesson?.title_de || ''}
+                          sectionHeading={`Bài Test (${activeQuiz.length} câu hỏi)`}
+                          extraContext={quizContextDigest}
+                          messages={quizChatMessages}
+                          onUpdateMessages={handleUpdateAiChat}
+                          onWordClick={handleWordClick}
+                          isCloudSynced={aiChatCloudReady}
+                          onClose={() =>
+                            setOpenChatKeys((prev) => ({ ...prev, [quizChatKey]: false }))
+                          }
+                        />
+                      )}
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           )}
 
@@ -3105,22 +3349,98 @@ export default function App() {
           )}
 
           {/* ==================== VIEW 7: MISTAKE BANK & ANALYTICS ==================== */}
-          {view === 'mistakes' && (
-            <MistakesAnalyticsView
-              wrongQuestions={wrongQuestions}
-              subjects={subjects}
-              lessons={lessons}
-              flashcards={flashcards}
-              progressMap={progressMap}
-              quizAttempts={quizAttempts}
-              showVn={showVn}
-              ttsRate={ttsRate}
-              dictMode={dictMode}
-              onWordClick={handleWordClick}
-              onToggleResolveMistake={handleToggleResolveMistake}
-              onOpenLesson={(lid) => openLesson(lid, 'study')}
-            />
-          )}
+          {view === 'mistakes' && (() => {
+            const mistakesChatKey = 'mistakes:global';
+            const mistakesChatMessages = aiChatsMap[mistakesChatKey] || [];
+            const isMistakesChatOpen = Boolean(openChatKeys[mistakesChatKey]);
+            const unresolvedList = wrongQuestions.filter((m) => !m.resolved).slice(0, 12);
+            const mistakesDigest = unresolvedList.length
+              ? unresolvedList
+                  .map((m, idx) => {
+                    const q = m.question_snapshot || {};
+                    return `Câu sai #${idx + 1}: ${q.question_de || ''}\nHọc viên chọn/trả lời: ${m.user_answer || '(Trống)'}${
+                      m.feedback_vn ? `\nNhận xét cũ: ${m.feedback_vn}` : ''
+                    }`;
+                  })
+                  .join('\n---\n')
+              : 'Hiện học viên chưa có câu sai tồn đọng nào.';
+
+            return (
+              <div className="space-y-5">
+                <MistakesAnalyticsView
+                  wrongQuestions={wrongQuestions}
+                  subjects={subjects}
+                  lessons={lessons}
+                  flashcards={flashcards}
+                  progressMap={progressMap}
+                  quizAttempts={quizAttempts}
+                  showVn={showVn}
+                  ttsRate={ttsRate}
+                  dictMode={dictMode}
+                  onWordClick={handleWordClick}
+                  onToggleResolveMistake={handleToggleResolveMistake}
+                  onOpenLesson={(lid) => openLesson(lid, 'study')}
+                />
+
+                <div className="bg-white dark:bg-slate-900 rounded-3xl border border-indigo-200 dark:border-indigo-800/80 p-4 sm:p-5 shadow-sm">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-10 h-10 rounded-2xl bg-indigo-600 text-white flex items-center justify-center shrink-0">
+                        <Bot className="w-5 h-5" />
+                      </div>
+                      <div className="min-w-0">
+                        <h3 className="text-sm font-extrabold text-slate-900 dark:text-white">
+                          Gia sư AI phân tích Câu sai & Vá lỗ hổng IHK
+                        </h3>
+                        <p className="text-xs text-slate-500 dark:text-slate-400">
+                          AI đã đọc sẵn {unresolvedList.length} câu sai chưa khắc phục của bạn để giải thích lại tận gốc
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setOpenChatKeys((prev) => ({ ...prev, [mistakesChatKey]: !prev[mistakesChatKey] }))
+                      }
+                      className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold border transition shrink-0 ${
+                        isMistakesChatOpen
+                          ? 'bg-indigo-600 text-white border-indigo-600'
+                          : 'bg-indigo-50 dark:bg-indigo-950/70 hover:bg-indigo-100 text-indigo-700 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800'
+                      }`}
+                    >
+                      <MessageCircle className="w-4 h-4" />
+                      {isMistakesChatOpen ? 'Thu gọn khung chat' : 'Hỏi Gia sư AI'}
+                      {mistakesChatMessages.length > 0 && (
+                        <span
+                          className={`px-1.5 py-0.5 rounded-full text-[10px] font-black ${
+                            isMistakesChatOpen ? 'bg-white/20 text-white' : 'bg-indigo-600 text-white'
+                          }`}
+                        >
+                          {mistakesChatMessages.length}
+                        </span>
+                      )}
+                    </button>
+                  </div>
+
+                  {isMistakesChatOpen && (
+                    <SectionAiChat
+                      contextKey={mistakesChatKey}
+                      contextType="mistakes"
+                      sectionHeading="Kho câu sai & Điểm yếu cần khắc phục"
+                      extraContext={mistakesDigest}
+                      messages={mistakesChatMessages}
+                      onUpdateMessages={handleUpdateAiChat}
+                      onWordClick={handleWordClick}
+                      isCloudSynced={aiChatCloudReady}
+                      onClose={() =>
+                        setOpenChatKeys((prev) => ({ ...prev, [mistakesChatKey]: false }))
+                      }
+                    />
+                  )}
+                </div>
+              </div>
+            );
+          })()}
 
           {/* ==================== VIEW 8: SETTINGS & BACKUP ==================== */}
           {view === 'settings' && (
