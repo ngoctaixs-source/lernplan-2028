@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   X,
   RefreshCw,
@@ -180,6 +180,18 @@ export default function LessonUpgradeModal({
 
   const pdfInputRef = useRef(null);
   const imgInputRef = useRef(null);
+
+  // Phím Esc để đóng nhanh cửa sổ (tự khóa khi AI đang chạy nâng cấp)
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape' && !running) {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [running, onClose]);
 
   const handlePickPdf = (file) => {
     if (!file) return;
@@ -448,8 +460,16 @@ export default function LessonUpgradeModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/75 backdrop-blur-sm">
-      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden">
+    <div
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !running) onClose();
+      }}
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/75 backdrop-blur-sm cursor-pointer"
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="cursor-default bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden"
+      >
         {/* Header */}
         <div className="p-5 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3 min-w-0">
