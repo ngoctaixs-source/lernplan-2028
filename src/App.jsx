@@ -49,6 +49,7 @@ import {
   RotateCw,
   Bot,
   MessageCircle,
+  CornerDownRight,
 } from 'lucide-react';
 import { supabase, isSupabaseConfigured, ADMIN_EMAIL } from './lib/supabase';
 import { callGeminiApi } from './lib/api';
@@ -266,6 +267,9 @@ export default function App() {
   });
   const [aiChatCloudReady, setAiChatCloudReady] = useState(false);
   const [openChatKeys, setOpenChatKeys] = useState({});
+  const [pendingChatQuotes, setPendingChatQuotes] = useState({});
+  const [lessonSelectionPopup, setLessonSelectionPopup] = useState(null); // null | { sectionId, text, top, left }
+  const [examChatExamId, setExamChatExamId] = useState('all');
 
   // Dictionary Cache & Popover State (lưu sẵn localStorage để tra lại mất 0ms)
   const [dictCache, setDictCache] = useState(() => {
@@ -327,6 +331,103 @@ export default function App() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, []);
+
+  // Tô đen bất kỳ đoạn chữ nào trong phần bài học -> hiện nút nổi "↳ Hỏi Gia sư AI" giống Gemini
+  useEffect(() => {
+    if (view !== 'lesson' || lessonTab !== 'study') {
+      setLessonSelectionPopup(null);
+      return undefined;
+    }
+
+    const detectSectionSelection = () => {
+      setTimeout(() => {
+        const sel = window.getSelection();
+        if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+          setLessonSelectionPopup(null);
+          return;
+        }
+        const selectedStr = sel.toString().replace(/\s+/g, ' ').trim();
+        if (selectedStr.length < 3) {
+          setLessonSelectionPopup(null);
+          return;
+        }
+
+        const range = sel.getRangeAt(0);
+        const ancestor = range.commonAncestorContainer;
+        const anchorEl = ancestor.nodeType === 1 ? ancestor : ancestor.parentElement;
+        if (!anchorEl) {
+          setLessonSelectionPopup(null);
+          return;
+        }
+
+        // Bỏ qua nếu đang tô đen bên trong khung chat (khung chat có nút nổi riêng) hoặc trong ô nhập liệu
+        if (anchorEl.closest('.section-ai-chat-root, input, textarea')) {
+          setLessonSelectionPopup(null);
+          return;
+        }
+
+        const sectionArticle = anchorEl.closest('[data-ai-section-id]');
+        if (!sectionArticle) {
+          setLessonSelectionPopup(null);
+          return;
+        }
+
+        const sectionId = sectionArticle.getAttribute('data-ai-section-id');
+        if (!sectionId) return;
+
+        const rect = range.getBoundingClientRect();
+        if (!rect || (rect.width === 0 && rect.height === 0)) {
+          setLessonSelectionPopup(null);
+          return;
+        }
+
+        const top = rect.top > 56 ? rect.top - 44 : rect.bottom + 8;
+        const left = Math.min(Math.max(rect.left + rect.width / 2, 92), window.innerWidth - 92);
+        setLessonSelectionPopup({
+          sectionId,
+          text: selectedStr.slice(0, 600),
+          top,
+          left,
+        });
+      }, 20);
+    };
+
+    const hidePopup = (e) => {
+      if (e.type === 'keydown' && e.key !== 'Escape') return;
+      setLessonSelectionPopup(null);
+    };
+
+    document.addEventListener('mouseup', detectSectionSelection);
+    document.addEventListener('touchend', detectSectionSelection);
+    window.addEventListener('scroll', hidePopup, true);
+    window.addEventListener('keydown', hidePopup);
+    return () => {
+      document.removeEventListener('mouseup', detectSectionSelection);
+      document.removeEventListener('touchend', detectSectionSelection);
+      window.removeEventListener('scroll', hidePopup, true);
+      window.removeEventListener('keydown', hidePopup);
+    };
+  }, [view, lessonTab]);
+
+  const handleAskTutorFromLessonHighlight = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!lessonSelectionPopup?.sectionId || !lessonSelectionPopup?.text) return;
+    const { sectionId, text } = lessonSelectionPopup;
+    const chatKey = `section:${sectionId}`;
+    setOpenChatKeys((prev) => ({ ...prev, [chatKey]: true }));
+    setPendingChatQuotes((prev) => ({ ...prev, [chatKey]: text }));
+    setLessonSelectionPopup(null);
+    try {
+      window.getSelection()?.removeAllRanges();
+    } catch {
+      // ignore
+    }
+    setTimeout(() => {
+      const anchor = document.getElementById(`ai-chat-anchor-${sectionId}`);
+      anchor?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 80);
+  };
 
   const daysToExam = useMemo(() => {
     const examDate = new Date('2028-05-01T08:00:00Z');
@@ -561,6 +662,11 @@ export default function App() {
 
   // ==================== CLICK-TO-TRANSLATE DICTIONARY HANDLER (0ms LOCAL + SIÊU TỐC) ====================
   const handleWordClick = async (rawWord, contextSentence = '') => {
+    // Nếu người dùng đang kéo chuột tô đen nhiều chữ để bấm "↳ Hỏi Gia sư AI", không bật popup tra 1 từ
+    if (typeof window !== 'undefined') {
+      const selStr = (window.getSelection()?.toString() || '').trim();
+      if (selStr.length >= 2) return;
+    }
     const cleaned = rawWord.trim();
     if (!cleaned) return;
     const key = cleaned.toLowerCase();
@@ -2808,6 +2914,7 @@ ${cleanReply}`;
                     return (
                       <article
                         key={sec.id}
+                        data-ai-section-id={sec.id}
                         className="bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 shadow-sm p-5 sm:p-7 space-y-4"
                       >
                         {isEditing ? (
@@ -3098,26 +3205,37 @@ ${cleanReply}`;
                             )}
 
                             {/* Embedded Dedicated AI Tutor Chat (lưu riêng cho từng mục học) */}
-                            {isChatOpen && (
-                              <SectionAiChat
-                                contextKey={secChatKey}
-                                contextType="section"
-                                subjectName={activeSubject?.title_de || ''}
-                                lessonTitle={activeLesson?.title_de || ''}
-                                sectionHeading={sec.heading_de || ''}
-                                sectionContentDe={sec.content_de || ''}
-                                sectionContentVn={sec.content_vn || ''}
-                                diagramJson={sec.diagram_json || null}
-                                messages={secChatMessages}
-                                onUpdateMessages={handleUpdateAiChat}
-                                onPinToNote={(replyText) => handlePinAiReplyToSectionNote(sec.id, replyText)}
-                                onWordClick={handleWordClick}
-                                isCloudSynced={aiChatCloudReady}
-                                onClose={() =>
-                                  setOpenChatKeys((prev) => ({ ...prev, [secChatKey]: false }))
-                                }
-                              />
-                            )}
+                            <div id={`ai-chat-anchor-${sec.id}`}>
+                              {isChatOpen && (
+                                <SectionAiChat
+                                  contextKey={secChatKey}
+                                  contextType="section"
+                                  subjectName={activeSubject?.title_de || ''}
+                                  lessonTitle={activeLesson?.title_de || ''}
+                                  sectionHeading={sec.heading_de || ''}
+                                  sectionContentDe={sec.content_de || ''}
+                                  sectionContentVn={sec.content_vn || ''}
+                                  diagramJson={sec.diagram_json || null}
+                                  messages={secChatMessages}
+                                  onUpdateMessages={handleUpdateAiChat}
+                                  onPinToNote={(replyText) => handlePinAiReplyToSectionNote(sec.id, replyText)}
+                                  onWordClick={handleWordClick}
+                                  isCloudSynced={aiChatCloudReady}
+                                  pendingQuote={pendingChatQuotes[secChatKey] || ''}
+                                  onClearPendingQuote={() =>
+                                    setPendingChatQuotes((prev) => {
+                                      if (!prev[secChatKey]) return prev;
+                                      const next = { ...prev };
+                                      delete next[secChatKey];
+                                      return next;
+                                    })
+                                  }
+                                  onClose={() =>
+                                    setOpenChatKeys((prev) => ({ ...prev, [secChatKey]: false }))
+                                  }
+                                />
+                              )}
+                            </div>
 
                             {/* Personal Notes (Eigene Notizen) */}
                             <details className="pt-2 border-t border-slate-100 dark:border-slate-800">
@@ -3329,24 +3447,138 @@ ${cleanReply}`;
           )}
 
           {/* ==================== VIEW 6: MOCK EXAM CENTER (ALTKLAUSUREN) ==================== */}
-          {view === 'exams' && (
-            <MockExamCenter
-              mockExams={mockExams}
-              mockExamQuestions={mockExamQuestions}
-              allQuizQuestions={quizQuestions}
-              subjects={subjects}
-              lessons={lessons}
-              isAdmin={isAdmin}
-              showVn={showVn}
-              ttsRate={ttsRate}
-              dictMode={dictMode}
-              onWordClick={handleWordClick}
-              onCreateExam={handleCreateExam}
-              onAppendExamQuestions={handleAppendExamQuestions}
-              onDeleteExam={handleDeleteExam}
-              onLogMistakes={handleLogMistakes}
-            />
-          )}
+          {view === 'exams' && (() => {
+            const activeExamObj =
+              examChatExamId === 'all' ? null : mockExams.find((ex) => ex.id === examChatExamId) || null;
+            const examChatKey = activeExamObj ? `exam:${activeExamObj.id}` : 'exam:all';
+            const examChatMessages = aiChatsMap[examChatKey] || [];
+            const isExamChatOpen = Boolean(openChatKeys[examChatKey]);
+
+            const scopedQuestions = activeExamObj
+              ? mockExamQuestions.filter((q) => q.exam_id === activeExamObj.id)
+              : mockExamQuestions.length > 0
+              ? mockExamQuestions.slice(0, 14)
+              : quizQuestions.slice(0, 12);
+
+            const examContextDigest = scopedQuestions.length
+              ? scopedQuestions
+                  .map((q, idx) => {
+                    const label = q.section_label || `Aufgabe ${idx + 1}`;
+                    const opts =
+                      Array.isArray(q.options) && q.options.length
+                        ? q.options
+                            .map(
+                              (o, oi) =>
+                                `${String.fromCharCode(65 + oi)}) ${o.de}${oi === q.correct_index ? ' [ĐÚNG]' : ''}`
+                            )
+                            .join(' | ')
+                        : '';
+                    return `${label} (${q.points || 10} Punkte · ${q.q_type}): ${q.question_de}${
+                      opts ? `\nĐáp án: ${opts}` : ''
+                    }${q.model_answer_de ? `\nBài mẫu: ${q.model_answer_de}` : ''}${
+                      q.explanation_vn ? `\nGiải thích: ${q.explanation_vn}` : ''
+                    }`;
+                  })
+                  .join('\n---\n')
+              : 'Học viên đang luyện thi thử IHK Veranstaltungskaufmann.';
+
+            return (
+              <div className="space-y-5">
+                <MockExamCenter
+                  mockExams={mockExams}
+                  mockExamQuestions={mockExamQuestions}
+                  allQuizQuestions={quizQuestions}
+                  subjects={subjects}
+                  lessons={lessons}
+                  isAdmin={isAdmin}
+                  showVn={showVn}
+                  ttsRate={ttsRate}
+                  dictMode={dictMode}
+                  onWordClick={handleWordClick}
+                  onCreateExam={handleCreateExam}
+                  onAppendExamQuestions={handleAppendExamQuestions}
+                  onDeleteExam={handleDeleteExam}
+                  onLogMistakes={handleLogMistakes}
+                />
+
+                {/* Gia sư AI riêng cho Phòng thi thử (Altklausuren) */}
+                <div className="bg-white dark:bg-slate-900 rounded-3xl border border-indigo-200 dark:border-indigo-800/80 p-4 sm:p-5 shadow-sm space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-10 h-10 rounded-2xl bg-indigo-600 text-white flex items-center justify-center shrink-0">
+                        <Bot className="w-5 h-5" />
+                      </div>
+                      <div className="min-w-0">
+                        <h3 className="text-sm font-extrabold text-slate-900 dark:text-white">
+                          Gia sư AI giải đáp riêng cho Phòng thi thử (Altklausuren)
+                        </h3>
+                        <p className="text-xs text-slate-500 dark:text-slate-400">
+                          Chọn bộ đề muốn hỏi, AI đọc sẵn đề + đáp án mẫu để mổ xẻ bẫy IHK & cách bấm Casio fx-580VN X
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      {mockExams.length > 0 && (
+                        <select
+                          value={activeExamObj ? activeExamObj.id : 'all'}
+                          onChange={(e) => setExamChatExamId(e.target.value)}
+                          className="px-3 py-2 text-xs font-bold bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl max-w-[220px]"
+                        >
+                          <option value="all">Tất cả đề thi thử ({mockExamQuestions.length || quizQuestions.length} câu)</option>
+                          {mockExams.map((ex) => (
+                            <option key={ex.id} value={ex.id}>
+                              {ex.title}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setOpenChatKeys((prev) => ({ ...prev, [examChatKey]: !prev[examChatKey] }))
+                        }
+                        className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold border transition shrink-0 ${
+                          isExamChatOpen
+                            ? 'bg-indigo-600 text-white border-indigo-600'
+                            : 'bg-indigo-50 dark:bg-indigo-950/70 hover:bg-indigo-100 text-indigo-700 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800'
+                        }`}
+                      >
+                        <MessageCircle className="w-4 h-4" />
+                        {isExamChatOpen ? 'Thu gọn khung chat' : 'Hỏi Gia sư AI'}
+                        {examChatMessages.length > 0 && (
+                          <span
+                            className={`px-1.5 py-0.5 rounded-full text-[10px] font-black ${
+                              isExamChatOpen ? 'bg-white/20 text-white' : 'bg-indigo-600 text-white'
+                            }`}
+                          >
+                            {examChatMessages.length}
+                          </span>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+
+                  {isExamChatOpen && (
+                    <SectionAiChat
+                      contextKey={examChatKey}
+                      contextType="exam"
+                      sectionHeading={activeExamObj ? activeExamObj.title : 'Phòng thi thử tổng hợp (Altklausuren)'}
+                      extraContext={examContextDigest}
+                      messages={examChatMessages}
+                      onUpdateMessages={handleUpdateAiChat}
+                      onWordClick={handleWordClick}
+                      isCloudSynced={aiChatCloudReady}
+                      onClose={() =>
+                        setOpenChatKeys((prev) => ({ ...prev, [examChatKey]: false }))
+                      }
+                    />
+                  )}
+                </div>
+              </div>
+            );
+          })()}
 
           {/* ==================== VIEW 7: MISTAKE BANK & ANALYTICS ==================== */}
           {view === 'mistakes' && (() => {
@@ -3465,6 +3697,24 @@ ${cleanReply}`;
           )}
         </main>
       </div>
+
+      {/* FLOATING HIGHLIGHT-TO-ASK PILL TRONG BÀI HỌC (tô đen chữ -> bấm "↳ Hỏi Gia sư AI") */}
+      {lessonSelectionPopup && (
+        <button
+          type="button"
+          onMouseDown={handleAskTutorFromLessonHighlight}
+          onTouchStart={handleAskTutorFromLessonHighlight}
+          style={{
+            top: `${lessonSelectionPopup.top}px`,
+            left: `${lessonSelectionPopup.left}px`,
+            transform: 'translateX(-50%)',
+          }}
+          className="fixed z-[80] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-full bg-slate-900 dark:bg-slate-800 hover:bg-indigo-600 text-white text-xs font-bold shadow-2xl border border-slate-700/80 transition whitespace-nowrap"
+        >
+          <CornerDownRight className="w-3.5 h-3.5 text-indigo-300" />
+          Hỏi Gia sư AI
+        </button>
+      )}
 
       {/* GLOBAL MODALS & DICTIONARY POPOVER */}
       <WordPopover
