@@ -301,6 +301,13 @@ export default function ImportModal({
   const [previewRotate, setPreviewRotate] = useState(0);
   const [previewHighResUrl, setPreviewHighResUrl] = useState('');
   const [previewLoadingImg, setPreviewLoadingImg] = useState(false);
+  const [previewDragOffsetY, setPreviewDragOffsetY] = useState(0);
+  const [previewIsPanning, setPreviewIsPanning] = useState(false);
+
+  const previewStageRef = useRef(null);
+  const previewWheelFlipRef = useRef(0);
+  const previewPanRef = useRef({ active: false, moved: false, startX: 0, startY: 0, scrollLeft: 0, scrollTop: 0 });
+  const previewTouchRef = useRef({ mode: null, startX: 0, startY: 0, startDist: 0, startZoom: 1, moved: false });
 
   // Tự động render trang PDF độ nét cao khi mở preview trang PDF
   useEffect(() => {
@@ -346,44 +353,116 @@ export default function ImportModal({
     };
   }, [previewModal, pdfPages]);
 
-  // Phím tắt Esc / Mũi tên trái phải / +/- khi đang mở cửa sổ xem trước
+  // Phím tắt thông minh: Esc đóng Xem ảnh trước -> đóng ImportModal; mũi tên, +/-, 0, R trong xem ảnh
   useEffect(() => {
-    if (!previewModal) return undefined;
     const onKeyDown = (e) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        setPreviewModal(null);
-      } else if (e.key === 'ArrowLeft') {
-        e.preventDefault();
-        if (previewModal.kind === 'pdf' && previewModal.pageNum > 1) {
+      if (previewModal) {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          setPreviewModal(null);
+        } else if (e.key === 'ArrowLeft') {
+          e.preventDefault();
+          if (previewModal.kind === 'pdf' && previewModal.pageNum > 1) {
+            setPreviewZoom(1);
+            setPreviewRotate(0);
+            setPreviewModal((prev) => (prev ? { ...prev, pageNum: prev.pageNum - 1 } : null));
+          } else if (previewModal.kind === 'image' && previewModal.index > 0) {
+            setPreviewZoom(1);
+            setPreviewRotate(0);
+            setPreviewModal((prev) => (prev ? { ...prev, index: prev.index - 1 } : null));
+          }
+        } else if (e.key === 'ArrowRight') {
+          e.preventDefault();
+          if (previewModal.kind === 'pdf' && previewModal.pageNum < pdfPages.length) {
+            setPreviewZoom(1);
+            setPreviewRotate(0);
+            setPreviewModal((prev) => (prev ? { ...prev, pageNum: prev.pageNum + 1 } : null));
+          } else if (previewModal.kind === 'image' && previewModal.index < images.length - 1) {
+            setPreviewZoom(1);
+            setPreviewRotate(0);
+            setPreviewModal((prev) => (prev ? { ...prev, index: prev.index + 1 } : null));
+          }
+        } else if (e.key === '+' || e.key === '=') {
+          setPreviewZoom((z) => Math.min(3.5, Number((z + 0.4).toFixed(2))));
+        } else if (e.key === '-') {
+          setPreviewZoom((z) => Math.max(1, Number((z - 0.4).toFixed(2))));
+        } else if (e.key === '0') {
           setPreviewZoom(1);
           setPreviewRotate(0);
-          setPreviewModal((prev) => (prev ? { ...prev, pageNum: prev.pageNum - 1 } : null));
-        } else if (previewModal.kind === 'image' && previewModal.index > 0) {
-          setPreviewZoom(1);
-          setPreviewRotate(0);
-          setPreviewModal((prev) => (prev ? { ...prev, index: prev.index - 1 } : null));
+        } else if (e.key === 'r' || e.key === 'R') {
+          setPreviewRotate((r) => (r + 90) % 360);
         }
-      } else if (e.key === 'ArrowRight') {
+        return;
+      }
+
+      if (e.key === 'Escape' && !loading && pdfStage !== 'importing') {
         e.preventDefault();
-        if (previewModal.kind === 'pdf' && previewModal.pageNum < pdfPages.length) {
-          setPreviewZoom(1);
-          setPreviewRotate(0);
-          setPreviewModal((prev) => (prev ? { ...prev, pageNum: prev.pageNum + 1 } : null));
-        } else if (previewModal.kind === 'image' && previewModal.index < images.length - 1) {
-          setPreviewZoom(1);
-          setPreviewRotate(0);
-          setPreviewModal((prev) => (prev ? { ...prev, index: prev.index + 1 } : null));
-        }
-      } else if (e.key === '+' || e.key === '=') {
-        setPreviewZoom((z) => Math.min(3, Number((z + 0.4).toFixed(2))));
-      } else if (e.key === '-') {
-        setPreviewZoom((z) => Math.max(1, Number((z - 0.4).toFixed(2))));
+        onClose();
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [previewModal, pdfPages.length, images.length]);
+  }, [previewModal, pdfPages.length, images.length, loading, pdfStage, onClose]);
+
+  // MacBook Trackpad Pinch-to-Zoom (ctrl+wheel) & Vuốt ngang 2 ngón đổi trang ảnh trong Preview Lightbox
+  useEffect(() => {
+    const el = previewStageRef.current;
+    if (!el || !previewModal) return undefined;
+    if (previewModal.kind === 'pdf' && previewModal.tab === 'text') return undefined;
+
+    const onWheel = (e) => {
+      // 1. Chụm / banh 2 ngón trên Trackpad MacBook để phóng to / thu nhỏ ảnh
+      if (e.ctrlKey) {
+        e.preventDefault();
+        const delta = -e.deltaY * 0.012;
+        setPreviewZoom((z) => Math.min(3.5, Math.max(1, Number((z + delta).toFixed(2)))));
+        return;
+      }
+
+      // 2. Khi ảnh đang vừa khung (zoom = 1): vuốt ngang 2 ngón đổi trang trước/sau mượt mà
+      if (previewZoom <= 1.02 && Math.abs(e.deltaX) > Math.abs(e.deltaY) * 1.4 && Math.abs(e.deltaX) > 26) {
+        const isPdf = previewModal.kind === 'pdf';
+        const total = isPdf ? pdfPages.length : images.length;
+        const pos = isPdf ? previewModal.pageNum : previewModal.index + 1;
+        const goingNext = e.deltaX > 0;
+        const goingPrev = e.deltaX < 0;
+        const now = Date.now();
+
+        if (goingNext && pos < total) {
+          e.preventDefault();
+          if (now - previewWheelFlipRef.current > 360) {
+            previewWheelFlipRef.current = now;
+            setPreviewZoom(1);
+            setPreviewRotate(0);
+            setPreviewModal((prev) =>
+              prev
+                ? prev.kind === 'pdf'
+                  ? { ...prev, pageNum: prev.pageNum + 1 }
+                  : { ...prev, index: prev.index + 1 }
+                : null
+            );
+          }
+        } else if (goingPrev && pos > 1) {
+          e.preventDefault();
+          if (now - previewWheelFlipRef.current > 360) {
+            previewWheelFlipRef.current = now;
+            setPreviewZoom(1);
+            setPreviewRotate(0);
+            setPreviewModal((prev) =>
+              prev
+                ? prev.kind === 'pdf'
+                  ? { ...prev, pageNum: prev.pageNum - 1 }
+                  : { ...prev, index: prev.index - 1 }
+                : null
+            );
+          }
+        }
+      }
+    };
+
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [previewModal, previewZoom, pdfPages.length, images.length]);
 
   const openPdfPagePreview = (pageNum, tab = 'image') => {
     setPreviewZoom(1);
@@ -1027,8 +1106,18 @@ export default function ImportModal({
   }).length;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/70 backdrop-blur-sm">
-      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden">
+    <div
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !loading && pdfStage !== 'importing' && !previewModal) {
+          onClose();
+        }
+      }}
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/70 backdrop-blur-sm cursor-pointer"
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="cursor-default bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden"
+      >
         {/* Header */}
         <div className="p-5 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -1917,8 +2006,8 @@ export default function ImportModal({
                     </button>
                     <button
                       type="button"
-                      onClick={() => setPreviewZoom((z) => Math.min(3, Number((z + 0.4).toFixed(2))))}
-                      disabled={previewZoom >= 3}
+                      onClick={() => setPreviewZoom((z) => Math.min(3.5, Number((z + 0.4).toFixed(2))))}
+                      disabled={previewZoom >= 3.5}
                       className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40"
                       title="Phóng to (+)"
                     >
@@ -2019,12 +2108,134 @@ export default function ImportModal({
                 </div>
               ) : (
                 <div
-                  className="w-full h-full overflow-auto p-4 sm:p-8 flex items-start justify-center"
-                  onClick={(e) => e.stopPropagation()}
+                  ref={previewStageRef}
+                  onClick={(e) => {
+                    if (previewPanRef.current.moved) {
+                      previewPanRef.current.moved = false;
+                      e.stopPropagation();
+                      return;
+                    }
+                    // Nhấn trực tiếp vào vùng nền trống xung quanh ảnh -> đóng ngay lập tức!
+                    if (e.target === e.currentTarget) {
+                      setPreviewModal(null);
+                    }
+                  }}
+                  onMouseDown={(e) => {
+                    if (previewZoom <= 1.02 || e.button !== 0) return;
+                    const box = previewStageRef.current;
+                    if (!box) return;
+                    previewPanRef.current = {
+                      active: true,
+                      moved: false,
+                      startX: e.clientX,
+                      startY: e.clientY,
+                      scrollLeft: box.scrollLeft,
+                      scrollTop: box.scrollTop,
+                    };
+                    setPreviewIsPanning(true);
+                  }}
+                  onMouseMove={(e) => {
+                    if (!previewPanRef.current.active) return;
+                    const box = previewStageRef.current;
+                    if (!box) return;
+                    const dx = e.clientX - previewPanRef.current.startX;
+                    const dy = e.clientY - previewPanRef.current.startY;
+                    if (Math.abs(dx) > 4 || Math.abs(dy) > 4) {
+                      previewPanRef.current.moved = true;
+                    }
+                    box.scrollLeft = previewPanRef.current.scrollLeft - dx;
+                    box.scrollTop = previewPanRef.current.scrollTop - dy;
+                  }}
+                  onMouseUp={() => {
+                    if (previewPanRef.current.active) {
+                      previewPanRef.current.active = false;
+                      setPreviewIsPanning(false);
+                    }
+                  }}
+                  onMouseLeave={() => {
+                    if (previewPanRef.current.active) {
+                      previewPanRef.current.active = false;
+                      setPreviewIsPanning(false);
+                    }
+                  }}
+                  onTouchStart={(e) => {
+                    if (e.touches.length === 2) {
+                      const d = Math.hypot(
+                        e.touches[0].clientX - e.touches[1].clientX,
+                        e.touches[0].clientY - e.touches[1].clientY
+                      );
+                      previewTouchRef.current = { mode: 'pinch', startDist: d, startZoom: previewZoom, moved: true };
+                    } else if (e.touches.length === 1 && previewZoom <= 1.02) {
+                      previewTouchRef.current = {
+                        mode: 'swipe',
+                        startX: e.touches[0].clientX,
+                        startY: e.touches[0].clientY,
+                        moved: false,
+                      };
+                    } else {
+                      previewTouchRef.current = { mode: null, moved: false };
+                    }
+                  }}
+                  onTouchMove={(e) => {
+                    const t = previewTouchRef.current;
+                    if (t.mode === 'pinch' && e.touches.length === 2 && t.startDist > 10) {
+                      const d = Math.hypot(
+                        e.touches[0].clientX - e.touches[1].clientX,
+                        e.touches[0].clientY - e.touches[1].clientY
+                      );
+                      const nextZ = Math.min(3.5, Math.max(1, Number((t.startZoom * (d / t.startDist)).toFixed(2))));
+                      setPreviewZoom(nextZ);
+                    } else if (t.mode === 'swipe' && e.touches.length === 1 && previewZoom <= 1.02) {
+                      const dx = e.touches[0].clientX - t.startX;
+                      const dy = e.touches[0].clientY - t.startY;
+                      if (dy > 16 && dy > Math.abs(dx) * 1.3) {
+                        t.moved = true;
+                        setPreviewDragOffsetY(Math.min(180, dy));
+                      } else if (Math.abs(dx) > 16) {
+                        t.moved = true;
+                      }
+                    }
+                  }}
+                  onTouchEnd={(e) => {
+                    const t = previewTouchRef.current;
+                    if (t.mode === 'swipe' && previewZoom <= 1.02) {
+                      const touch = e.changedTouches?.[0];
+                      if (touch) {
+                        const dx = touch.clientX - t.startX;
+                        const dy = touch.clientY - t.startY;
+                        if (dy > 85 && dy > Math.abs(dx) * 1.35) {
+                          setPreviewDragOffsetY(0);
+                          setPreviewModal(null);
+                          previewTouchRef.current = { mode: null, moved: false };
+                          return;
+                        }
+                        if (Math.abs(dx) > 55 && Math.abs(dx) > Math.abs(dy) * 1.35) {
+                          if (dx < 0 && canNext) goNext();
+                          else if (dx > 0 && canPrev) goPrev();
+                        }
+                      }
+                    }
+                    setPreviewDragOffsetY(0);
+                    previewTouchRef.current = { mode: null, moved: false };
+                  }}
+                  className={`w-full h-full overflow-auto p-4 sm:p-8 flex items-start justify-center ${
+                    previewZoom > 1.02
+                      ? previewIsPanning
+                        ? 'cursor-grabbing'
+                        : 'cursor-grab'
+                      : 'cursor-pointer'
+                  }`}
                 >
-                  <div className="relative my-auto flex flex-col items-center">
+                  <div
+                    className="relative my-auto flex flex-col items-center pointer-events-none"
+                    style={{
+                      transform: previewDragOffsetY ? `translateY(${previewDragOffsetY}px)` : undefined,
+                      opacity: previewDragOffsetY ? Math.max(0.35, 1 - previewDragOffsetY / 260) : 1,
+                      transition: previewDragOffsetY ? 'none' : 'transform 0.2s ease, opacity 0.2s ease',
+                    }}
+                  >
                     {previewLoadingImg && (
-                      <div className="mb-2 inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-indigo-600/90 text-white text-[11px] font-bold shadow">
+                      <div className="mb-2 inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-indigo-600/90 text-white text-[11px] font-bold shadow pointer-events-auto">
                         <Loader2 className="w-3.5 h-3.5 animate-spin" /> Đang tải ảnh độ nét cao...
                       </div>
                     )}
@@ -2032,20 +2243,35 @@ export default function ImportModal({
                       <img
                         src={imgSrc}
                         alt={`Xem trước ${currentPos}`}
-                        onClick={() => setPreviewZoom((z) => (z === 1 ? 1.8 : 1))}
+                        draggable={false}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (previewPanRef.current.moved) {
+                            previewPanRef.current.moved = false;
+                            return;
+                          }
+                          setPreviewZoom((z) => (z === 1 ? 1.85 : 1));
+                        }}
                         style={{
                           width: previewZoom === 1 ? 'auto' : `${Math.round(previewZoom * 100)}%`,
                           maxWidth: previewZoom === 1 ? '100%' : 'none',
-                          maxHeight: previewZoom === 1 ? '76vh' : 'none',
+                          maxHeight: previewZoom === 1 ? '75vh' : 'none',
                           transform: previewRotate ? `rotate(${previewRotate}deg)` : undefined,
                         }}
-                        className={`rounded-xl bg-white shadow-2xl transition-all select-none ${
-                          previewZoom === 1 ? 'cursor-zoom-in object-contain' : 'cursor-zoom-out'
+                        className={`pointer-events-auto rounded-xl bg-white shadow-2xl transition-[max-height] duration-150 select-none ${
+                          previewZoom > 1.02
+                            ? previewIsPanning
+                              ? 'cursor-grabbing'
+                              : 'cursor-grab'
+                            : 'cursor-zoom-in object-contain'
                         }`}
                       />
                     ) : (
-                      <p className="text-xs text-slate-400">Không có ảnh xem trước.</p>
+                      <p className="text-xs text-slate-400 pointer-events-auto">Không có ảnh xem trước.</p>
                     )}
+                    <span className="mt-2.5 text-[10px] font-semibold text-slate-400/90 hidden sm:inline">
+                      Nhấn khoảng trống tối để đóng · Chụm 2 ngón phóng to · Vuốt 2 ngón lật trang
+                    </span>
                   </div>
                 </div>
               )}
