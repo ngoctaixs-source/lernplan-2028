@@ -50,6 +50,8 @@ import {
   Bot,
   MessageCircle,
   CornerDownRight,
+  FileText,
+  Tag,
 } from 'lucide-react';
 import { supabase, isSupabaseConfigured, ADMIN_EMAIL } from './lib/supabase';
 import { callGeminiApi } from './lib/api';
@@ -149,11 +151,11 @@ function parseSubjectTitle(titleDe = '') {
   return { code: '', name: raw };
 }
 
-// Hỗ trợ lưu & đọc NHIỀU ảnh bảng / nhiều trang PDF gốc trong cùng cột source_image_url (không cần sửa bảng Supabase)
-function parseSourceImages(raw) {
-  if (!raw) return [];
-  if (Array.isArray(raw)) {
-    return raw
+// Hỗ trợ lưu & đọc NHIỀU ảnh bản gốc + TÊN FILE GỐC OneNote/PDF trong cùng cột source_image_url (không cần sửa bảng Supabase)
+function normalizePhotoList(input) {
+  if (!input) return [];
+  if (Array.isArray(input)) {
+    return input
       .map((item, idx) => {
         if (typeof item === 'string' && item.trim()) return { url: item.trim(), label: `Trang ${idx + 1}` };
         if (item && typeof item === 'object' && item.url) return { url: item.url, label: item.label || `Trang ${idx + 1}` };
@@ -161,28 +163,77 @@ function parseSourceImages(raw) {
       })
       .filter(Boolean);
   }
-  const str = String(raw).trim();
+  const str = String(input).trim();
   if (!str) return [];
-  if (str.startsWith('[')) {
+  return [{ url: str, label: 'Trang 1' }];
+}
+
+function normalizeSourceFilesList(list) {
+  const seen = new Set();
+  const out = [];
+  (Array.isArray(list) ? list : []).forEach((item) => {
+    const clean = String(item || '').trim();
+    if (!clean) return;
+    const key = clean.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(clean);
+    }
+  });
+  return out;
+}
+
+function parseLessonSourceMeta(raw) {
+  if (!raw) return { photos: [], sourceFiles: [] };
+  if (Array.isArray(raw)) {
+    return { photos: normalizePhotoList(raw), sourceFiles: [] };
+  }
+  if (typeof raw === 'object') {
+    return {
+      photos: normalizePhotoList(raw.photos),
+      sourceFiles: normalizeSourceFilesList(raw.sourceFiles || (raw.sourceFile ? [raw.sourceFile] : [])),
+    };
+  }
+  const str = String(raw).trim();
+  if (!str) return { photos: [], sourceFiles: [] };
+  if (str.startsWith('{') || str.startsWith('[')) {
     try {
       const parsed = JSON.parse(str);
       if (Array.isArray(parsed)) {
-        return parseSourceImages(parsed);
+        return { photos: normalizePhotoList(parsed), sourceFiles: [] };
+      }
+      if (parsed && typeof parsed === 'object') {
+        return {
+          photos: normalizePhotoList(parsed.photos),
+          sourceFiles: normalizeSourceFilesList(parsed.sourceFiles || (parsed.sourceFile ? [parsed.sourceFile] : [])),
+        };
       }
     } catch {
       // fallback single image string
     }
   }
-  return [{ url: str, label: 'Trang 1' }];
+  return { photos: [{ url: str, label: 'Trang 1' }], sourceFiles: [] };
 }
 
-function serializeSourceImages(input) {
-  const list = parseSourceImages(input);
-  if (list.length === 0) return '';
-  if (list.length === 1 && list[0].label === 'Trang 1') {
-    return list[0].url;
+function serializeLessonSourceMeta({ photos = [], sourceFiles = [] } = {}) {
+  const cleanPhotos = normalizePhotoList(photos);
+  const cleanFiles = normalizeSourceFilesList(sourceFiles);
+  if (cleanFiles.length === 0) {
+    if (cleanPhotos.length === 0) return '';
+    if (cleanPhotos.length === 1 && cleanPhotos[0].label === 'Trang 1') {
+      return cleanPhotos[0].url;
+    }
+    return JSON.stringify(cleanPhotos);
   }
-  return JSON.stringify(list);
+  return JSON.stringify({
+    v: 2,
+    sourceFiles: cleanFiles,
+    photos: cleanPhotos,
+  });
+}
+
+function parseSourceImages(raw) {
+  return parseLessonSourceMeta(raw).photos;
 }
 
 export default function App() {
@@ -295,6 +346,8 @@ export default function App() {
   const [videoInputSectionId, setVideoInputSectionId] = useState(null);
   const [videoDraft, setVideoDraft] = useState({ title: '', url: '' });
   const [movingLessonId, setMovingLessonId] = useState(null);
+  const [editingSourceTagLessonId, setEditingSourceTagLessonId] = useState(null);
+  const [editSourceTagDraft, setEditSourceTagDraft] = useState('');
 
   // Subject Organization & Management State
   const [importDefaultSubjectId, setImportDefaultSubjectId] = useState('');
@@ -608,9 +661,31 @@ export default function App() {
     () => subjects.find((s) => s.id === activeLesson?.subject_id) || null,
     [subjects, activeLesson]
   );
-  const activeSourceImages = useMemo(
-    () => parseSourceImages(activeLesson?.source_image_url),
+  const activeSourceMeta = useMemo(
+    () => parseLessonSourceMeta(activeLesson?.source_image_url),
     [activeLesson]
+  );
+  const activeSourceImages = activeSourceMeta.photos;
+  const activeSourceFiles = activeSourceMeta.sourceFiles;
+
+  // Map nhanh lessonId -> danh sách tên file gốc (để hiện badge, tìm kiếm và cảnh báo nạp trùng)
+  const lessonSourceFilesMap = useMemo(() => {
+    const m = {};
+    lessons.forEach((l) => {
+      m[l.id] = parseLessonSourceMeta(l.source_image_url).sourceFiles;
+    });
+    return m;
+  }, [lessons]);
+
+  const existingLessonsForImport = useMemo(
+    () =>
+      lessons.map((l) => ({
+        id: l.id,
+        subject_id: l.subject_id,
+        title_de: l.title_de,
+        sourceFiles: lessonSourceFilesMap[l.id] || [],
+      })),
+    [lessons, lessonSourceFilesMap]
   );
 
   // Phím tắt Esc / Mũi tên / +/- cho Lightbox xem ảnh bảng gốc toàn màn hình
@@ -1011,7 +1086,10 @@ ${cleanReply}`;
 
   // ==================== ADMIN: IMPORT ONENOTE / PDF / HANDWRITING ====================
   const handleSaveImportedData = async (aiResult, boardPhotosInput = '', options = {}) => {
-    const serializedSourceImages = serializeSourceImages(boardPhotosInput);
+    const serializedSourceImages = serializeLessonSourceMeta({
+      photos: boardPhotosInput,
+      sourceFiles: options.sourceFiles || [],
+    });
     if (!supabase || !isAdmin) throw new Error('Chỉ Admin mới có quyền thêm bài.');
     if (!Array.isArray(aiResult?.lessons) || aiResult.lessons.length === 0) {
       throw new Error('AI không trả về bài học nào hợp lệ.');
@@ -1180,6 +1258,7 @@ ${cleanReply}`;
     upgradedLesson,
     studyPack = null,
     newlyArchivedPhotos = [],
+    addedSourceFiles = [],
   }) => {
     if (!supabase || !isAdmin) throw new Error('Chỉ Admin mới có quyền cập nhật bài học.');
     const targetLesson = lessons.find((l) => l.id === lessonId);
@@ -1189,10 +1268,14 @@ ${cleanReply}`;
       .filter((s) => s.lesson_id === lessonId)
       .sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
 
-    // 1. Gộp ảnh bản gốc cũ + ảnh mới tải lên (tối đa 10 trang)
-    const oldPhotos = parseSourceImages(targetLesson.source_image_url);
-    const mergedPhotos = [...oldPhotos, ...parseSourceImages(newlyArchivedPhotos)].slice(0, 10);
-    const serializedPhotos = serializeSourceImages(mergedPhotos);
+    // 1. Gộp ảnh bản gốc cũ + ảnh mới tải lên (tối đa 10 trang) VÀ giữ nguyên + nối thêm tên file gốc
+    const oldMeta = parseLessonSourceMeta(targetLesson.source_image_url);
+    const mergedPhotos = [...oldMeta.photos, ...normalizePhotoList(newlyArchivedPhotos)].slice(0, 10);
+    const mergedSourceFiles = normalizeSourceFilesList([...oldMeta.sourceFiles, ...(addedSourceFiles || [])]);
+    const serializedPhotos = serializeLessonSourceMeta({
+      photos: mergedPhotos,
+      sourceFiles: mergedSourceFiles,
+    });
 
     // 2. Cập nhật metadata của chính bài học đang có (giữ nguyên ID, môn học, sort_order)
     const lessonUpdatePayload = {
@@ -1687,6 +1770,35 @@ ${item.text}`
     setMovingLessonId(null);
     await loadCurriculum();
     showToast('Đã chuyển bài học sang môn mới!');
+  };
+
+  const handleSaveLessonSourceFiles = async (lessonId, rawInput) => {
+    if (!isAdmin || !supabase) return;
+    const target = lessons.find((l) => l.id === lessonId);
+    if (!target) return;
+    const oldMeta = parseLessonSourceMeta(target.source_image_url);
+    const parsedFiles = String(rawInput || '')
+      .split(/[\n,;]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const serialized = serializeLessonSourceMeta({
+      photos: oldMeta.photos,
+      sourceFiles: parsedFiles,
+    });
+    const { error } = await supabase
+      .from('lessons')
+      .update({ source_image_url: serialized })
+      .eq('id', lessonId);
+    if (error) {
+      showToast(error.message || 'Không lưu được nhãn file gốc.', 'error');
+      return;
+    }
+    setLessons((prev) =>
+      prev.map((l) => (l.id === lessonId ? { ...l, source_image_url: serialized } : l))
+    );
+    setEditingSourceTagLessonId(null);
+    setEditSourceTagDraft('');
+    showToast(parsedFiles.length > 0 ? `Đã gắn nhãn file "${parsedFiles[0]}"!` : 'Đã xóa nhãn file gốc.');
   };
 
   const handleDeleteLesson = async (lessonId, title) => {
@@ -2630,7 +2742,7 @@ ${item.text}`
                       <input
                         value={subjectLessonSearch}
                         onChange={(e) => setSubjectLessonSearch(e.target.value)}
-                        placeholder="Lọc nhanh bài học theo tên (VD: GuV, Privatrecht, Strukturprinzipien, OHG...)"
+                        placeholder="Lọc nhanh bài học theo tên bài hoặc tên file OneNote (VD: 2.4, Bemessung, GuV, OHG...)"
                         className="w-full pl-9 pr-8 py-2 text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500"
                       />
                       {subjectLessonSearch && (
@@ -2688,7 +2800,8 @@ ${item.text}`
                             (l) =>
                               (l.title_de || '').toLowerCase().includes(query) ||
                               (l.title_vn || '').toLowerCase().includes(query) ||
-                              (sub.title_de || '').toLowerCase().includes(query)
+                              (sub.title_de || '').toLowerCase().includes(query) ||
+                              (lessonSourceFilesMap[l.id] || []).some((f) => f.toLowerCase().includes(query))
                           )
                         : allSubLessons;
 
@@ -2919,6 +3032,7 @@ ${item.text}`
                                   const lesCardCount = flashcards.filter((c) => c.lesson_id === les.id).length;
                                   const lesQuizCount = quizQuestions.filter((q) => q.lesson_id === les.id).length;
                                   const latestAttempt = quizAttempts.find((a) => a.lesson_id === les.id);
+                                  const lesSourceFiles = lessonSourceFilesMap[les.id] || [];
 
                                   return (
                                     <div
@@ -2949,6 +3063,43 @@ ${item.text}`
                                           </h3>
                                           {showVn && les.title_vn && (
                                             <p className="text-xs text-slate-500 dark:text-slate-400">{les.title_vn}</p>
+                                          )}
+                                          {/* Nhãn file gốc OneNote / PDF giúp đối chiếu ngay file nào đã nạp */}
+                                          {(lesSourceFiles.length > 0 || isAdmin) && (
+                                            <div className="flex items-center gap-1.5 flex-wrap pt-0.5" onClick={(e) => e.stopPropagation()}>
+                                              {lesSourceFiles.map((fname, fIdx) => (
+                                                <span
+                                                  key={fIdx}
+                                                  title={`File gốc đã nạp: ${fname}`}
+                                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-sky-50 dark:bg-sky-950/60 text-sky-700 dark:text-sky-300 border border-sky-200/80 dark:border-sky-800/70 max-w-[260px] sm:max-w-sm truncate"
+                                                >
+                                                  <FileText className="w-3 h-3 shrink-0 opacity-80" />
+                                                  <span className="truncate">{fname}</span>
+                                                </span>
+                                              ))}
+                                              {isAdmin && (
+                                                <button
+                                                  type="button"
+                                                  onClick={() => {
+                                                    if (editingSourceTagLessonId === les.id) {
+                                                      setEditingSourceTagLessonId(null);
+                                                    } else {
+                                                      setEditingSourceTagLessonId(les.id);
+                                                      setEditSourceTagDraft(lesSourceFiles.join(', '));
+                                                    }
+                                                  }}
+                                                  title={
+                                                    lesSourceFiles.length > 0
+                                                      ? 'Sửa nhãn tên file gốc OneNote'
+                                                      : 'Gắn nhanh mã / tên file gốc OneNote (VD: 2.1 S_Künstlersozial...)'
+                                                  }
+                                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold text-slate-500 dark:text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-300 hover:bg-slate-100 dark:hover:bg-slate-800 border border-dashed border-slate-300 dark:border-slate-700 transition"
+                                                >
+                                                  <Tag className="w-2.5 h-2.5" />
+                                                  {lesSourceFiles.length > 0 ? 'Sửa nhãn' : '+ Gắn tên file'}
+                                                </button>
+                                              )}
+                                            </div>
                                           )}
                                         </div>
                                       </div>
@@ -3020,6 +3171,47 @@ ${item.text}`
                               <button onClick={() => setMovingLessonId(null)} className="text-slate-500 ml-auto">
                                 Hủy
                               </button>
+                            </div>
+                          )}
+
+                          {/* Inline Source File Tag Editor (gắn nhanh mã / tên file OneNote cho bài cũ chỉ trong 2 giây) */}
+                          {isAdmin && editingSourceTagLessonId && allSubLessons.some((l) => l.id === editingSourceTagLessonId) && (
+                            <div className="p-4 bg-sky-50 dark:bg-sky-950/40 border-t border-sky-200 dark:border-sky-800 flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5 text-xs">
+                              <div className="flex items-center gap-1.5 font-extrabold text-sky-900 dark:text-sky-200 shrink-0">
+                                <Tag className="w-3.5 h-3.5 text-sky-600 dark:text-sky-400" />
+                                <span>Nhãn file gốc:</span>
+                              </div>
+                              <input
+                                value={editSourceTagDraft}
+                                autoFocus
+                                onChange={(e) => setEditSourceTagDraft(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') {
+                                    e.preventDefault();
+                                    handleSaveLessonSourceFiles(editingSourceTagLessonId, editSourceTagDraft);
+                                  } else if (e.key === 'Escape') {
+                                    setEditingSourceTagLessonId(null);
+                                  }
+                                }}
+                                placeholder="Gõ mã / tên file OneNote (VD: 2.1 S_Künstlersozialversicherung — nhiều file ngăn bằng dấu phẩy)"
+                                className="flex-1 px-3 py-1.5 bg-white dark:bg-slate-900 border border-sky-300 dark:border-sky-700 rounded-lg text-xs text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-sky-500"
+                              />
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => handleSaveLessonSourceFiles(editingSourceTagLessonId, editSourceTagDraft)}
+                                  className="px-3.5 py-1.5 bg-sky-600 hover:bg-sky-700 text-white font-bold rounded-lg inline-flex items-center gap-1"
+                                >
+                                  <Save className="w-3.5 h-3.5" /> Lưu
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingSourceTagLessonId(null)}
+                                  className="px-2.5 py-1.5 text-slate-500 hover:text-slate-700 dark:hover:text-slate-200 font-semibold"
+                                >
+                                  Hủy
+                                </button>
+                              </div>
                             </div>
                           )}
                         </section>
@@ -3178,6 +3370,76 @@ ${item.text}`
                   </h1>
                   {showVn && activeLesson.title_vn && (
                     <p className="text-base font-semibold text-indigo-600 dark:text-indigo-400">{activeLesson.title_vn}</p>
+                  )}
+
+                  {/* Nhãn file gốc OneNote / PDF ngay đầu bài học */}
+                  {(activeSourceFiles.length > 0 || isAdmin) && (
+                    <div className="pt-1 space-y-2">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {activeSourceFiles.map((fname, idx) => (
+                          <span
+                            key={idx}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-xs font-bold bg-sky-50 dark:bg-sky-950/60 text-sky-700 dark:text-sky-300 border border-sky-200 dark:border-sky-800/80"
+                          >
+                            <FileText className="w-3.5 h-3.5 shrink-0" />
+                            <span>File gốc: {fname}</span>
+                          </span>
+                        ))}
+                        {isAdmin && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (editingSourceTagLessonId === activeLesson.id) {
+                                setEditingSourceTagLessonId(null);
+                              } else {
+                                setEditingSourceTagLessonId(activeLesson.id);
+                                setEditSourceTagDraft(activeSourceFiles.join(', '));
+                              }
+                            }}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-xl text-xs font-bold text-slate-500 dark:text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-300 bg-slate-100/80 dark:bg-slate-800/80 border border-dashed border-slate-300 dark:border-slate-700 transition"
+                          >
+                            <Tag className="w-3 h-3" />
+                            {activeSourceFiles.length > 0 ? 'Sửa nhãn file' : '+ Gắn nhãn file OneNote'}
+                          </button>
+                        )}
+                      </div>
+
+                      {isAdmin && editingSourceTagLessonId === activeLesson.id && (
+                        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 p-2.5 rounded-xl bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800">
+                          <input
+                            value={editSourceTagDraft}
+                            autoFocus
+                            onChange={(e) => setEditSourceTagDraft(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault();
+                                handleSaveLessonSourceFiles(activeLesson.id, editSourceTagDraft);
+                              } else if (e.key === 'Escape') {
+                                setEditingSourceTagLessonId(null);
+                              }
+                            }}
+                            placeholder="VD: 2.4 S_Bemessungsgrundlage_Zuständigkeiten_und_Meldung.pdf"
+                            className="flex-1 px-3 py-1.5 text-xs bg-white dark:bg-slate-900 border border-sky-300 dark:border-sky-700 rounded-lg text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-sky-500"
+                          />
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => handleSaveLessonSourceFiles(activeLesson.id, editSourceTagDraft)}
+                              className="px-3 py-1.5 bg-sky-600 hover:bg-sky-700 text-white text-xs font-bold rounded-lg inline-flex items-center gap-1"
+                            >
+                              <Save className="w-3.5 h-3.5" /> Lưu nhãn
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setEditingSourceTagLessonId(null)}
+                              className="px-2.5 py-1.5 text-xs text-slate-500 font-semibold"
+                            >
+                              Hủy
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   )}
                 </div>
 
@@ -4057,8 +4319,10 @@ ${item.text}`
       {showImportModal && (
         <ImportModal
           subjects={subjects}
+          existingLessons={existingLessonsForImport}
           defaultSubjectId={importDefaultSubjectId}
           onCreateSubject={handleCreateSubject}
+          onOpenExistingLesson={(lessonId) => openLesson(lessonId)}
           onClose={() => {
             setShowImportModal(false);
             setImportDefaultSubjectId('');
