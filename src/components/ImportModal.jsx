@@ -437,7 +437,7 @@ export default function ImportModal({
         await Promise.all(
           chunk.map(async (pg) => {
             try {
-              const rendered = await renderPdfPageToJpeg(pdfDoc, pg.pageNum, 1400, 0.8);
+              const rendered = await renderPdfPageToJpeg(pdfDoc, pg.pageNum, 1550, 0.82);
               const ocrRes = await callGeminiApi('ocr_pdf_page', {
                 pageNum: pg.pageNum,
                 image: { base64: rendered.base64, mimeType: rendered.mimeType },
@@ -448,11 +448,14 @@ export default function ImportModal({
                 pg.isBlank = true;
                 pg.text = '';
                 pg.charCount = 0;
-              } else if (ocrText.length > pg.text.length * 0.7) {
+              } else if (ocrText && pg.text.length < 80) {
+                pg.text = ocrText;
+                pg.charCount = ocrText.length;
+              } else if (ocrText.length >= pg.text.length * 0.9) {
                 pg.text = ocrText;
                 pg.charCount = ocrText.length;
               } else if (ocrText) {
-                pg.text = `${pg.text}\n\n[Nội dung trong ảnh/sơ đồ]:\n${ocrText}`;
+                pg.text = `${pg.text}\n\n[Nội dung đọc thêm từ hình ảnh / sơ đồ / chữ viết tay]:\n${ocrText}`;
                 pg.charCount = pg.text.length;
               }
               pg.ocrDone = true;
@@ -477,7 +480,7 @@ export default function ImportModal({
           pageNum: p.pageNum,
           charCount: p.charCount,
           isBlank: p.isBlank,
-          textPreview: p.text.slice(0, 1150),
+          textPreview: p.text.slice(0, 1500),
         })),
         existingSubjects: subjects,
       });
@@ -613,7 +616,54 @@ export default function ImportModal({
     setStatusMsg('');
   };
 
-  // ==================== HANDLER 2: NẠP HÀNG LOẠT BẰNG MODEL 70B TỪ VĂN BẢN ĐÃ OCR ĐẦY ĐỦ ====================
+  // ==================== PHASE 2 HELPER: TẠO ĐẦY ĐỦ TỪ VỰNG (8-12), FLASHCARDS (6-8) & BÀI TEST (6-8) ====================
+  const enrichLessonsWithStudyPack = async (aiResult, onStepLabel) => {
+    if (!aiResult || !Array.isArray(aiResult.lessons)) return aiResult;
+    for (let idx = 0; idx < aiResult.lessons.length; idx++) {
+      const les = aiResult.lessons[idx];
+      const needPack =
+        !Array.isArray(les.vocabularies) ||
+        les.vocabularies.length < 4 ||
+        !Array.isArray(les.flashcards) ||
+        les.flashcards.length < 4 ||
+        !Array.isArray(les.quiz_questions) ||
+        les.quiz_questions.length < 4;
+
+      if (!needPack) continue;
+
+      const sectionsText = (Array.isArray(les.sections) ? les.sections : [])
+        .map((s) => `## ${s.heading_de || ''}\n${s.content_de || ''}\n${s.content_vn || ''}`)
+        .join('\n\n')
+        .trim();
+
+      if (!sectionsText) continue;
+
+      if (onStepLabel) {
+        onStepLabel(`Bước 2/2: Đang tạo trọn bộ 8–12 Từ vựng, Flashcards & Bài Test cho "${les.title_de || 'bài học'}"...`);
+      }
+
+      try {
+        const pack = await callGeminiApi('generate_study_pack', {
+          lessonTitle: les.title_de || '',
+          sectionsText,
+        });
+        if (Array.isArray(pack?.vocabularies) && pack.vocabularies.length > 0) {
+          les.vocabularies = pack.vocabularies;
+        }
+        if (Array.isArray(pack?.flashcards) && pack.flashcards.length > 0) {
+          les.flashcards = pack.flashcards;
+        }
+        if (Array.isArray(pack?.quiz_questions) && pack.quiz_questions.length > 0) {
+          les.quiz_questions = pack.quiz_questions;
+        }
+      } catch {
+        // Nếu Phase 2 lỗi mạng tạm thời, vẫn lưu trọn vẹn nội dung bài giảng Phase 1 để người dùng không mất bài
+      }
+    }
+    return aiResult;
+  };
+
+  // ==================== HANDLER 2: NẠP HÀNG LOẠT 2 GIAI ĐOẠN (GIẢNG BÀI SÂU -> TẠO BỘ LUYỆN TẬP) ====================
   const handleRunPdfBatchImport = async () => {
     const chosen = pdfGroups.filter((g) => g.selected && g.pageNums.length > 0);
     if (chosen.length === 0) {
@@ -683,7 +733,7 @@ export default function ImportModal({
         const combinedText = [
           `THEMA: ${group.title_de}${group.subject_hint ? ` | FACH: ${group.subject_hint}` : ''}`,
           `ANZAHL SEITEN IN DIESEM PAKET: ${groupPages.length} (Seiten: ${group.pageNums.join(', ')})`,
-          'WICHTIG: Verarbeite ALLE folgenden Seiten vollständig und löse JEDE Situation / jeden Fall / jede Aufgabe konkret!',
+          'LEHRER-AUFTRAG: Der Schüler hat die PDF-Seiten NICHT selbst gelesen! Präsentiere ZUERST alle Theorie-Inhalte und den VOLLSTÄNDIGEN Originaltext jeder Situation/Aufgabe zweisprachig (DE + VN) mit Aufgabenanalyse, und löse ERST DANACH jede einzelne Aufgabe Schritt für Schritt inkl. Casio fx-580VN X!',
           ...groupPages.map(
             (p) =>
               `=== Seite ${p.pageNum} ===\n${
@@ -692,18 +742,30 @@ export default function ImportModal({
           ),
         ].join('\n\n');
 
-        // Gửi văn bản đầy đủ (images rỗng trừ khi có trang lỗi OCR) -> chạy trên model 70B cực thông minh & không sót trang!
+        // GIAI ĐOẠN 1: Dồn 100% sức mạnh AI 70B để đọc, dịch, phân tích đề & giảng bài chi tiết như giáo viên
         const aiResult = await callGeminiApi('import_onenote', {
           rawText: combinedText,
           images: fallbackImages,
           existingSubjects: workingSubjects,
           targetSubjectId: selectedSubjectId || null,
           targetSubjectName: selectedSubjectObj?.title_de || '',
+          teachingOnly: true,
         });
 
         if (selectedSubjectId && aiResult) {
           aiResult.existing_subject_id = selectedSubjectId;
         }
+
+        // GIAI ĐOẠN 2: Tự động tạo đầy đủ 8-12 Từ vựng, 6-8 Flashcards & 6-8 câu Bài Test từ bài vừa giảng
+        await enrichLessonsWithStudyPack(aiResult, (stepLabel) => {
+          setBatchProgress({
+            current: i + 1,
+            total: chosen.length,
+            label: stepLabel,
+            doneCount: totalLessonsCreated,
+            failList: [...failList],
+          });
+        });
 
         const saved = await onSaveImportedData(aiResult, groupSourcePhotos, {
           silent: true,
@@ -786,18 +848,23 @@ export default function ImportModal({
         }
       }
 
-      setStatusMsg('AI 70B đang soạn bài chuẩn IHK, giải đáp các tình huống thực tế, trích Từ vựng, Flashcards & Test...');
+      setStatusMsg('Bước 1/2: Giáo viên AI đang trích đầy đủ kiến thức & đề bài gốc, dịch tiếng Việt, phân tích đề và giảng chi tiết từng bước...');
       const aiResult = await callGeminiApi('import_onenote', {
         rawText: finalRawText,
         images: payloadImages,
         existingSubjects: subjects,
         targetSubjectId: selectedSubjectId || null,
         targetSubjectName: selectedSubjectObj?.title_de || '',
+        teachingOnly: true,
       });
 
       if (selectedSubjectId && aiResult) {
         aiResult.existing_subject_id = selectedSubjectId;
       }
+
+      await enrichLessonsWithStudyPack(aiResult, (stepLabel) => {
+        setStatusMsg(stepLabel);
+      });
 
       const allUploadedPhotos =
         mode === 'images' && images.length > 0
@@ -1262,7 +1329,7 @@ export default function ImportModal({
                     </p>
                     <p className="text-xs font-semibold text-indigo-600 dark:text-indigo-400">{batchProgress.label}</p>
                     <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                      Đang tổng hợp trọn vẹn mọi trang, giải đáp từng tình huống thực tế, tạo Từ vựng, Flashcards & Test...
+                      Chế độ Giáo viên: Đang trích đầy đủ lý thuyết & đề gốc → Dịch & phân tích đề → Giải từng bước + Casio → Tạo trọn bộ Từ vựng, Flashcards & Test...
                     </p>
                   </div>
                   <div className="max-w-sm mx-auto h-2.5 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden">
