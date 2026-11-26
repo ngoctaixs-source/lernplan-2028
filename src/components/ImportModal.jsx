@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   X,
   Sparkles,
@@ -17,6 +17,13 @@ import {
   Folder,
   Plus,
   Lock,
+  Eye,
+  ZoomIn,
+  ZoomOut,
+  ChevronLeft,
+  ChevronRight,
+  Maximize2,
+  RotateCw,
 } from 'lucide-react';
 import { callGeminiApi } from '../lib/api';
 
@@ -242,6 +249,110 @@ export default function ImportModal({
   const pdfDocRef = useRef(null);
   const pdfInputRef = useRef(null);
   const imgInputRef = useRef(null);
+  const highResPdfCacheRef = useRef({});
+
+  // Fullscreen Preview & Zoom State (dùng chung cho cả xem trước PDF từng trang lẫn ảnh tải lên)
+  // previewModal: null | { kind: 'pdf', pageNum: number, tab: 'image' | 'text' } | { kind: 'image', index: number }
+  const [previewModal, setPreviewModal] = useState(null);
+  const [previewZoom, setPreviewZoom] = useState(1); // 1 = vừa khung (fit), >1 = phóng to (1.5, 2, 2.5, 3)
+  const [previewRotate, setPreviewRotate] = useState(0);
+  const [previewHighResUrl, setPreviewHighResUrl] = useState('');
+  const [previewLoadingImg, setPreviewLoadingImg] = useState(false);
+
+  // Tự động render trang PDF độ nét cao khi mở preview trang PDF
+  useEffect(() => {
+    let cancelled = false;
+    if (!previewModal || previewModal.kind !== 'pdf') {
+      setPreviewHighResUrl('');
+      setPreviewLoadingImg(false);
+      return undefined;
+    }
+
+    const pageNum = previewModal.pageNum;
+    const cached = highResPdfCacheRef.current[pageNum];
+    if (cached) {
+      setPreviewHighResUrl(cached);
+      setPreviewLoadingImg(false);
+      return undefined;
+    }
+
+    const fallbackThumb = pdfPages.find((p) => p.pageNum === pageNum)?.thumbUrl || '';
+    setPreviewHighResUrl(fallbackThumb);
+
+    if (!pdfDocRef.current) {
+      setPreviewLoadingImg(false);
+      return undefined;
+    }
+
+    setPreviewLoadingImg(true);
+    renderPdfPageToJpeg(pdfDocRef.current, pageNum, 1600, 0.85)
+      .then((rendered) => {
+        if (cancelled) return;
+        highResPdfCacheRef.current[pageNum] = rendered.dataUrl;
+        setPreviewHighResUrl(rendered.dataUrl);
+      })
+      .catch(() => {
+        // giữ ảnh thumbnail dự phòng
+      })
+      .finally(() => {
+        if (!cancelled) setPreviewLoadingImg(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [previewModal, pdfPages]);
+
+  // Phím tắt Esc / Mũi tên trái phải / +/- khi đang mở cửa sổ xem trước
+  useEffect(() => {
+    if (!previewModal) return undefined;
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setPreviewModal(null);
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        if (previewModal.kind === 'pdf' && previewModal.pageNum > 1) {
+          setPreviewZoom(1);
+          setPreviewRotate(0);
+          setPreviewModal((prev) => (prev ? { ...prev, pageNum: prev.pageNum - 1 } : null));
+        } else if (previewModal.kind === 'image' && previewModal.index > 0) {
+          setPreviewZoom(1);
+          setPreviewRotate(0);
+          setPreviewModal((prev) => (prev ? { ...prev, index: prev.index - 1 } : null));
+        }
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        if (previewModal.kind === 'pdf' && previewModal.pageNum < pdfPages.length) {
+          setPreviewZoom(1);
+          setPreviewRotate(0);
+          setPreviewModal((prev) => (prev ? { ...prev, pageNum: prev.pageNum + 1 } : null));
+        } else if (previewModal.kind === 'image' && previewModal.index < images.length - 1) {
+          setPreviewZoom(1);
+          setPreviewRotate(0);
+          setPreviewModal((prev) => (prev ? { ...prev, index: prev.index + 1 } : null));
+        }
+      } else if (e.key === '+' || e.key === '=') {
+        setPreviewZoom((z) => Math.min(3, Number((z + 0.4).toFixed(2))));
+      } else if (e.key === '-') {
+        setPreviewZoom((z) => Math.max(1, Number((z - 0.4).toFixed(2))));
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [previewModal, pdfPages.length, images.length]);
+
+  const openPdfPagePreview = (pageNum, tab = 'image') => {
+    setPreviewZoom(1);
+    setPreviewRotate(0);
+    setPreviewModal({ kind: 'pdf', pageNum, tab });
+  };
+
+  const openUploadedImagePreview = (index) => {
+    setPreviewZoom(1);
+    setPreviewRotate(0);
+    setPreviewModal({ kind: 'image', index });
+  };
 
   const selectedSubjectObj = subjects.find((s) => s.id === selectedSubjectId) || null;
 
@@ -284,6 +395,8 @@ export default function ImportModal({
     }
 
     setError('');
+    highResPdfCacheRef.current = {};
+    setPreviewModal(null);
     setPdfFileName(file.name);
     setPdfStage('scanning');
     setScanProgress({ done: 0, total: 0 });
@@ -488,6 +601,8 @@ export default function ImportModal({
 
   const resetPdf = () => {
     pdfDocRef.current = null;
+    highResPdfCacheRef.current = {};
+    setPreviewModal(null);
     setPdfFileName('');
     setPdfPages([]);
     setPdfSummary('');
@@ -528,16 +643,24 @@ export default function ImportModal({
           .map((num) => pdfPages.find((p) => p.pageNum === num))
           .filter(Boolean);
 
-        // Chụp 1 ảnh nhẹ của trang đầu làm ảnh đối chiếu (nếu cần), và CHỈ đính ảnh vào AI cho trang nào OCR bị lỗi
-        let firstPhotoDataUrl = groupPages[0]?.thumbUrl || '';
+        // Lưu ĐẦY ĐỦ ảnh sắc nét của TẤT CẢ các trang trong nhóm để sau này xem đối chiếu & phóng to từng trang
+        const groupSourcePhotos = [];
         const fallbackImages = [];
         if (pdfDocRef.current) {
-          if (groupPages[0]) {
+          const pagesToArchive = groupPages.slice(0, 10);
+          const archiveWidth = pagesToArchive.length > 5 ? 1050 : 1220;
+          const archiveQuality = pagesToArchive.length > 5 ? 0.68 : 0.74;
+          for (const pg of pagesToArchive) {
             try {
-              const refImg = await renderPdfPageToJpeg(pdfDocRef.current, groupPages[0].pageNum, 1000, 0.72);
-              firstPhotoDataUrl = refImg.dataUrl;
+              const refImg = await renderPdfPageToJpeg(pdfDocRef.current, pg.pageNum, archiveWidth, archiveQuality);
+              groupSourcePhotos.push({
+                url: refImg.dataUrl,
+                label: `Trang ${pg.pageNum}`,
+              });
             } catch {
-              // keep thumbUrl
+              if (pg.thumbUrl) {
+                groupSourcePhotos.push({ url: pg.thumbUrl, label: `Trang ${pg.pageNum}` });
+              }
             }
           }
           const failedOcrPages = groupPages.filter((p) => p.ocrFailed || p.charCount < 20).slice(0, 2);
@@ -549,6 +672,12 @@ export default function ImportModal({
               // ignore
             }
           }
+        } else {
+          groupPages.slice(0, 10).forEach((pg) => {
+            if (pg.thumbUrl) {
+              groupSourcePhotos.push({ url: pg.thumbUrl, label: `Trang ${pg.pageNum}` });
+            }
+          });
         }
 
         const combinedText = [
@@ -576,7 +705,7 @@ export default function ImportModal({
           aiResult.existing_subject_id = selectedSubjectId;
         }
 
-        const saved = await onSaveImportedData(aiResult, firstPhotoDataUrl, {
+        const saved = await onSaveImportedData(aiResult, groupSourcePhotos, {
           silent: true,
           forcedSubjectId: selectedSubjectId || null,
         });
@@ -670,8 +799,14 @@ export default function ImportModal({
         aiResult.existing_subject_id = selectedSubjectId;
       }
 
-      const firstPhoto = mode === 'images' && images[0] ? images[0].dataUrl : '';
-      await onSaveImportedData(aiResult, firstPhoto, {
+      const allUploadedPhotos =
+        mode === 'images' && images.length > 0
+          ? images.map((im, idx) => ({
+              url: im.dataUrl,
+              label: im.name ? `Ảnh ${idx + 1} · ${im.name}` : `Ảnh ${idx + 1}`,
+            }))
+          : [];
+      await onSaveImportedData(aiResult, allUploadedPhotos, {
         forcedSubjectId: selectedSubjectId || null,
       });
       onClose();
@@ -942,11 +1077,18 @@ export default function ImportModal({
                             .map((n) => pdfPages.find((p) => p.pageNum === n))
                             .filter(Boolean);
                           return (
-                            <button
+                            <div
                               key={g.id}
-                              type="button"
                               onClick={() => toggleGroupSelected(g.id)}
-                              className={`w-full text-left p-3.5 rounded-2xl border transition flex items-start gap-3 ${
+                              role="button"
+                              tabIndex={0}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                  e.preventDefault();
+                                  toggleGroupSelected(g.id);
+                                }
+                              }}
+                              className={`w-full text-left p-3.5 rounded-2xl border transition flex items-start gap-3 cursor-pointer ${
                                 g.selected
                                   ? 'bg-indigo-50/70 dark:bg-indigo-950/40 border-indigo-400 dark:border-indigo-700'
                                   : 'bg-slate-50 dark:bg-slate-800/40 border-slate-200 dark:border-slate-800 opacity-60'
@@ -962,45 +1104,75 @@ export default function ImportModal({
                                 {g.selected && <Check className="w-3.5 h-3.5" />}
                               </div>
                               <div className="min-w-0 flex-1 space-y-1.5">
-                                <div className="flex items-center gap-2 flex-wrap">
-                                  <span className="text-xs font-extrabold text-slate-900 dark:text-white">{g.title_de}</span>
-                                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-100 dark:bg-indigo-900 text-indigo-700 dark:text-indigo-200">
-                                    Trang {g.pageNums.join(', ')}
-                                  </span>
-                                  {g.subject_hint && (
-                                    <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-200/80 dark:bg-slate-700 text-slate-700 dark:text-slate-200">
-                                      {g.subject_hint}
+                                <div className="flex items-start justify-between gap-2">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className="text-xs font-extrabold text-slate-900 dark:text-white">{g.title_de}</span>
+                                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-100 dark:bg-indigo-900 text-indigo-700 dark:text-indigo-200">
+                                      Trang {g.pageNums.join(', ')}
                                     </span>
+                                    {g.subject_hint && (
+                                      <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-200/80 dark:bg-slate-700 text-slate-700 dark:text-slate-200">
+                                        {g.subject_hint}
+                                      </span>
+                                    )}
+                                  </div>
+                                  {groupPageObjs[0] && (
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        openPdfPagePreview(groupPageObjs[0].pageNum, 'image');
+                                      }}
+                                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white dark:bg-slate-900 border border-indigo-300 dark:border-indigo-700 text-[11px] font-bold text-indigo-700 dark:text-indigo-300 hover:bg-indigo-50 shrink-0"
+                                      title="Mở xem to từng trang & nội dung chữ AI đã đọc"
+                                    >
+                                      <Eye className="w-3.5 h-3.5" /> Xem & Soi
+                                    </button>
                                   )}
                                 </div>
                                 {g.title_vn && <p className="text-xs font-semibold text-indigo-600 dark:text-indigo-400">{g.title_vn}</p>}
                                 <p className="text-[11px] text-slate-500 dark:text-slate-400">{g.reason_vn}</p>
 
-                                {/* Hiển thị ảnh thu nhỏ + số ký tự AI đã đọc được ở TỪNG trang */}
+                                {/* Ảnh thu nhỏ TỪNG trang: bấm trực tiếp để mở phóng to & xem chữ OCR */}
                                 {groupPageObjs.length > 0 && (
-                                  <div className="flex items-center gap-2 pt-1.5 overflow-x-auto">
-                                    {groupPageObjs.map((pg) => (
-                                      <div
-                                        key={pg.pageNum}
-                                        className="relative w-16 h-20 rounded-lg overflow-hidden border border-slate-200 dark:border-slate-700 bg-white shrink-0"
-                                        title={pg.text.slice(0, 160)}
-                                      >
-                                        {pg.thumbUrl ? (
-                                          <img src={pg.thumbUrl} alt={`Trang ${pg.pageNum}`} className="w-full h-full object-cover" />
-                                        ) : (
-                                          <div className="w-full h-full flex items-center justify-center text-[10px] text-slate-400">
-                                            Tr.{pg.pageNum}
+                                  <div className="space-y-1 pt-1">
+                                    <p className="text-[10px] font-semibold text-slate-400">
+                                      Bấm vào từng trang bên dưới để phóng to xem ảnh gốc & chữ AI đã đọc:
+                                    </p>
+                                    <div className="flex items-center gap-2 overflow-x-auto pb-1">
+                                      {groupPageObjs.map((pg) => (
+                                        <button
+                                          key={pg.pageNum}
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            openPdfPagePreview(pg.pageNum, 'image');
+                                          }}
+                                          className="group relative w-20 h-24 rounded-xl overflow-hidden border-2 border-slate-200 dark:border-slate-700 hover:border-indigo-500 bg-white shrink-0 transition shadow-sm"
+                                          title={`Bấm để xem phóng to Trang ${pg.pageNum} (${pg.charCount} ký tự)`}
+                                        >
+                                          {pg.thumbUrl ? (
+                                            <img src={pg.thumbUrl} alt={`Trang ${pg.pageNum}`} className="w-full h-full object-cover" />
+                                          ) : (
+                                            <div className="w-full h-full flex items-center justify-center text-[10px] text-slate-400">
+                                              Tr.{pg.pageNum}
+                                            </div>
+                                          )}
+                                          <div className="absolute inset-0 bg-slate-900/0 group-hover:bg-slate-900/35 transition flex items-center justify-center">
+                                            <span className="opacity-0 group-hover:opacity-100 p-1.5 rounded-full bg-indigo-600 text-white shadow transition">
+                                              <ZoomIn className="w-3.5 h-3.5" />
+                                            </span>
                                           </div>
-                                        )}
-                                        <span className="absolute bottom-0 inset-x-0 bg-slate-900/80 text-white text-[9px] font-bold text-center py-0.5">
-                                          Tr.{pg.pageNum} · {pg.charCount > 0 ? `${pg.charCount}ch` : 'Ảnh'}
-                                        </span>
-                                      </div>
-                                    ))}
+                                          <span className="absolute bottom-0 inset-x-0 bg-slate-900/85 text-white text-[9px] font-bold text-center py-0.5">
+                                            Tr.{pg.pageNum} · {pg.charCount > 0 ? `${pg.charCount}ch` : 'Ảnh'}
+                                          </span>
+                                        </button>
+                                      ))}
+                                    </div>
                                   </div>
                                 )}
                               </div>
-                            </button>
+                            </div>
                           );
                         })}
                       </div>
@@ -1030,29 +1202,48 @@ export default function ImportModal({
                           return (
                             <div
                               key={s.pageNum}
-                              className="p-2.5 rounded-xl bg-rose-50/50 dark:bg-rose-950/20 border border-rose-200/70 dark:border-rose-900/50 flex items-center justify-between gap-3 text-xs"
+                              className="p-2.5 rounded-xl bg-rose-50/50 dark:bg-rose-950/20 border border-rose-200/70 dark:border-rose-900/50 flex items-center justify-between gap-2.5 text-xs"
                             >
                               <div className="flex items-center gap-2.5 min-w-0">
-                                {pg?.thumbUrl && (
-                                  <img
-                                    src={pg.thumbUrl}
-                                    alt={`Trang ${s.pageNum}`}
-                                    className="w-10 h-12 rounded-md object-cover border border-slate-200 dark:border-slate-700 bg-white shrink-0"
-                                  />
-                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => openPdfPagePreview(s.pageNum, 'image')}
+                                  className="group relative w-11 h-14 rounded-lg overflow-hidden border border-slate-300 dark:border-slate-700 hover:border-indigo-500 bg-white shrink-0"
+                                  title={`Bấm để xem phóng to Trang ${s.pageNum}`}
+                                >
+                                  {pg?.thumbUrl ? (
+                                    <img src={pg.thumbUrl} alt={`Trang ${s.pageNum}`} className="w-full h-full object-cover" />
+                                  ) : (
+                                    <div className="w-full h-full flex items-center justify-center text-[9px] text-slate-400">
+                                      Tr.{s.pageNum}
+                                    </div>
+                                  )}
+                                  <span className="absolute inset-0 bg-slate-900/0 group-hover:bg-slate-900/40 flex items-center justify-center transition">
+                                    <ZoomIn className="w-3.5 h-3.5 text-white opacity-0 group-hover:opacity-100" />
+                                  </span>
+                                </button>
                                 <div className="min-w-0">
                                   <span className="font-bold text-rose-700 dark:text-rose-300">Trang {s.pageNum}:</span>{' '}
                                   <span className="text-slate-700 dark:text-slate-300">{s.title_hint}</span>
                                   <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">{s.reason_vn}</p>
                                 </div>
                               </div>
-                              <button
-                                type="button"
-                                onClick={() => restoreSkippedPage(s)}
-                                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 text-[11px] font-bold text-slate-700 dark:text-slate-200 hover:border-indigo-500 shrink-0"
-                              >
-                                <RotateCcw className="w-3 h-3" /> Giữ lại
-                              </button>
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => openPdfPagePreview(s.pageNum, 'image')}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 text-[11px] font-bold text-indigo-700 dark:text-indigo-300 hover:border-indigo-500"
+                                >
+                                  <Eye className="w-3 h-3" /> Xem
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => restoreSkippedPage(s)}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 text-[11px] font-bold text-slate-700 dark:text-slate-200 hover:border-emerald-500"
+                                >
+                                  <RotateCcw className="w-3 h-3" /> Giữ lại
+                                </button>
+                              </div>
                             </div>
                           );
                         })}
@@ -1144,19 +1335,64 @@ export default function ImportModal({
               </div>
 
               {images.length > 0 && (
-                <div className="grid grid-cols-3 sm:grid-cols-5 gap-2.5">
-                  {images.map((im, idx) => (
-                    <div key={idx} className="relative rounded-xl overflow-hidden border border-slate-200 dark:border-slate-700 aspect-square bg-slate-100">
-                      <img src={im.dataUrl} alt={im.name} className="w-full h-full object-cover" />
-                      <button
-                        type="button"
-                        onClick={() => setImages((prev) => prev.filter((_, i) => i !== idx))}
-                        className="absolute top-1.5 right-1.5 p-1 rounded-lg bg-slate-900/80 text-white hover:bg-rose-600"
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="font-bold text-slate-600 dark:text-slate-300">
+                      Đã chọn {images.length} ảnh — bấm vào bất kỳ ảnh nào để phóng to kiểm tra trước khi nạp:
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => openUploadedImagePreview(0)}
+                      className="inline-flex items-center gap-1 font-bold text-indigo-600 dark:text-indigo-400 hover:underline"
+                    >
+                      <Eye className="w-3.5 h-3.5" /> Xem lần lượt
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+                    {images.map((im, idx) => (
+                      <div
+                        key={idx}
+                        className="group relative rounded-2xl overflow-hidden border-2 border-slate-200 dark:border-slate-700 hover:border-indigo-500 bg-slate-100 dark:bg-slate-800 transition"
                       >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  ))}
+                        <button
+                          type="button"
+                          onClick={() => openUploadedImagePreview(idx)}
+                          className="block w-full aspect-[4/3] relative overflow-hidden bg-white dark:bg-slate-900"
+                          title={`Bấm để phóng to kiểm tra ${im.name || `Ảnh ${idx + 1}`}`}
+                        >
+                          <img src={im.dataUrl} alt={im.name} className="w-full h-full object-cover" />
+                          <div className="absolute inset-0 bg-slate-900/0 group-hover:bg-slate-900/35 transition flex items-center justify-center">
+                            <span className="opacity-0 group-hover:opacity-100 inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-indigo-600 text-white text-[11px] font-bold shadow transition">
+                              <ZoomIn className="w-3.5 h-3.5" /> Xem rõ
+                            </span>
+                          </div>
+                        </button>
+                        <div className="px-2.5 py-1.5 bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between gap-1.5">
+                          <span className="text-[11px] font-bold text-slate-700 dark:text-slate-200 truncate">
+                            Ảnh {idx + 1}{im.name ? ` · ${im.name}` : ''}
+                          </span>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => openUploadedImagePreview(idx)}
+                              className="p-1 rounded-lg text-indigo-600 dark:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-950"
+                              title="Phóng to xem ảnh"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setImages((prev) => prev.filter((_, i) => i !== idx))}
+                              className="p-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950"
+                              title="Xóa ảnh này"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
 
@@ -1222,6 +1458,318 @@ export default function ImportModal({
           )}
         </div>
       </div>
+
+      {/* ==================== FULLSCREEN PREVIEW & ZOOM LIGHTBOX (PDF + ẢNH TẢI LÊN) ==================== */}
+      {previewModal && (() => {
+        const isPdf = previewModal.kind === 'pdf';
+        const activePdfPage = isPdf ? pdfPages.find((p) => p.pageNum === previewModal.pageNum) : null;
+        const activeSkippedItem = isPdf ? pdfSkipped.find((s) => s.pageNum === previewModal.pageNum) : null;
+        const activeGroupItem = isPdf ? pdfGroups.find((g) => g.pageNums.includes(previewModal.pageNum)) : null;
+        const activeUploadedImg = !isPdf ? images[previewModal.index] : null;
+
+        const imgSrc = isPdf ? (previewHighResUrl || activePdfPage?.thumbUrl || '') : (activeUploadedImg?.dataUrl || '');
+        const totalCount = isPdf ? pdfPages.length : images.length;
+        const currentPos = isPdf ? previewModal.pageNum : previewModal.index + 1;
+        const canPrev = currentPos > 1;
+        const canNext = currentPos < totalCount;
+
+        const goPrev = () => {
+          if (!canPrev) return;
+          setPreviewZoom(1);
+          setPreviewRotate(0);
+          setPreviewModal((prev) =>
+            prev
+              ? prev.kind === 'pdf'
+                ? { ...prev, pageNum: prev.pageNum - 1 }
+                : { ...prev, index: prev.index - 1 }
+              : null
+          );
+        };
+        const goNext = () => {
+          if (!canNext) return;
+          setPreviewZoom(1);
+          setPreviewRotate(0);
+          setPreviewModal((prev) =>
+            prev
+              ? prev.kind === 'pdf'
+                ? { ...prev, pageNum: prev.pageNum + 1 }
+                : { ...prev, index: prev.index + 1 }
+              : null
+          );
+        };
+
+        return (
+          <div
+            className="fixed inset-0 z-[70] bg-slate-950/92 backdrop-blur-md flex flex-col"
+            onClick={() => setPreviewModal(null)}
+          >
+            {/* Top Toolbar */}
+            <div
+              className="px-4 py-3 bg-slate-900/95 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 text-white shrink-0"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center gap-2.5 min-w-0 flex-wrap">
+                <span className="px-2.5 py-1 rounded-lg bg-indigo-600 text-xs font-extrabold shrink-0">
+                  {isPdf ? `Trang ${currentPos} / ${totalCount}` : `Ảnh ${currentPos} / ${totalCount}`}
+                </span>
+                <span className="text-xs font-bold text-slate-200 truncate max-w-[220px] sm:max-w-xs">
+                  {isPdf
+                    ? activeGroupItem?.title_de || activeSkippedItem?.title_hint || pdfFileName
+                    : activeUploadedImg?.name || `Ảnh ${currentPos}`}
+                </span>
+                {isPdf && activeGroupItem && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-900/80 text-emerald-300 border border-emerald-700">
+                    {activeGroupItem.selected ? 'Đang chọn nạp' : 'Đã bỏ tích nhóm'}
+                  </span>
+                )}
+                {isPdf && activeSkippedItem && (
+                  <button
+                    type="button"
+                    onClick={() => restoreSkippedPage(activeSkippedItem)}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-bold"
+                  >
+                    <RotateCcw className="w-3 h-3" /> Giữ lại trang này
+                  </button>
+                )}
+              </div>
+
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {/* Chuyển tab Ảnh gốc vs. Chữ AI đã đọc (cho PDF) */}
+                {isPdf && (
+                  <div className="flex items-center bg-slate-800 p-0.5 rounded-xl border border-slate-700 mr-1">
+                    <button
+                      type="button"
+                      onClick={() => setPreviewModal((prev) => (prev ? { ...prev, tab: 'image' } : null))}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition ${
+                        previewModal.tab === 'image' ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:text-white'
+                      }`}
+                    >
+                      Ảnh gốc
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPreviewModal((prev) => (prev ? { ...prev, tab: 'text' } : null))}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition ${
+                        previewModal.tab === 'text' ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:text-white'
+                      }`}
+                    >
+                      Chữ AI đọc ({activePdfPage?.charCount || 0})
+                    </button>
+                  </div>
+                )}
+
+                {/* Zoom & Rotate controls (khi đang xem ảnh) */}
+                {(!isPdf || previewModal.tab === 'image') && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setPreviewZoom((z) => Math.max(1, Number((z - 0.4).toFixed(2))))}
+                      disabled={previewZoom <= 1}
+                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40"
+                      title="Thu nhỏ (-)"
+                    >
+                      <ZoomOut className="w-4 h-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPreviewZoom((z) => (z === 1 ? 1.8 : 1))}
+                      className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[11px] font-bold min-w-[60px]"
+                      title="Chuyển nhanh Vừa khung / Phóng to 180%"
+                    >
+                      {previewZoom === 1 ? 'Vừa khung' : `${Math.round(previewZoom * 100)}%`}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPreviewZoom((z) => Math.min(3, Number((z + 0.4).toFixed(2))))}
+                      disabled={previewZoom >= 3}
+                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40"
+                      title="Phóng to (+)"
+                    >
+                      <ZoomIn className="w-4 h-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPreviewRotate((r) => (r + 90) % 360)}
+                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700"
+                      title="Xoay ảnh 90°"
+                    >
+                      <RotateCw className="w-4 h-4" />
+                    </button>
+                  </>
+                )}
+
+                {!isPdf && activeUploadedImg && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const delIdx = previewModal.index;
+                      const nextLen = images.length - 1;
+                      setImages((prev) => prev.filter((_, i) => i !== delIdx));
+                      if (nextLen <= 0) setPreviewModal(null);
+                      else setPreviewModal({ kind: 'image', index: Math.min(delIdx, nextLen - 1) });
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-rose-600/90 hover:bg-rose-600 text-[11px] font-bold"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" /> Xóa
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => setPreviewModal(null)}
+                  className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-600 text-white ml-1"
+                  title="Đóng (Esc)"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Main Viewport */}
+            <div className="flex-1 relative overflow-hidden flex items-center justify-center">
+              {/* Prev Arrow */}
+              {canPrev && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    goPrev();
+                  }}
+                  className="absolute left-3 z-20 p-2.5 rounded-full bg-slate-900/85 hover:bg-indigo-600 text-white border border-slate-700 shadow-lg transition"
+                  title="Trang trước (←)"
+                >
+                  <ChevronLeft className="w-5 h-5" />
+                </button>
+              )}
+
+              {/* Next Arrow */}
+              {canNext && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    goNext();
+                  }}
+                  className="absolute right-3 z-20 p-2.5 rounded-full bg-slate-900/85 hover:bg-indigo-600 text-white border border-slate-700 shadow-lg transition"
+                  title="Trang sau (→)"
+                >
+                  <ChevronRight className="w-5 h-5" />
+                </button>
+              )}
+
+              {isPdf && previewModal.tab === 'text' ? (
+                <div
+                  className="w-full max-w-3xl max-h-full overflow-y-auto m-4 p-5 rounded-2xl bg-slate-900 border border-slate-700 text-slate-100 space-y-3"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-800">
+                    <span className="text-xs font-extrabold text-indigo-400">
+                      Nội dung chữ AI đã đọc được từ Trang {previewModal.pageNum}
+                    </span>
+                    <span className="text-[11px] text-slate-400">
+                      {activePdfPage?.charCount || 0} ký tự
+                    </span>
+                  </div>
+                  {activePdfPage?.text ? (
+                    <pre className="whitespace-pre-wrap font-sans text-xs sm:text-sm leading-relaxed text-slate-200">
+                      {activePdfPage.text}
+                    </pre>
+                  ) : (
+                    <p className="text-xs text-slate-400 italic">
+                      Trang này không có chữ (trang trống hoặc chưa đọc được OCR). Hãy chuyển qua tab "Ảnh gốc" để kiểm tra trực tiếp.
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <div
+                  className="w-full h-full overflow-auto p-4 sm:p-8 flex items-start justify-center"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div className="relative my-auto flex flex-col items-center">
+                    {previewLoadingImg && (
+                      <div className="mb-2 inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-indigo-600/90 text-white text-[11px] font-bold shadow">
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" /> Đang tải ảnh độ nét cao...
+                      </div>
+                    )}
+                    {imgSrc ? (
+                      <img
+                        src={imgSrc}
+                        alt={`Xem trước ${currentPos}`}
+                        onClick={() => setPreviewZoom((z) => (z === 1 ? 1.8 : 1))}
+                        style={{
+                          width: previewZoom === 1 ? 'auto' : `${Math.round(previewZoom * 100)}%`,
+                          maxWidth: previewZoom === 1 ? '100%' : 'none',
+                          maxHeight: previewZoom === 1 ? '76vh' : 'none',
+                          transform: previewRotate ? `rotate(${previewRotate}deg)` : undefined,
+                        }}
+                        className={`rounded-xl bg-white shadow-2xl transition-all select-none ${
+                          previewZoom === 1 ? 'cursor-zoom-in object-contain' : 'cursor-zoom-out'
+                        }`}
+                      />
+                    ) : (
+                      <p className="text-xs text-slate-400">Không có ảnh xem trước.</p>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Bottom Filmstrip */}
+            {totalCount > 1 && (
+              <div
+                className="px-4 py-2.5 bg-slate-900/95 border-t border-slate-800 flex items-center gap-2 overflow-x-auto justify-start sm:justify-center shrink-0"
+                onClick={(e) => e.stopPropagation()}
+              >
+                {isPdf
+                  ? pdfPages.map((pg) => {
+                      const active = pg.pageNum === previewModal.pageNum;
+                      return (
+                        <button
+                          key={pg.pageNum}
+                          type="button"
+                          onClick={() => {
+                            setPreviewZoom(1);
+                            setPreviewRotate(0);
+                            setPreviewModal((prev) => (prev ? { ...prev, pageNum: pg.pageNum } : null));
+                          }}
+                          className={`relative w-12 h-14 rounded-lg overflow-hidden border-2 shrink-0 bg-white transition ${
+                            active ? 'border-indigo-500 ring-2 ring-indigo-400/60 scale-105' : 'border-slate-700 opacity-65 hover:opacity-100'
+                          }`}
+                        >
+                          {pg.thumbUrl && <img src={pg.thumbUrl} alt={`Tr.${pg.pageNum}`} className="w-full h-full object-cover" />}
+                          <span className="absolute bottom-0 inset-x-0 bg-slate-900/85 text-white text-[9px] font-bold text-center">
+                            {pg.pageNum}
+                          </span>
+                        </button>
+                      );
+                    })
+                  : images.map((im, idx) => {
+                      const active = idx === previewModal.index;
+                      return (
+                        <button
+                          key={idx}
+                          type="button"
+                          onClick={() => {
+                            setPreviewZoom(1);
+                            setPreviewRotate(0);
+                            setPreviewModal({ kind: 'image', index: idx });
+                          }}
+                          className={`relative w-12 h-14 rounded-lg overflow-hidden border-2 shrink-0 bg-white transition ${
+                            active ? 'border-indigo-500 ring-2 ring-indigo-400/60 scale-105' : 'border-slate-700 opacity-65 hover:opacity-100'
+                          }`}
+                        >
+                          <img src={im.dataUrl} alt={`Ảnh ${idx + 1}`} className="w-full h-full object-cover" />
+                          <span className="absolute bottom-0 inset-x-0 bg-slate-900/85 text-white text-[9px] font-bold text-center">
+                            {idx + 1}
+                          </span>
+                        </button>
+                      );
+                    })}
+              </div>
+            )}
+          </div>
+        );
+      })()}
     </div>
   );
 }
