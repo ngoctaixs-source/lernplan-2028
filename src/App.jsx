@@ -42,6 +42,11 @@ import {
   FolderInput,
   GraduationCap,
   GitMerge,
+  ZoomIn,
+  ZoomOut,
+  ChevronLeft,
+  Maximize2,
+  RotateCw,
 } from 'lucide-react';
 import { supabase, isSupabaseConfigured, ADMIN_EMAIL } from './lib/supabase';
 import { callGeminiApi } from './lib/api';
@@ -138,6 +143,42 @@ function parseSubjectTitle(titleDe = '') {
   return { code: '', name: raw };
 }
 
+// Hỗ trợ lưu & đọc NHIỀU ảnh bảng / nhiều trang PDF gốc trong cùng cột source_image_url (không cần sửa bảng Supabase)
+function parseSourceImages(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) {
+    return raw
+      .map((item, idx) => {
+        if (typeof item === 'string' && item.trim()) return { url: item.trim(), label: `Trang ${idx + 1}` };
+        if (item && typeof item === 'object' && item.url) return { url: item.url, label: item.label || `Trang ${idx + 1}` };
+        return null;
+      })
+      .filter(Boolean);
+  }
+  const str = String(raw).trim();
+  if (!str) return [];
+  if (str.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(str);
+      if (Array.isArray(parsed)) {
+        return parseSourceImages(parsed);
+      }
+    } catch {
+      // fallback single image string
+    }
+  }
+  return [{ url: str, label: 'Trang 1' }];
+}
+
+function serializeSourceImages(input) {
+  const list = parseSourceImages(input);
+  if (list.length === 0) return '';
+  if (list.length === 1 && list[0].label === 'Trang 1') {
+    return list[0].url;
+  }
+  return JSON.stringify(list);
+}
+
 export default function App() {
   // User Preferences (Dark Mode, Font Scale, Dict Mode, TTS, VN)
   const [darkMode, setDarkMode] = useState(() => {
@@ -224,6 +265,9 @@ export default function App() {
 
   // Lesson Study UI State
   const [showBoardPhoto, setShowBoardPhoto] = useState(false);
+  const [boardLightboxIndex, setBoardLightboxIndex] = useState(null); // null | number
+  const [boardLightboxZoom, setBoardLightboxZoom] = useState(1);
+  const [boardLightboxRotate, setBoardLightboxRotate] = useState(0);
   const [openExplainIds, setOpenExplainIds] = useState({});
   const [loadingExplainId, setLoadingExplainId] = useState(null);
   const [editingSectionId, setEditingSectionId] = useState(null);
@@ -426,6 +470,37 @@ export default function App() {
     () => subjects.find((s) => s.id === activeLesson?.subject_id) || null,
     [subjects, activeLesson]
   );
+  const activeSourceImages = useMemo(
+    () => parseSourceImages(activeLesson?.source_image_url),
+    [activeLesson]
+  );
+
+  // Phím tắt Esc / Mũi tên / +/- cho Lightbox xem ảnh bảng gốc toàn màn hình
+  useEffect(() => {
+    if (boardLightboxIndex === null) return undefined;
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setBoardLightboxIndex(null);
+      } else if (e.key === 'ArrowLeft' && boardLightboxIndex > 0) {
+        e.preventDefault();
+        setBoardLightboxZoom(1);
+        setBoardLightboxRotate(0);
+        setBoardLightboxIndex((idx) => (idx !== null && idx > 0 ? idx - 1 : idx));
+      } else if (e.key === 'ArrowRight' && boardLightboxIndex < activeSourceImages.length - 1) {
+        e.preventDefault();
+        setBoardLightboxZoom(1);
+        setBoardLightboxRotate(0);
+        setBoardLightboxIndex((idx) => (idx !== null && idx < activeSourceImages.length - 1 ? idx + 1 : idx));
+      } else if (e.key === '+' || e.key === '=') {
+        setBoardLightboxZoom((z) => Math.min(3, Number((z + 0.4).toFixed(2))));
+      } else if (e.key === '-') {
+        setBoardLightboxZoom((z) => Math.max(1, Number((z - 0.4).toFixed(2))));
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [boardLightboxIndex, activeSourceImages.length]);
   const activeSections = useMemo(
     () => sections.filter((s) => s.lesson_id === activeLessonId).sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0)),
     [sections, activeLessonId]
@@ -728,7 +803,8 @@ export default function App() {
   };
 
   // ==================== ADMIN: IMPORT ONENOTE / PDF / HANDWRITING ====================
-  const handleSaveImportedData = async (aiResult, firstBoardPhotoUrl = '', options = {}) => {
+  const handleSaveImportedData = async (aiResult, boardPhotosInput = '', options = {}) => {
+    const serializedSourceImages = serializeSourceImages(boardPhotosInput);
     if (!supabase || !isAdmin) throw new Error('Chỉ Admin mới có quyền thêm bài.');
     if (!Array.isArray(aiResult?.lessons) || aiResult.lessons.length === 0) {
       throw new Error('AI không trả về bài học nào hợp lệ.');
@@ -785,7 +861,7 @@ export default function App() {
           sort_order: existingLessonCount + i + 1,
           overview_de: les.overview_de || '',
           overview_vn: les.overview_vn || '',
-          source_image_url: i === 0 ? firstBoardPhotoUrl : '',
+          source_image_url: serializedSourceImages,
         })
         .select()
         .single();
@@ -1321,6 +1397,9 @@ export default function App() {
     setLessonTab(tab);
     setOpenExplainIds({});
     setShowBoardPhoto(false);
+    setBoardLightboxIndex(null);
+    setBoardLightboxZoom(1);
+    setBoardLightboxRotate(0);
     setEditingSectionId(null);
     setView('lesson');
     setMobileMenuOpen(false);
@@ -2431,12 +2510,15 @@ export default function App() {
                   <ArrowLeft className="w-4 h-4" /> Quay lại Môn học
                 </button>
                 <div className="flex items-center gap-2">
-                  {activeLesson.source_image_url && (
+                  {activeSourceImages.length > 0 && (
                     <button
                       onClick={() => setShowBoardPhoto((s) => !s)}
-                      className="inline-flex items-center gap-1.5 text-xs font-bold text-indigo-700 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950 px-3 py-2 rounded-xl border border-indigo-200 dark:border-indigo-800"
+                      className="inline-flex items-center gap-1.5 text-xs font-bold text-indigo-700 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950 hover:bg-indigo-100 dark:hover:bg-indigo-900/60 px-3 py-2 rounded-xl border border-indigo-200 dark:border-indigo-800 transition"
                     >
-                      <ImageIcon className="w-4 h-4" /> {showBoardPhoto ? 'Ẩn ảnh bảng gốc' : 'Xem ảnh bảng gốc'}
+                      <ImageIcon className="w-4 h-4" />
+                      {showBoardPhoto
+                        ? 'Ẩn ảnh bản gốc'
+                        : `Xem ảnh bản gốc${activeSourceImages.length > 1 ? ` (${activeSourceImages.length} trang)` : ''}`}
                     </button>
                   )}
                   {activeSubject && (
@@ -2445,14 +2527,88 @@ export default function App() {
                 </div>
               </div>
 
-              {showBoardPhoto && activeLesson.source_image_url && (
-                <div className="bg-white dark:bg-slate-900 rounded-2xl border border-indigo-200 dark:border-indigo-800 p-4 space-y-2">
-                  <p className="text-xs font-bold text-indigo-700 dark:text-indigo-300">Ảnh chụp bảng / ghi chú gốc (để đối chiếu):</p>
-                  <img
-                    src={activeLesson.source_image_url}
-                    alt="Ảnh bảng gốc"
-                    className="w-full max-h-96 object-contain rounded-xl bg-slate-100 dark:bg-slate-800"
-                  />
+              {showBoardPhoto && activeSourceImages.length > 0 && (
+                <div className="bg-white dark:bg-slate-900 rounded-2xl border border-indigo-200 dark:border-indigo-800 p-4 sm:p-5 space-y-3 shadow-sm">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <p className="text-xs font-extrabold text-indigo-700 dark:text-indigo-300">
+                        Ảnh chụp bảng / tài liệu gốc ({activeSourceImages.length} trang)
+                      </p>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                        Bấm trực tiếp vào bất kỳ trang nào để mở toàn màn hình, phóng to & đọc rõ từng chữ
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setBoardLightboxZoom(1);
+                        setBoardLightboxRotate(0);
+                        setBoardLightboxIndex(0);
+                      }}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold shadow-sm"
+                    >
+                      <Maximize2 className="w-3.5 h-3.5" /> Phóng to toàn màn hình
+                    </button>
+                  </div>
+
+                  {activeSourceImages.length === 1 ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setBoardLightboxZoom(1);
+                        setBoardLightboxRotate(0);
+                        setBoardLightboxIndex(0);
+                      }}
+                      className="group relative block w-full rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 cursor-zoom-in"
+                      title="Bấm để phóng to toàn màn hình"
+                    >
+                      <img
+                        src={activeSourceImages[0].url}
+                        alt={activeSourceImages[0].label}
+                        className="w-full max-h-[28rem] object-contain mx-auto"
+                      />
+                      <span className="absolute bottom-3 right-3 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900/85 text-white text-xs font-bold shadow group-hover:bg-indigo-600 transition">
+                        <ZoomIn className="w-3.5 h-3.5" /> Bấm để phóng to
+                      </span>
+                    </button>
+                  ) : (
+                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+                      {activeSourceImages.map((imgItem, idx) => (
+                        <button
+                          key={idx}
+                          type="button"
+                          onClick={() => {
+                            setBoardLightboxZoom(1);
+                            setBoardLightboxRotate(0);
+                            setBoardLightboxIndex(idx);
+                          }}
+                          className="group relative rounded-xl overflow-hidden border-2 border-slate-200 dark:border-slate-700 hover:border-indigo-500 bg-white dark:bg-slate-800 transition text-left cursor-zoom-in shadow-sm"
+                          title={`Bấm để phóng to ${imgItem.label}`}
+                        >
+                          <div className="aspect-[3/4] w-full overflow-hidden bg-slate-100 dark:bg-slate-900">
+                            <img
+                              src={imgItem.url}
+                              alt={imgItem.label}
+                              className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                            />
+                          </div>
+                          <div className="absolute inset-0 bg-slate-900/0 group-hover:bg-slate-900/35 transition flex items-center justify-center">
+                            <span className="opacity-0 group-hover:opacity-100 inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-indigo-600 text-white text-[11px] font-bold shadow transition">
+                              <ZoomIn className="w-3.5 h-3.5" /> Phóng to
+                            </span>
+                          </div>
+                          <div className="px-2.5 py-1.5 bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between gap-1">
+                            <span className="text-[11px] font-extrabold text-slate-800 dark:text-slate-100 truncate">
+                              {imgItem.label}
+                            </span>
+                            <span className="text-[10px] font-bold text-slate-400 shrink-0">
+                              {idx + 1}/{activeSourceImages.length}
+                            </span>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -3029,6 +3185,162 @@ export default function App() {
           onOpenLesson={openLesson}
           onGoToVocab={() => navigate('vocab')}
         />
+      )}
+
+      {/* ==================== FULLSCREEN ZOOMABLE LIGHTBOX CHO ẢNH BẢN GỐC ==================== */}
+      {boardLightboxIndex !== null && activeSourceImages[boardLightboxIndex] && (
+        <div
+          className="fixed inset-0 z-[70] bg-slate-950/92 backdrop-blur-md flex flex-col"
+          onClick={() => setBoardLightboxIndex(null)}
+        >
+          {/* Top Controls Bar */}
+          <div
+            className="px-4 py-3 bg-slate-900/95 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 text-white shrink-0"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-2.5 min-w-0">
+              <span className="px-2.5 py-1 rounded-lg bg-indigo-600 text-xs font-extrabold shrink-0">
+                {boardLightboxIndex + 1} / {activeSourceImages.length}
+              </span>
+              <span className="text-xs font-bold text-slate-200 truncate max-w-[200px] sm:max-w-md">
+                {activeSourceImages[boardLightboxIndex].label}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <button
+                type="button"
+                onClick={() => setBoardLightboxZoom((z) => Math.max(1, Number((z - 0.4).toFixed(2))))}
+                disabled={boardLightboxZoom <= 1}
+                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40"
+                title="Thu nhỏ (-)"
+              >
+                <ZoomOut className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setBoardLightboxZoom((z) => (z === 1 ? 1.8 : 1))}
+                className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[11px] font-bold min-w-[64px]"
+                title="Chuyển nhanh Vừa màn / Phóng to 180%"
+              >
+                {boardLightboxZoom === 1 ? 'Vừa khung' : `${Math.round(boardLightboxZoom * 100)}%`}
+              </button>
+              <button
+                type="button"
+                onClick={() => setBoardLightboxZoom((z) => Math.min(3, Number((z + 0.4).toFixed(2))))}
+                disabled={boardLightboxZoom >= 3}
+                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40"
+                title="Phóng to (+)"
+              >
+                <ZoomIn className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setBoardLightboxRotate((r) => (r + 90) % 360)}
+                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700"
+                title="Xoay ảnh 90°"
+              >
+                <RotateCw className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setBoardLightboxIndex(null)}
+                className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-600 text-white ml-1"
+                title="Đóng (Esc)"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {/* Main Zoomable Stage */}
+          <div className="flex-1 relative overflow-hidden flex items-center justify-center">
+            {boardLightboxIndex > 0 && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setBoardLightboxZoom(1);
+                  setBoardLightboxRotate(0);
+                  setBoardLightboxIndex((idx) => Math.max(0, idx - 1));
+                }}
+                className="absolute left-3 z-20 p-2.5 rounded-full bg-slate-900/85 hover:bg-indigo-600 text-white border border-slate-700 shadow-lg transition"
+                title="Trang trước (←)"
+              >
+                <ChevronLeft className="w-5 h-5" />
+              </button>
+            )}
+
+            {boardLightboxIndex < activeSourceImages.length - 1 && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setBoardLightboxZoom(1);
+                  setBoardLightboxRotate(0);
+                  setBoardLightboxIndex((idx) => Math.min(activeSourceImages.length - 1, idx + 1));
+                }}
+                className="absolute right-3 z-20 p-2.5 rounded-full bg-slate-900/85 hover:bg-indigo-600 text-white border border-slate-700 shadow-lg transition"
+                title="Trang sau (→)"
+              >
+                <ChevronRight className="w-5 h-5" />
+              </button>
+            )}
+
+            <div
+              className="w-full h-full overflow-auto p-4 sm:p-8 flex items-start justify-center"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <img
+                src={activeSourceImages[boardLightboxIndex].url}
+                alt={activeSourceImages[boardLightboxIndex].label}
+                onClick={() => setBoardLightboxZoom((z) => (z === 1 ? 1.8 : 1))}
+                style={{
+                  width: boardLightboxZoom === 1 ? 'auto' : `${Math.round(boardLightboxZoom * 100)}%`,
+                  maxWidth: boardLightboxZoom === 1 ? '100%' : 'none',
+                  maxHeight: boardLightboxZoom === 1 ? '76vh' : 'none',
+                  transform: boardLightboxRotate ? `rotate(${boardLightboxRotate}deg)` : undefined,
+                }}
+                className={`my-auto rounded-xl bg-white shadow-2xl transition-all select-none ${
+                  boardLightboxZoom === 1 ? 'cursor-zoom-in object-contain' : 'cursor-zoom-out'
+                }`}
+              />
+            </div>
+          </div>
+
+          {/* Bottom Page Thumbnails Strip */}
+          {activeSourceImages.length > 1 && (
+            <div
+              className="px-4 py-2.5 bg-slate-900/95 border-t border-slate-800 flex items-center gap-2 overflow-x-auto justify-start sm:justify-center shrink-0"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {activeSourceImages.map((imgItem, idx) => {
+                const active = idx === boardLightboxIndex;
+                return (
+                  <button
+                    key={idx}
+                    type="button"
+                    onClick={() => {
+                      setBoardLightboxZoom(1);
+                      setBoardLightboxRotate(0);
+                      setBoardLightboxIndex(idx);
+                    }}
+                    className={`relative w-12 h-14 rounded-lg overflow-hidden border-2 shrink-0 bg-white transition ${
+                      active
+                        ? 'border-indigo-500 ring-2 ring-indigo-400/60 scale-105'
+                        : 'border-slate-700 opacity-65 hover:opacity-100'
+                    }`}
+                  >
+                    <img src={imgItem.url} alt={imgItem.label} className="w-full h-full object-cover" />
+                    <span className="absolute bottom-0 inset-x-0 bg-slate-900/85 text-white text-[9px] font-bold text-center">
+                      {idx + 1}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
       )}
     </div>
   );
