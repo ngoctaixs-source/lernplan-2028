@@ -27,6 +27,33 @@ import {
 } from 'lucide-react';
 import { callGeminiApi } from '../lib/api';
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Chống lỗi 429 Rate Limit / timeout khi nạp liên tục nhiều trang PDF trên gói Groq miễn phí
+async function callApiWithRetry(action, payload, { maxRetries = 2, onWait = null } = {}) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await callGeminiApi(action, payload);
+    } catch (err) {
+      const msg = String(err?.message || '');
+      const isRetryable =
+        /429|rate.?limit|quota|too many|503|overloaded|timeout|network|fetch/i.test(msg);
+      if (!isRetryable || attempt >= maxRetries) {
+        throw err;
+      }
+      attempt += 1;
+      const waitSec = attempt === 1 ? 6 : 12;
+      if (onWait) {
+        onWait(`AI đang chạm nhịp giới hạn tốc độ, tự động thử lại lần ${attempt}/${maxRetries} sau ${waitSec} giây...`);
+      }
+      await sleep(waitSec * 1000);
+    }
+  }
+}
+
 const SAMPLE_GEMA = `GEMA & Urheberrecht bei VA (Stichpunkte Lehrer)
 
 1. UrhG: schützt geistige Schöpfungen (Musik, Texte, Fotos). Entsteht autom. mit Schöpfung -> keine Anmeldung nötig! Schutzfrist: 70 J. nach Tod d. Urhebers (§ 64 UrhG), danach gemeinfrei.
@@ -438,11 +465,15 @@ export default function ImportModal({
           chunk.map(async (pg) => {
             try {
               const rendered = await renderPdfPageToJpeg(pdfDoc, pg.pageNum, 1550, 0.82);
-              const ocrRes = await callGeminiApi('ocr_pdf_page', {
-                pageNum: pg.pageNum,
-                image: { base64: rendered.base64, mimeType: rendered.mimeType },
-                existingText: pg.text,
-              });
+              const ocrRes = await callApiWithRetry(
+                'ocr_pdf_page',
+                {
+                  pageNum: pg.pageNum,
+                  image: { base64: rendered.base64, mimeType: rendered.mimeType },
+                  existingText: pg.text,
+                },
+                { onWait: (m) => setStatusMsg(`Trang ${pg.pageNum}: ${m}`) }
+              );
               const ocrText = (ocrRes?.text || '').trim();
               if (ocrRes?.isEmpty && pg.charCount < 15) {
                 pg.isBlank = true;
@@ -473,17 +504,21 @@ export default function ImportModal({
 
       // Bước 3: Gửi TOÀN BỘ văn bản đã đọc sạch của mọi trang cho model 70B lọc rác & chia bài thông minh
       setStatusMsg(`AI đang tổng hợp & chia bài cho toàn bộ ${totalPages} trang...`);
-      const filterRes = await callGeminiApi('filter_pdf_pages', {
-        fileName: file.name,
-        targetSubjectName: selectedSubjectObj?.title_de || '',
-        pages: extractedPages.map((p) => ({
-          pageNum: p.pageNum,
-          charCount: p.charCount,
-          isBlank: p.isBlank,
-          textPreview: p.text.slice(0, 1500),
-        })),
-        existingSubjects: subjects,
-      });
+      const filterRes = await callApiWithRetry(
+        'filter_pdf_pages',
+        {
+          fileName: file.name,
+          targetSubjectName: selectedSubjectObj?.title_de || '',
+          pages: extractedPages.map((p) => ({
+            pageNum: p.pageNum,
+            charCount: p.charCount,
+            isBlank: p.isBlank,
+            textPreview: p.text.slice(0, 1500),
+          })),
+          existingSubjects: subjects,
+        },
+        { onWait: (m) => setStatusMsg(m) }
+      );
 
       const rawGroups = Array.isArray(filterRes?.groups) ? filterRes.groups : [];
       const rawSkipped = Array.isArray(filterRes?.skipped_pages) ? filterRes.skipped_pages : [];
@@ -643,10 +678,16 @@ export default function ImportModal({
       }
 
       try {
-        const pack = await callGeminiApi('generate_study_pack', {
-          lessonTitle: les.title_de || '',
-          sectionsText,
-        });
+        // Nhịp nghỉ ngắn 2.2s giữa Bước 1 và Bước 2 để tránh chạm giới hạn tốc độ theo phút của Groq
+        await sleep(2200);
+        const pack = await callApiWithRetry(
+          'generate_study_pack',
+          {
+            lessonTitle: les.title_de || '',
+            sectionsText,
+          },
+          { onWait: (m) => onStepLabel && onStepLabel(m) }
+        );
         if (Array.isArray(pack?.vocabularies) && pack.vocabularies.length > 0) {
           les.vocabularies = pack.vocabularies;
         }
@@ -742,15 +783,40 @@ export default function ImportModal({
           ),
         ].join('\n\n');
 
+        // Nhịp nghỉ ngắn giữa các cụm bài khi nạp nhiều cụm liên tiếp từ PDF dày
+        if (i > 0) {
+          setBatchProgress({
+            current: i + 1,
+            total: chosen.length,
+            label: `Nghỉ nhịp 2 giây chống quá tải trước khi nạp "${group.title_de}"...`,
+            doneCount: totalLessonsCreated,
+            failList: [...failList],
+          });
+          await sleep(2200);
+        }
+
         // GIAI ĐOẠN 1: Dồn 100% sức mạnh AI 70B để đọc, dịch, phân tích đề & giảng bài chi tiết như giáo viên
-        const aiResult = await callGeminiApi('import_onenote', {
-          rawText: combinedText,
-          images: fallbackImages,
-          existingSubjects: workingSubjects,
-          targetSubjectId: selectedSubjectId || null,
-          targetSubjectName: selectedSubjectObj?.title_de || '',
-          teachingOnly: true,
-        });
+        const aiResult = await callApiWithRetry(
+          'import_onenote',
+          {
+            rawText: combinedText,
+            images: fallbackImages,
+            existingSubjects: workingSubjects,
+            targetSubjectId: selectedSubjectId || null,
+            targetSubjectName: selectedSubjectObj?.title_de || '',
+            teachingOnly: true,
+          },
+          {
+            onWait: (m) =>
+              setBatchProgress({
+                current: i + 1,
+                total: chosen.length,
+                label: `${group.title_de}: ${m}`,
+                doneCount: totalLessonsCreated,
+                failList: [...failList],
+              }),
+          }
+        );
 
         if (selectedSubjectId && aiResult) {
           aiResult.existing_subject_id = selectedSubjectId;
@@ -849,14 +915,18 @@ export default function ImportModal({
       }
 
       setStatusMsg('Bước 1/2: Giáo viên AI đang trích đầy đủ kiến thức & đề bài gốc, dịch tiếng Việt, phân tích đề và giảng chi tiết từng bước...');
-      const aiResult = await callGeminiApi('import_onenote', {
-        rawText: finalRawText,
-        images: payloadImages,
-        existingSubjects: subjects,
-        targetSubjectId: selectedSubjectId || null,
-        targetSubjectName: selectedSubjectObj?.title_de || '',
-        teachingOnly: true,
-      });
+      const aiResult = await callApiWithRetry(
+        'import_onenote',
+        {
+          rawText: finalRawText,
+          images: payloadImages,
+          existingSubjects: subjects,
+          targetSubjectId: selectedSubjectId || null,
+          targetSubjectName: selectedSubjectObj?.title_de || '',
+          teachingOnly: true,
+        },
+        { onWait: (m) => setStatusMsg(m) }
+      );
 
       if (selectedSubjectId && aiResult) {
         aiResult.existing_subject_id = selectedSubjectId;
