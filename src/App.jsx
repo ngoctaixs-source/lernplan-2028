@@ -52,6 +52,7 @@ import {
   CornerDownRight,
   FileText,
   Tag,
+  ArrowUp,
 } from 'lucide-react';
 import { supabase, isSupabaseConfigured, ADMIN_EMAIL } from './lib/supabase';
 import { callGeminiApi } from './lib/api';
@@ -339,6 +340,20 @@ export default function App() {
   const [boardLightboxIndex, setBoardLightboxIndex] = useState(null); // null | number
   const [boardLightboxZoom, setBoardLightboxZoom] = useState(1);
   const [boardLightboxRotate, setBoardLightboxRotate] = useState(0);
+  const [boardDragOffsetY, setBoardDragOffsetY] = useState(0);
+  const [boardIsPanning, setBoardIsPanning] = useState(false);
+
+  // Trạng thái vuốt cạnh trái (iPhone) & nút Lên đầu trang mượt mà
+  const [edgeSwipeProgress, setEdgeSwipeProgress] = useState(0); // 0 -> 1
+  const [showScrollTop, setShowScrollTop] = useState(false);
+
+  const isPoppingHistoryRef = useRef(false);
+  const boardStageRef = useRef(null);
+  const boardWheelFlipRef = useRef(0);
+  const boardPanRef = useRef({ active: false, moved: false, startX: 0, startY: 0, scrollLeft: 0, scrollTop: 0 });
+  const boardTouchRef = useRef({ mode: null, startX: 0, startY: 0, startDist: 0, startZoom: 1, moved: false });
+  const edgeSwipeRef = useRef({ active: false, startX: 0, startY: 0, triggered: false });
+  const drawerTouchRef = useRef({ active: false, startX: 0, startY: 0 });
   const [openExplainIds, setOpenExplainIds] = useState({});
   const [loadingExplainId, setLoadingExplainId] = useState(null);
   const [editingSectionId, setEditingSectionId] = useState(null);
@@ -375,17 +390,246 @@ export default function App() {
     }, 4500);
   };
 
-  // Cmd+K shortcut for Global Search
+  // ==================== LỊCH SỬ DUYỆT TRANG NATIVE (VUỐT 2 NGÓN MACBOOK BACK / FORWARD + IPHONE) ====================
+  const pushAppHistory = (nextState) => {
+    if (typeof window === 'undefined' || isPoppingHistoryRef.current) return;
+    const cur = window.history.state;
+    const payload = {
+      lpNav: true,
+      view: nextState.view ?? view,
+      activeLessonId: nextState.activeLessonId !== undefined ? nextState.activeLessonId : activeLessonId,
+      lessonTab: nextState.lessonTab ?? lessonTab,
+      overlay: nextState.overlay ?? null,
+    };
+    if (
+      cur?.lpNav &&
+      cur.view === payload.view &&
+      cur.activeLessonId === payload.activeLessonId &&
+      cur.lessonTab === payload.lessonTab &&
+      cur.overlay === payload.overlay
+    ) {
+      return;
+    }
+    try {
+      window.history.pushState(payload, '');
+    } catch {
+      // ignore sandbox history limits
+    }
+  };
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+    if (!window.history.state?.lpNav) {
+      try {
+        window.history.replaceState(
+          { lpNav: true, view: 'home', activeLessonId: null, lessonTab: 'study', overlay: null },
+          ''
+        );
+      } catch {
+        // ignore
+      }
+    }
+
+    const onPopState = (e) => {
+      const st = e.state;
+      if (!st?.lpNav) return;
+      isPoppingHistoryRef.current = true;
+
+      setView(st.view || 'home');
+      setActiveLessonId(st.activeLessonId || null);
+      setLessonTab(st.lessonTab || 'study');
+
+      const ov = st.overlay || null;
+      setBoardLightboxIndex((prev) => (ov === 'lightbox' ? (prev ?? 0) : null));
+      setShowImportModal(ov === 'import');
+      setShowUpgradeLessonModal(ov === 'upgrade');
+      setShowSearchModal(ov === 'search');
+      setShowAuthModal(ov === 'auth');
+      setMobileMenuOpen(ov === 'menu');
+
+      setWordLookup(null);
+      setLessonSelectionPopup(null);
+      setBoardDragOffsetY(0);
+
+      setTimeout(() => {
+        isPoppingHistoryRef.current = false;
+      }, 0);
+    };
+
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  const openOverlay = (overlayName, openerFn) => {
+    openerFn();
+    pushAppHistory({ overlay: overlayName });
+  };
+
+  const closeOverlay = (overlayName, closerFn) => {
+    closerFn();
+    if (typeof window !== 'undefined' && window.history.state?.lpNav && window.history.state?.overlay === overlayName) {
+      window.history.back();
+    }
+  };
+
+  const openBoardLightbox = (idx) => {
+    setBoardLightboxZoom(1);
+    setBoardLightboxRotate(0);
+    setBoardDragOffsetY(0);
+    openOverlay('lightbox', () => setBoardLightboxIndex(idx));
+  };
+
+  const closeBoardLightbox = () => {
+    setBoardDragOffsetY(0);
+    closeOverlay('lightbox', () => setBoardLightboxIndex(null));
+  };
+
+  const goBackSmart = () => {
+    if (boardLightboxIndex !== null) {
+      closeBoardLightbox();
+      return;
+    }
+    if (wordLookup) {
+      setWordLookup(null);
+      return;
+    }
+    if (mobileMenuOpen) {
+      closeOverlay('menu', () => setMobileMenuOpen(false));
+      return;
+    }
+    if (showSearchModal) {
+      closeOverlay('search', () => setShowSearchModal(false));
+      return;
+    }
+    if (showAuthModal) {
+      closeOverlay('auth', () => setShowAuthModal(false));
+      return;
+    }
+    if (typeof window !== 'undefined' && window.history.state?.lpNav && window.history.length > 1) {
+      window.history.back();
+      return;
+    }
+    if (view === 'lesson') {
+      navigate('subjects');
+    } else if (view !== 'home') {
+      navigate('home');
+    }
+  };
+
+  // Phím tắt toàn cục: Cmd+K tìm nhanh, Esc thông minh đóng lớp trên cùng
   useEffect(() => {
     const onKey = (e) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
-        setShowSearchModal((s) => !s);
+        if (showSearchModal) {
+          closeOverlay('search', () => setShowSearchModal(false));
+        } else {
+          openOverlay('search', () => setShowSearchModal(true));
+        }
+        return;
+      }
+      if (e.key === 'Escape') {
+        if (boardLightboxIndex !== null) return; // Lightbox tự xử lý Esc
+        if (showImportModal || showUpgradeLessonModal) return; // Modal tự xử lý Esc
+        if (wordLookup) {
+          e.preventDefault();
+          setWordLookup(null);
+        } else if (mobileMenuOpen) {
+          e.preventDefault();
+          closeOverlay('menu', () => setMobileMenuOpen(false));
+        } else if (showSearchModal) {
+          e.preventDefault();
+          closeOverlay('search', () => setShowSearchModal(false));
+        } else if (showAuthModal) {
+          e.preventDefault();
+          closeOverlay('auth', () => setShowAuthModal(false));
+        }
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
+  }, [boardLightboxIndex, wordLookup, mobileMenuOpen, showSearchModal, showAuthModal, showImportModal, showUpgradeLessonModal]);
+
+  // Bấm vào khoảng trống bên ngoài bảng Tra từ điển (WordPopover) -> tự đóng gọn
+  useEffect(() => {
+    if (!wordLookup) return undefined;
+    const onOutsideDown = (e) => {
+      const target = e.target;
+      if (!target || typeof target.closest !== 'function') return;
+      if (target.closest('.word-popover-wrap, [data-word-token="true"]')) return;
+      // Nếu người dùng bấm vào một từ tiếng Đức khác (role=button có title dịch từ) thì không đóng trước
+      if (target.closest('[title^="Bấm để dịch từ"]')) return;
+      setWordLookup(null);
+    };
+    document.addEventListener('mousedown', onOutsideDown);
+    return () => document.removeEventListener('mousedown', onOutsideDown);
+  }, [wordLookup]);
+
+  // Hiện nút "Lên đầu trang" khi cuộn sâu xuống dưới
+  useEffect(() => {
+    const onScroll = () => {
+      setShowScrollTop(window.scrollY > 420);
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
   }, []);
+
+  // Cử chỉ vuốt từ cạnh trái màn hình cảm ứng (iPhone/iPad) để Quay lại trang trước hoặc Mở menu
+  useEffect(() => {
+    const onTouchStart = (e) => {
+      if (e.touches.length !== 1) return;
+      if (boardLightboxIndex !== null || showImportModal || showUpgradeLessonModal || showSearchModal || showAuthModal) {
+        return;
+      }
+      const t = e.touches[0];
+      if (t.clientX <= 34) {
+        edgeSwipeRef.current = { active: true, startX: t.clientX, startY: t.clientY, triggered: false };
+      } else {
+        edgeSwipeRef.current = { active: false, startX: 0, startY: 0, triggered: false };
+      }
+    };
+    const onTouchMove = (e) => {
+      const st = edgeSwipeRef.current;
+      if (!st.active || e.touches.length !== 1) return;
+      const t = e.touches[0];
+      const dx = t.clientX - st.startX;
+      const dy = Math.abs(t.clientY - st.startY);
+      if (dy > 48 && dx < 40) {
+        st.active = false;
+        setEdgeSwipeProgress(0);
+        return;
+      }
+      if (dx > 12 && dx > dy * 1.35) {
+        setEdgeSwipeProgress(Math.min(1, dx / 92));
+      }
+    };
+    const onTouchEnd = (e) => {
+      const st = edgeSwipeRef.current;
+      if (!st.active) return;
+      const t = e.changedTouches?.[0];
+      const dx = t ? t.clientX - st.startX : 0;
+      const dy = t ? Math.abs(t.clientY - st.startY) : 999;
+      edgeSwipeRef.current = { active: false, startX: 0, startY: 0, triggered: false };
+      setEdgeSwipeProgress(0);
+
+      if (dx > 68 && dx > dy * 1.45) {
+        if (view === 'home' && !mobileMenuOpen) {
+          openOverlay('menu', () => setMobileMenuOpen(true));
+        } else if (view !== 'home') {
+          goBackSmart();
+        }
+      }
+    };
+
+    window.addEventListener('touchstart', onTouchStart, { passive: true });
+    window.addEventListener('touchmove', onTouchMove, { passive: true });
+    window.addEventListener('touchend', onTouchEnd, { passive: true });
+    return () => {
+      window.removeEventListener('touchstart', onTouchStart);
+      window.removeEventListener('touchmove', onTouchMove);
+      window.removeEventListener('touchend', onTouchEnd);
+    };
+  }, [view, mobileMenuOpen, boardLightboxIndex, showImportModal, showUpgradeLessonModal, showSearchModal, showAuthModal]);
 
   // Tô đen bất kỳ đoạn chữ nào trong phần bài học -> hiện nút nổi "↳ Hỏi Gia sư AI" giống Gemini
   useEffect(() => {
@@ -688,13 +932,13 @@ export default function App() {
     [lessons, lessonSourceFilesMap]
   );
 
-  // Phím tắt Esc / Mũi tên / +/- cho Lightbox xem ảnh bảng gốc toàn màn hình
+  // Phím tắt Esc / Mũi tên / +/- / 0 / R cho Lightbox xem ảnh bản gốc toàn màn hình
   useEffect(() => {
     if (boardLightboxIndex === null) return undefined;
     const onKey = (e) => {
       if (e.key === 'Escape') {
         e.preventDefault();
-        setBoardLightboxIndex(null);
+        closeBoardLightbox();
       } else if (e.key === 'ArrowLeft' && boardLightboxIndex > 0) {
         e.preventDefault();
         setBoardLightboxZoom(1);
@@ -706,14 +950,63 @@ export default function App() {
         setBoardLightboxRotate(0);
         setBoardLightboxIndex((idx) => (idx !== null && idx < activeSourceImages.length - 1 ? idx + 1 : idx));
       } else if (e.key === '+' || e.key === '=') {
-        setBoardLightboxZoom((z) => Math.min(3, Number((z + 0.4).toFixed(2))));
+        setBoardLightboxZoom((z) => Math.min(3.5, Number((z + 0.4).toFixed(2))));
       } else if (e.key === '-') {
         setBoardLightboxZoom((z) => Math.max(1, Number((z - 0.4).toFixed(2))));
+      } else if (e.key === '0') {
+        setBoardLightboxZoom(1);
+        setBoardLightboxRotate(0);
+      } else if (e.key === 'r' || e.key === 'R') {
+        setBoardLightboxRotate((r) => (r + 90) % 360);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [boardLightboxIndex, activeSourceImages.length]);
+
+  // MacBook Trackpad Pinch-to-Zoom (ctrl+wheel) & Vuốt ngang 2 ngón lật trang trong Lightbox xem ảnh gốc
+  useEffect(() => {
+    const el = boardStageRef.current;
+    if (!el || boardLightboxIndex === null) return undefined;
+
+    const onWheel = (e) => {
+      // 1. Chụm / banh 2 ngón trên Trackpad MacBook -> phóng to / thu nhỏ mượt
+      if (e.ctrlKey) {
+        e.preventDefault();
+        const delta = -e.deltaY * 0.012;
+        setBoardLightboxZoom((z) => Math.min(3.5, Math.max(1, Number((z + delta).toFixed(2)))));
+        return;
+      }
+
+      // 2. Khi ảnh đang vừa khung (zoom = 1): vuốt ngang 2 ngón lật trang trước/sau
+      // (Ở Trang 1 nếu vuốt phải thì KHÔNG chặn để macOS Back tự động đóng Lightbox!)
+      if (boardLightboxZoom <= 1.02 && Math.abs(e.deltaX) > Math.abs(e.deltaY) * 1.4 && Math.abs(e.deltaX) > 26) {
+        const now = Date.now();
+        const goingNext = e.deltaX > 0;
+        const goingPrev = e.deltaX < 0;
+        if (goingNext && boardLightboxIndex < activeSourceImages.length - 1) {
+          e.preventDefault();
+          if (now - boardWheelFlipRef.current > 360) {
+            boardWheelFlipRef.current = now;
+            setBoardLightboxZoom(1);
+            setBoardLightboxRotate(0);
+            setBoardLightboxIndex((idx) => Math.min(activeSourceImages.length - 1, idx + 1));
+          }
+        } else if (goingPrev && boardLightboxIndex > 0) {
+          e.preventDefault();
+          if (now - boardWheelFlipRef.current > 360) {
+            boardWheelFlipRef.current = now;
+            setBoardLightboxZoom(1);
+            setBoardLightboxRotate(0);
+            setBoardLightboxIndex((idx) => Math.max(0, idx - 1));
+          }
+        }
+      }
+    };
+
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [boardLightboxIndex, boardLightboxZoom, activeSourceImages.length]);
   const activeSections = useMemo(
     () => sections.filter((s) => s.lesson_id === activeLessonId).sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0)),
     [sections, activeLessonId]
@@ -2046,12 +2339,21 @@ ${item.text}`
     setEditingSectionId(null);
     setView('lesson');
     setMobileMenuOpen(false);
+    pushAppHistory({ view: 'lesson', activeLessonId: lessonId, lessonTab: tab, overlay: null });
     window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const switchLessonTab = (tabId) => {
+    if (tabId === lessonTab) return;
+    setLessonTab(tabId);
+    pushAppHistory({ view: 'lesson', activeLessonId, lessonTab: tabId, overlay: null });
   };
 
   const navigate = (targetView) => {
     setView(targetView);
     setMobileMenuOpen(false);
+    setBoardLightboxIndex(null);
+    pushAppHistory({ view: targetView, activeLessonId: targetView === 'lesson' ? activeLessonId : null, lessonTab, overlay: null });
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
@@ -2060,9 +2362,9 @@ ${item.text}`
     const targetId = typeof preselectedSubjectId === 'string' ? preselectedSubjectId : '';
     if (isAdmin) {
       setImportDefaultSubjectId(targetId);
-      setShowImportModal(true);
+      openOverlay('import', () => setShowImportModal(true));
     } else {
-      setShowAuthModal(true);
+      openOverlay('auth', () => setShowAuthModal(true));
       showToast(`Đăng nhập tài khoản Admin (${ADMIN_EMAIL}) để thêm kiến thức mới.`, 'error');
     }
   };
@@ -2163,7 +2465,7 @@ ${item.text}`
     <div className="min-h-screen flex bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
       {/* Toast */}
       {toast && (
-        <div className="fixed bottom-5 right-5 z-50 max-w-sm">
+        <div className="fixed bottom-20 right-5 z-50 max-w-sm">
           <div
             className={`px-4 py-3 rounded-2xl shadow-xl border text-xs font-semibold flex items-center gap-2.5 ${
               toast.type === 'error'
@@ -2279,7 +2581,7 @@ ${item.text}`
             </div>
           ) : (
             <button
-              onClick={() => setShowAuthModal(true)}
+              onClick={() => openOverlay('auth', () => setShowAuthModal(true))}
               className="w-full py-2 px-3 bg-slate-900 dark:bg-slate-800 hover:bg-slate-800 text-white text-xs font-bold rounded-xl flex items-center justify-center gap-2"
             >
               <LogIn className="w-3.5 h-3.5" /> Đăng nhập Admin
@@ -2291,8 +2593,30 @@ ${item.text}`
       {/* ==================== MOBILE SLIDE-OUT MENU DRAWER ==================== */}
       {mobileMenuOpen && (
         <div className="fixed inset-0 z-50 lg:hidden flex">
-          <div className="fixed inset-0 bg-slate-950/60 backdrop-blur-sm" onClick={() => setMobileMenuOpen(false)} />
-          <div className="relative w-72 max-w-[85vw] bg-white dark:bg-slate-900 h-full shadow-2xl flex flex-col z-10">
+          <div
+            className="fixed inset-0 bg-slate-950/60 backdrop-blur-sm cursor-pointer"
+            onClick={() => closeOverlay('menu', () => setMobileMenuOpen(false))}
+          />
+          <div
+            onTouchStart={(e) => {
+              if (e.touches.length === 1) {
+                drawerTouchRef.current = { active: true, startX: e.touches[0].clientX, startY: e.touches[0].clientY };
+              }
+            }}
+            onTouchEnd={(e) => {
+              if (!drawerTouchRef.current.active) return;
+              const t = e.changedTouches?.[0];
+              if (t) {
+                const dx = t.clientX - drawerTouchRef.current.startX;
+                const dy = Math.abs(t.clientY - drawerTouchRef.current.startY);
+                if (dx < -55 && Math.abs(dx) > dy * 1.4) {
+                  closeOverlay('menu', () => setMobileMenuOpen(false));
+                }
+              }
+              drawerTouchRef.current = { active: false, startX: 0, startY: 0 };
+            }}
+            className="relative w-72 max-w-[85vw] bg-white dark:bg-slate-900 h-full shadow-2xl flex flex-col z-10"
+          >
             <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
               <div className="flex items-center gap-2.5">
                 <div className="w-9 h-9 rounded-xl bg-indigo-600 text-white font-black text-sm flex items-center justify-center">
@@ -2300,7 +2624,7 @@ ${item.text}`
                 </div>
                 <span className="font-extrabold text-sm text-slate-900 dark:text-white">Menu LernPlan 2028</span>
               </div>
-              <button onClick={() => setMobileMenuOpen(false)} className="p-2 text-slate-500">
+              <button onClick={() => closeOverlay('menu', () => setMobileMenuOpen(false))} className="p-2 text-slate-500">
                 <X className="w-5 h-5" />
               </button>
             </div>
@@ -2371,7 +2695,7 @@ ${item.text}`
         <header className="sticky top-0 z-30 bg-white/95 dark:bg-slate-900/95 backdrop-blur border-b border-slate-200 dark:border-slate-800 h-16 px-4 sm:px-6 flex items-center justify-between gap-2">
           <div className="flex items-center gap-2.5 min-w-0">
             <button
-              onClick={() => setMobileMenuOpen(true)}
+              onClick={() => openOverlay('menu', () => setMobileMenuOpen(true))}
               className="lg:hidden p-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200"
               aria-label="Mở menu"
             >
@@ -2379,7 +2703,7 @@ ${item.text}`
             </button>
 
             <button
-              onClick={() => setShowSearchModal(true)}
+              onClick={() => openOverlay('search', () => setShowSearchModal(true))}
               className="flex items-center gap-2 px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-500 dark:text-slate-400 text-xs font-medium transition max-w-xs"
             >
               <Search className="w-3.5 h-3.5 shrink-0" />
@@ -2418,7 +2742,7 @@ ${item.text}`
 
             {!user && (
               <button
-                onClick={() => setShowAuthModal(true)}
+                onClick={() => openOverlay('auth', () => setShowAuthModal(true))}
                 className="lg:hidden px-3 py-1.5 rounded-xl bg-slate-900 dark:bg-indigo-600 text-white text-xs font-bold"
               >
                 Đăng nhập
@@ -2555,7 +2879,7 @@ ${item.text}`
                     Đăng nhập quyền Admin để tạo bộ môn chuẩn, đổi tên môn, gộp môn hoặc sắp xếp lại bài học.
                   </span>
                   <button
-                    onClick={() => setShowAuthModal(true)}
+                    onClick={() => openOverlay('auth', () => setShowAuthModal(true))}
                     className="px-3 py-1.5 bg-indigo-600 text-white font-bold rounded-lg shrink-0"
                   >
                     Đăng nhập Admin
@@ -3236,7 +3560,7 @@ ${item.text}`
                   {isAdmin && (
                     <button
                       type="button"
-                      onClick={() => setShowUpgradeLessonModal(true)}
+                      onClick={() => openOverlay('upgrade', () => setShowUpgradeLessonModal(true))}
                       title="Nâng cấp bài học này theo chuẩn AI mới nhất hoặc bổ sung thêm trang tài liệu mới mà không cần xóa bài cũ"
                       className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/60 hover:bg-emerald-100 dark:hover:bg-emerald-900/60 px-3 py-2 rounded-xl border border-emerald-200 dark:border-emerald-800 transition"
                     >
@@ -3274,11 +3598,7 @@ ${item.text}`
                     </div>
                     <button
                       type="button"
-                      onClick={() => {
-                        setBoardLightboxZoom(1);
-                        setBoardLightboxRotate(0);
-                        setBoardLightboxIndex(0);
-                      }}
+                      onClick={() => openBoardLightbox(0)}
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold shadow-sm"
                     >
                       <Maximize2 className="w-3.5 h-3.5" /> Phóng to toàn màn hình
@@ -3288,11 +3608,7 @@ ${item.text}`
                   {activeSourceImages.length === 1 ? (
                     <button
                       type="button"
-                      onClick={() => {
-                        setBoardLightboxZoom(1);
-                        setBoardLightboxRotate(0);
-                        setBoardLightboxIndex(0);
-                      }}
+                      onClick={() => openBoardLightbox(0)}
                       className="group relative block w-full rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 cursor-zoom-in"
                       title="Bấm để phóng to toàn màn hình"
                     >
@@ -3311,11 +3627,7 @@ ${item.text}`
                         <button
                           key={idx}
                           type="button"
-                          onClick={() => {
-                            setBoardLightboxZoom(1);
-                            setBoardLightboxRotate(0);
-                            setBoardLightboxIndex(idx);
-                          }}
+                          onClick={() => openBoardLightbox(idx)}
                           className="group relative rounded-xl overflow-hidden border-2 border-slate-200 dark:border-slate-700 hover:border-indigo-500 bg-white dark:bg-slate-800 transition text-left cursor-zoom-in shadow-sm"
                           title={`Bấm để phóng to ${imgItem.label}`}
                         >
@@ -3468,7 +3780,7 @@ ${item.text}`
                   ].map((t) => (
                     <button
                       key={t.id}
-                      onClick={() => setLessonTab(t.id)}
+                      onClick={() => switchLessonTab(t.id)}
                       className={`py-3 px-3 rounded-2xl text-center border transition ${
                         lessonTab === t.id
                           ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm'
@@ -4302,18 +4614,48 @@ ${item.text}`
         </button>
       )}
 
+      {/* IPHONE EDGE-SWIPE BACK INDICATOR (Huy hiệu mũi tên trượt mượt từ cạnh trái) */}
+      {edgeSwipeProgress > 0.05 && (
+        <div
+          style={{
+            transform: `translate3d(${Math.round(edgeSwipeProgress * 44) - 44}px, -50%, 0) scale(${0.85 + edgeSwipeProgress * 0.2})`,
+            opacity: Math.min(1, edgeSwipeProgress * 1.4),
+          }}
+          className="fixed left-3 top-1/2 z-[90] w-11 h-11 rounded-full bg-slate-900/85 dark:bg-indigo-600/90 text-white shadow-2xl backdrop-blur flex items-center justify-center pointer-events-none border border-white/15"
+        >
+          <ArrowLeft className="w-5 h-5" />
+        </div>
+      )}
+
+      {/* NÚT NỔI LÊN ĐẦU TRANG MƯỢT MÀ */}
+      {showScrollTop && boardLightboxIndex === null && (
+        <button
+          type="button"
+          onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
+          title="Cuộn lên đầu trang"
+          className="fixed bottom-5 right-5 z-40 w-11 h-11 rounded-full bg-white/95 dark:bg-slate-800/95 hover:bg-indigo-600 hover:text-white text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 shadow-lg backdrop-blur flex items-center justify-center transition-all hover:scale-105 active:scale-95"
+        >
+          <ArrowUp className="w-4 h-4" />
+        </button>
+      )}
+
       {/* GLOBAL MODALS & DICTIONARY POPOVER */}
-      <WordPopover
-        lookupState={wordLookup}
-        ttsRate={ttsRate}
-        isAdmin={isAdmin}
-        canSaveToLesson={view === 'lesson' && Boolean(activeLesson)}
-        onClose={() => setWordLookup(null)}
-        onSaveToVocab={handleSavePopoverWordToLessonVocab}
-      />
+      <div className="word-popover-wrap">
+        <WordPopover
+          lookupState={wordLookup}
+          ttsRate={ttsRate}
+          isAdmin={isAdmin}
+          canSaveToLesson={view === 'lesson' && Boolean(activeLesson)}
+          onClose={() => setWordLookup(null)}
+          onSaveToVocab={handleSavePopoverWordToLessonVocab}
+        />
+      </div>
 
       {showAuthModal && (
-        <AuthModal onClose={() => setShowAuthModal(false)} onSuccess={() => showToast('Đăng nhập thành công!')} />
+        <AuthModal
+          onClose={() => closeOverlay('auth', () => setShowAuthModal(false))}
+          onSuccess={() => showToast('Đăng nhập thành công!')}
+        />
       )}
 
       {showImportModal && (
@@ -4323,10 +4665,12 @@ ${item.text}`
           defaultSubjectId={importDefaultSubjectId}
           onCreateSubject={handleCreateSubject}
           onOpenExistingLesson={(lessonId) => openLesson(lessonId)}
-          onClose={() => {
-            setShowImportModal(false);
-            setImportDefaultSubjectId('');
-          }}
+          onClose={() =>
+            closeOverlay('import', () => {
+              setShowImportModal(false);
+              setImportDefaultSubjectId('');
+            })
+          }
           onSaveImportedData={handleSaveImportedData}
           onBatchComplete={handleBatchImportComplete}
         />
@@ -4342,7 +4686,7 @@ ${item.text}`
           vocabCount={activeVocabs.length}
           cardCount={activeCards.length}
           quizCount={activeQuiz.length}
-          onClose={() => setShowUpgradeLessonModal(false)}
+          onClose={() => closeOverlay('upgrade', () => setShowUpgradeLessonModal(false))}
           onApplyUpgrade={handleApplyLessonUpgrade}
         />
       )}
@@ -4354,17 +4698,17 @@ ${item.text}`
           sections={sections}
           vocabularies={vocabularies}
           flashcards={flashcards}
-          onClose={() => setShowSearchModal(false)}
+          onClose={() => closeOverlay('search', () => setShowSearchModal(false))}
           onOpenLesson={openLesson}
           onGoToVocab={() => navigate('vocab')}
         />
       )}
 
-      {/* ==================== FULLSCREEN ZOOMABLE LIGHTBOX CHO ẢNH BẢN GỐC ==================== */}
+      {/* ==================== FULLSCREEN ZOOMABLE LIGHTBOX CHO ẢNH BẢN GỐC (VUỐT CHẠM + CHỤM PHÓNG TO + NHẤN KHOẢNG TRỐNG ĐÓNG) ==================== */}
       {boardLightboxIndex !== null && activeSourceImages[boardLightboxIndex] && (
         <div
           className="fixed inset-0 z-[70] bg-slate-950/92 backdrop-blur-md flex flex-col"
-          onClick={() => setBoardLightboxIndex(null)}
+          onClick={closeBoardLightbox}
         >
           {/* Top Controls Bar */}
           <div
@@ -4392,16 +4736,16 @@ ${item.text}`
               </button>
               <button
                 type="button"
-                onClick={() => setBoardLightboxZoom((z) => (z === 1 ? 1.8 : 1))}
+                onClick={() => setBoardLightboxZoom((z) => (z === 1 ? 1.85 : 1))}
                 className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[11px] font-bold min-w-[64px]"
-                title="Chuyển nhanh Vừa màn / Phóng to 180%"
+                title="Chuyển nhanh Vừa màn / Phóng to 185% (phím 0 để đặt lại)"
               >
                 {boardLightboxZoom === 1 ? 'Vừa khung' : `${Math.round(boardLightboxZoom * 100)}%`}
               </button>
               <button
                 type="button"
-                onClick={() => setBoardLightboxZoom((z) => Math.min(3, Number((z + 0.4).toFixed(2))))}
-                disabled={boardLightboxZoom >= 3}
+                onClick={() => setBoardLightboxZoom((z) => Math.min(3.5, Number((z + 0.4).toFixed(2))))}
+                disabled={boardLightboxZoom >= 3.5}
                 className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40"
                 title="Phóng to (+)"
               >
@@ -4411,22 +4755,22 @@ ${item.text}`
                 type="button"
                 onClick={() => setBoardLightboxRotate((r) => (r + 90) % 360)}
                 className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700"
-                title="Xoay ảnh 90°"
+                title="Xoay ảnh 90° (phím R)"
               >
                 <RotateCw className="w-4 h-4" />
               </button>
               <button
                 type="button"
-                onClick={() => setBoardLightboxIndex(null)}
+                onClick={closeBoardLightbox}
                 className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-600 text-white ml-1"
-                title="Đóng (Esc)"
+                title="Đóng (Esc hoặc nhấn khoảng trống)"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
           </div>
 
-          {/* Main Zoomable Stage */}
+          {/* Main Zoomable & Gesture-Ready Stage */}
           <div className="flex-1 relative overflow-hidden flex items-center justify-center">
             {boardLightboxIndex > 0 && (
               <button
@@ -4461,23 +4805,172 @@ ${item.text}`
             )}
 
             <div
-              className="w-full h-full overflow-auto p-4 sm:p-8 flex items-start justify-center"
-              onClick={(e) => e.stopPropagation()}
+              ref={boardStageRef}
+              onClick={(e) => {
+                if (boardPanRef.current.moved) {
+                  boardPanRef.current.moved = false;
+                  e.stopPropagation();
+                  return;
+                }
+                // Nhấn bất kỳ khoảng trống tối nào xung quanh ảnh -> đóng ngay lập tức!
+                if (e.target === e.currentTarget) {
+                  e.stopPropagation();
+                  closeBoardLightbox();
+                }
+              }}
+              onMouseDown={(e) => {
+                if (boardLightboxZoom <= 1.02 || e.button !== 0) return;
+                const box = boardStageRef.current;
+                if (!box) return;
+                boardPanRef.current = {
+                  active: true,
+                  moved: false,
+                  startX: e.clientX,
+                  startY: e.clientY,
+                  scrollLeft: box.scrollLeft,
+                  scrollTop: box.scrollTop,
+                };
+                setBoardIsPanning(true);
+              }}
+              onMouseMove={(e) => {
+                if (!boardPanRef.current.active) return;
+                const box = boardStageRef.current;
+                if (!box) return;
+                const dx = e.clientX - boardPanRef.current.startX;
+                const dy = e.clientY - boardPanRef.current.startY;
+                if (Math.abs(dx) > 4 || Math.abs(dy) > 4) {
+                  boardPanRef.current.moved = true;
+                }
+                box.scrollLeft = boardPanRef.current.scrollLeft - dx;
+                box.scrollTop = boardPanRef.current.scrollTop - dy;
+              }}
+              onMouseUp={() => {
+                if (boardPanRef.current.active) {
+                  boardPanRef.current.active = false;
+                  setBoardIsPanning(false);
+                }
+              }}
+              onMouseLeave={() => {
+                if (boardPanRef.current.active) {
+                  boardPanRef.current.active = false;
+                  setBoardIsPanning(false);
+                }
+              }}
+              onTouchStart={(e) => {
+                if (e.touches.length === 2) {
+                  const d = Math.hypot(
+                    e.touches[0].clientX - e.touches[1].clientX,
+                    e.touches[0].clientY - e.touches[1].clientY
+                  );
+                  boardTouchRef.current = { mode: 'pinch', startDist: d, startZoom: boardLightboxZoom, moved: true };
+                } else if (e.touches.length === 1 && boardLightboxZoom <= 1.02) {
+                  boardTouchRef.current = {
+                    mode: 'swipe',
+                    startX: e.touches[0].clientX,
+                    startY: e.touches[0].clientY,
+                    moved: false,
+                  };
+                } else {
+                  boardTouchRef.current = { mode: null, moved: false };
+                }
+              }}
+              onTouchMove={(e) => {
+                const t = boardTouchRef.current;
+                if (t.mode === 'pinch' && e.touches.length === 2 && t.startDist > 10) {
+                  const d = Math.hypot(
+                    e.touches[0].clientX - e.touches[1].clientX,
+                    e.touches[0].clientY - e.touches[1].clientY
+                  );
+                  const nextZ = Math.min(3.5, Math.max(1, Number((t.startZoom * (d / t.startDist)).toFixed(2))));
+                  setBoardLightboxZoom(nextZ);
+                } else if (t.mode === 'swipe' && e.touches.length === 1 && boardLightboxZoom <= 1.02) {
+                  const dx = e.touches[0].clientX - t.startX;
+                  const dy = e.touches[0].clientY - t.startY;
+                  if (dy > 16 && dy > Math.abs(dx) * 1.3) {
+                    t.moved = true;
+                    setBoardDragOffsetY(Math.min(180, dy));
+                  } else if (Math.abs(dx) > 16) {
+                    t.moved = true;
+                  }
+                }
+              }}
+              onTouchEnd={(e) => {
+                const t = boardTouchRef.current;
+                if (t.mode === 'swipe' && boardLightboxZoom <= 1.02) {
+                  const touch = e.changedTouches?.[0];
+                  if (touch) {
+                    const dx = touch.clientX - t.startX;
+                    const dy = touch.clientY - t.startY;
+                    // Vuốt xuống -> đóng ảnh kiểu iOS Photos
+                    if (dy > 85 && dy > Math.abs(dx) * 1.35) {
+                      setBoardDragOffsetY(0);
+                      closeBoardLightbox();
+                      boardTouchRef.current = { mode: null, moved: false };
+                      return;
+                    }
+                    // Vuốt trái/phải -> đổi trang ảnh
+                    if (Math.abs(dx) > 55 && Math.abs(dx) > Math.abs(dy) * 1.35) {
+                      if (dx < 0 && boardLightboxIndex < activeSourceImages.length - 1) {
+                        setBoardLightboxZoom(1);
+                        setBoardLightboxRotate(0);
+                        setBoardLightboxIndex((idx) => Math.min(activeSourceImages.length - 1, idx + 1));
+                      } else if (dx > 0 && boardLightboxIndex > 0) {
+                        setBoardLightboxZoom(1);
+                        setBoardLightboxRotate(0);
+                        setBoardLightboxIndex((idx) => Math.max(0, idx - 1));
+                      }
+                    }
+                  }
+                }
+                setBoardDragOffsetY(0);
+                boardTouchRef.current = { mode: null, moved: false };
+              }}
+              className={`w-full h-full overflow-auto p-4 sm:p-8 flex items-start justify-center ${
+                boardLightboxZoom > 1.02
+                  ? boardIsPanning
+                    ? 'cursor-grabbing'
+                    : 'cursor-grab'
+                  : 'cursor-pointer'
+              }`}
             >
-              <img
-                src={activeSourceImages[boardLightboxIndex].url}
-                alt={activeSourceImages[boardLightboxIndex].label}
-                onClick={() => setBoardLightboxZoom((z) => (z === 1 ? 1.8 : 1))}
+              <div
+                className="relative my-auto flex flex-col items-center pointer-events-none"
                 style={{
-                  width: boardLightboxZoom === 1 ? 'auto' : `${Math.round(boardLightboxZoom * 100)}%`,
-                  maxWidth: boardLightboxZoom === 1 ? '100%' : 'none',
-                  maxHeight: boardLightboxZoom === 1 ? '76vh' : 'none',
-                  transform: boardLightboxRotate ? `rotate(${boardLightboxRotate}deg)` : undefined,
+                  transform: boardDragOffsetY ? `translateY(${boardDragOffsetY}px)` : undefined,
+                  opacity: boardDragOffsetY ? Math.max(0.35, 1 - boardDragOffsetY / 260) : 1,
+                  transition: boardDragOffsetY ? 'none' : 'transform 0.2s ease, opacity 0.2s ease',
                 }}
-                className={`my-auto rounded-xl bg-white shadow-2xl transition-all select-none ${
-                  boardLightboxZoom === 1 ? 'cursor-zoom-in object-contain' : 'cursor-zoom-out'
-                }`}
-              />
+              >
+                <img
+                  src={activeSourceImages[boardLightboxIndex].url}
+                  alt={activeSourceImages[boardLightboxIndex].label}
+                  draggable={false}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (boardPanRef.current.moved) {
+                      boardPanRef.current.moved = false;
+                      return;
+                    }
+                    setBoardLightboxZoom((z) => (z === 1 ? 1.85 : 1));
+                  }}
+                  style={{
+                    width: boardLightboxZoom === 1 ? 'auto' : `${Math.round(boardLightboxZoom * 100)}%`,
+                    maxWidth: boardLightboxZoom === 1 ? '100%' : 'none',
+                    maxHeight: boardLightboxZoom === 1 ? '75vh' : 'none',
+                    transform: boardLightboxRotate ? `rotate(${boardLightboxRotate}deg)` : undefined,
+                  }}
+                  className={`pointer-events-auto rounded-xl bg-white shadow-2xl transition-[max-height] duration-150 select-none ${
+                    boardLightboxZoom > 1.02
+                      ? boardIsPanning
+                        ? 'cursor-grabbing'
+                        : 'cursor-grab'
+                      : 'cursor-zoom-in object-contain'
+                  }`}
+                />
+                <span className="mt-2.5 text-[10px] font-semibold text-slate-400/90 hidden sm:inline">
+                  Nhấn khoảng trống tối để đóng · Chụm 2 ngón phóng to · Kéo ảnh khi phóng to · Vuốt 2 ngón lật trang
+                </span>
+              </div>
             </div>
           </div>
 
