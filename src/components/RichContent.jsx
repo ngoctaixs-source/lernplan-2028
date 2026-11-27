@@ -47,6 +47,32 @@ const LATEX_SYMBOLS = {
   qquad: '\u00A0\u00A0\u00A0\u00A0',
 };
 
+// Danh sách từ tiếng Việt không dấu viết hoa đầu câu (tránh nhận nhầm là danh từ tiếng Đức trong chế độ mixedGerman)
+const VN_PLAIN_CAP_WORDS = new Set([
+  'Anh', 'Ba', 'Ban', 'Bao', 'Bay', 'Ben', 'Biet', 'Binh', 'Bo', 'Bon', 'Buoc',
+  'Cac', 'Cach', 'Can', 'Cao', 'Cau', 'Cham', 'Chan', 'Chay', 'Chi', 'Chia', 'Chinh',
+  'Cho', 'Chon', 'Chu', 'Chua', 'Chuan', 'Chuyen', 'Co', 'Con', 'Cong', 'Cua', 'Cung', 'Cuoi',
+  'Da', 'Dan', 'Dang', 'Danh', 'Dau', 'Day', 'De', 'Dem', 'Den', 'Di', 'Dich', 'Diem', 'Dieu',
+  'Dinh', 'Do', 'Doc', 'Doi', 'Dong', 'Du', 'Dung', 'Duoc', 'Duoi',
+  'Em', 'Ghi', 'Gia', 'Giai', 'Giam', 'Gian', 'Giao', 'Giay', 'Giu', 'Giup', 'Goi', 'Gom',
+  'Hai', 'Han', 'Hang', 'Hay', 'Het', 'Hien', 'Hieu', 'Hinh', 'Ho', 'Hoa', 'Hoac', 'Hoan', 'Hoc', 'Hoi', 'Hon', 'Hop', 'Huong',
+  'It', 'Ke', 'Kem', 'Ket', 'Kha', 'Khac', 'Khach', 'Khai', 'Khi', 'Kho', 'Khoa', 'Khoan', 'Khoang', 'Khong', 'Khu', 'Kiem', 'Kien', 'Kieu', 'Ky',
+  'La', 'Lai', 'Lam', 'Lan', 'Lap', 'Lay', 'Len', 'Lich', 'Lien', 'Liet', 'Loai', 'Loi', 'Lon', 'Luat', 'Luc', 'Luong', 'Luu', 'Ly',
+  'Ma', 'Mai', 'Man', 'Mat', 'Mau', 'May', 'Meo', 'Mien', 'Minh', 'Mo', 'Moi', 'Mon', 'Mot', 'Mua', 'Muc', 'Muon', 'Muoi',
+  'Nam', 'Nang', 'Nao', 'Nay', 'Nen', 'Neu', 'Ngan', 'Nganh', 'Ngay', 'Nghe', 'Nghi', 'Nghia', 'Ngoai', 'Nguoi', 'Nguyen',
+  'Nha', 'Nhac', 'Nhan', 'Nhanh', 'Nhap', 'Nhat', 'Nhe', 'Nhieu', 'Nhin', 'Nho', 'Nhom', 'Nhu', 'Nhung',
+  'Noi', 'Nop', 'Nuoc', 'Phan', 'Phai', 'Phat', 'Phep', 'Phi', 'Phim', 'Phong', 'Phu', 'Phuong', 'Phut',
+  'Qua', 'Quan', 'Quay', 'Quen', 'Quyet', 'Ra', 'Rat', 'Rieng', 'Ro', 'Roi', 'Rut',
+  'Sai', 'San', 'Sang', 'Sao', 'Sau', 'Se', 'Sinh', 'So', 'Soi', 'Song', 'Su', 'Sua', 'Suy',
+  'Ta', 'Tac', 'Tai', 'Tam', 'Tang', 'Tao', 'Tap', 'Tat', 'Ten', 'Thang', 'Thanh', 'Thap', 'That', 'Thay',
+  'The', 'Them', 'Theo', 'Thi', 'Thich', 'Thieu', 'Thoi', 'Thong', 'Thu', 'Thua', 'Thuc', 'Thue', 'Thuong',
+  'Tien', 'Tieng', 'Tiep', 'Tieu', 'Tim', 'Tin', 'Tinh', 'To', 'Toan', 'Toi', 'Tom', 'Tong', 'Tot',
+  'Tra', 'Trai', 'Trang', 'Tren', 'Trich', 'Trinh', 'Trong', 'Tru', 'Truc', 'Trung', 'Truoc', 'Truong',
+  'Tu', 'Tuan', 'Tung', 'Tuong', 'Tuy', 'Va', 'Vai', 'Van', 'Vao', 'Vay', 'Ve', 'Vi', 'Viec', 'Viet', 'Voi', 'Vua', 'Vuot',
+  'Xa', 'Xac', 'Xay', 'Xem', 'Xep', 'Xin', 'Xoa', 'Xu', 'Xuat', 'Xung', 'Yeu',
+  'Casio', 'Mio', 'Mrd', 'Eur', 'Euro', 'Admin', 'OneNote', 'PDF', 'Note', 'Test', 'Flashcard', 'Flashcards', 'App', 'Web', 'Cloud', 'AI', 'SRS',
+]);
+
 function readMathGroup(str, start) {
   let i = start;
   while (i < str.length && str[i] === ' ') i++;
@@ -279,21 +305,37 @@ function MathExpr({ expr, display = false }) {
   );
 }
 
-// ==================== CLICKABLE GERMAN WORD RENDERER ====================
-function renderClickablePlainText(text, dictMode, onWordClick, contextText, keyPrefix = 'w') {
-  if (!text) return null;
-  if (!dictMode || !onWordClick) return text;
+// ==================== CLICKABLE GERMAN WORD RENDERER (FULL GERMAN + MIXED VIETNAMESE/GERMAN) ====================
+function isClickableToken(tok, clickMode) {
+  if (!tok || tok.length < 2) return false;
+  // Phải là từ thuần chữ cái Đức (không chứa dấu tiếng Việt như ă, â, đ, ê, ô, ơ, ư, sắc, huyền, hỏi, ngã, nặng)
+  if (!/^[A-Za-zÄÖÜäöüß]{2,}(?:-[A-Za-zÄÖÜäöüß]+)*$/.test(tok)) return false;
 
-  // Tokenize into German word tokens (including Umlauts & ß & hyphenated compounds) vs separators
-  const tokens = text.split(/([A-Za-zÄÖÜäöüß]+(?:-[A-Za-zÄÖÜäöüß]+)*)/g);
+  if (clickMode === 'full') return true;
+
+  // Chế độ 'mixed': chỉ gắn bấm-dịch cho từ/thuật ngữ tiếng Đức lẫn trong câu giải thích tiếng Việt
+  if (/[ÄÖÜäöüß]/.test(tok)) return true;
+  if (tok.includes('-') && tok.length >= 4) return true;
+  if (/^[A-Z]{2,6}$/.test(tok) && !VN_PLAIN_CAP_WORDS.has(tok)) return true; // BGB, KSVG, GEMA, USt, GuV...
+  if (/^[A-Z][a-z]{2,}$/.test(tok) && !VN_PLAIN_CAP_WORDS.has(tok)) return true; // Dreisatz, Verwerter, Vertrag...
+  if (tok.length >= 7) return true; // động từ/tính từ tiếng Đức dài như verpflichtet, berechnen, mittels...
+  return false;
+}
+
+function renderClickablePlainText(text, clickMode, onWordClick, contextText, keyPrefix = 'w') {
+  if (!text) return null;
+  if (!clickMode || !onWordClick) return text;
+
+  // Dùng Unicode letter (\p{L}) để KHÔNG BAO GIỜ cắt vụn từ có dấu tiếng Việt như "Phương", "Điểm", "Tính"
+  const tokens = text.split(/([\p{L}]+(?:-[\p{L}]+)*)/gu);
   return tokens.map((tok, tIdx) => {
-    const isGermanWord = /^[A-Za-zÄÖÜäöüß]{2,}(?:-[A-Za-zÄÖÜäöüß]+)*$/.test(tok);
-    if (!isGermanWord) {
+    if (!isClickableToken(tok, clickMode)) {
       return <React.Fragment key={`${keyPrefix}-${tIdx}`}>{tok}</React.Fragment>;
     }
     return (
       <span
         key={`${keyPrefix}-${tIdx}`}
+        data-word-token="true"
         role="button"
         tabIndex={0}
         onClick={(e) => {
@@ -324,9 +366,7 @@ function findClosingDollar(str, startIdx) {
       continue;
     }
     if (str[i] === '$') {
-      // Avoid matching $$ as single $
       if (str[i + 1] === '$') return -1;
-      // Closing $ must not be preceded by whitespace
       if (i > startIdx && str[i - 1] !== ' ') return i;
       return -1;
     }
@@ -334,7 +374,7 @@ function findClosingDollar(str, startIdx) {
   return -1;
 }
 
-function renderClickableInline(text, dictMode, onWordClick, contextText, keyPrefix = 'in') {
+function renderClickableInline(text, clickMode, onWordClick, contextText, keyPrefix = 'in') {
   if (!text) return null;
   const nodes = [];
   let plainBuf = '';
@@ -345,7 +385,7 @@ function renderClickableInline(text, dictMode, onWordClick, contextText, keyPref
     if (!plainBuf) return;
     nodes.push(
       <React.Fragment key={`${keyPrefix}-p${k++}`}>
-        {renderClickablePlainText(plainBuf, dictMode, onWordClick, contextText || text, `${keyPrefix}w${k}`)}
+        {renderClickablePlainText(plainBuf, clickMode, onWordClick, contextText || text, `${keyPrefix}w${k}`)}
       </React.Fragment>
     );
     plainBuf = '';
@@ -368,7 +408,6 @@ function renderClickableInline(text, dictMode, onWordClick, contextText, keyPref
       const closeIdx = findClosingDollar(text, i + 1);
       if (closeIdx !== -1) {
         const inner = text.slice(i + 1, closeIdx);
-        // Guard against stray currency pairs unless math-like
         const looksLikeCurrencyPair = /^\d[\d.,]*\s+[A-Za-z]/.test(inner) && !/[=+\-*\/\\^_€]/.test(inner);
         if (!looksLikeCurrencyPair) {
           flushPlain();
@@ -416,7 +455,7 @@ function renderClickableInline(text, dictMode, onWordClick, contextText, keyPref
         const inner = text.slice(i + 2, closeIdx);
         nodes.push(
           <strong key={`${keyPrefix}-b${k++}`} className="font-bold text-slate-900 dark:text-white">
-            {renderClickableInline(inner, dictMode, onWordClick, contextText || text, `${keyPrefix}b${k}`)}
+            {renderClickableInline(inner, clickMode, onWordClick, contextText || text, `${keyPrefix}b${k}`)}
           </strong>
         );
         i = closeIdx + 2;
@@ -438,7 +477,7 @@ function renderClickableInline(text, dictMode, onWordClick, contextText, keyPref
         const inner = text.slice(i + 1, closeIdx);
         nodes.push(
           <em key={`${keyPrefix}-em${k++}`} className="italic text-slate-600 dark:text-slate-300">
-            {renderClickableInline(inner, dictMode, onWordClick, contextText || text, `${keyPrefix}em${k}`)}
+            {renderClickableInline(inner, clickMode, onWordClick, contextText || text, `${keyPrefix}em${k}`)}
           </em>
         );
         i = closeIdx + 1;
@@ -452,6 +491,17 @@ function renderClickableInline(text, dictMode, onWordClick, contextText, keyPref
 
   flushPlain();
   return nodes;
+}
+
+// ==================== TEXT NORMALIZER (CHỮA GẠCH ĐẦU DÒNG BỊ DÍNH 1 HÀNG TRONG NHẬN XÉT AI) ====================
+function normalizeMarkdownText(raw) {
+  let s = String(raw || '').replace(/\r\n/g, '\n');
+  // Tách các gạch đầu dòng bị AI viết dính trên cùng 1 hàng (VD: "Nhận xét: * **Điểm...** ... . * **Chỗ làm đúng...**")
+  s = s.replace(/([:.!?])\s+\*\s+(?=\*\*)/g, '$1\n- ');
+  s = s.replace(/^\s*\*\s+(?=\*\*)/gm, '- ');
+  // Tách $$...$$ có dấu chấm ngay sau thành khối sạch không bị rớt dấu chấm mồ côi sang dòng mới
+  s = s.replace(/\$\$\s*\.\s*\n/g, '$$\n');
+  return s;
 }
 
 // ==================== BLOCK PARSERS (TABLES, HEADINGS, MATH, LISTS, QUOTES) ====================
@@ -477,13 +527,15 @@ function parseTableBlock(lines) {
 export default function RichContent({
   text,
   isGerman = false,
+  mixedGerman = false,
   dictMode = false,
   onWordClick = null,
   className = '',
 }) {
   if (!text) return null;
 
-  const lines = String(text).split('\n');
+  const normalized = normalizeMarkdownText(text);
+  const lines = normalized.split('\n');
   const blocks = [];
   let i = 0;
 
@@ -497,17 +549,18 @@ export default function RichContent({
       continue;
     }
 
-    // Display Math block: $$...$$ (single-line or multi-line)
+    // Display Math block: $$...$$ (single-line or multi-line, cho phép dấu chấm/phẩy cuối dòng)
     if (trimmed.startsWith('$$')) {
-      if (trimmed.length > 4 && trimmed.endsWith('$$')) {
-        blocks.push({ type: 'math', expr: trimmed.slice(2, -2).trim() });
+      const strippedEnd = trimmed.replace(/[.,;]+$/, '');
+      if (strippedEnd.length > 4 && strippedEnd.endsWith('$$')) {
+        blocks.push({ type: 'math', expr: strippedEnd.slice(2, -2).trim() });
         i++;
         continue;
       }
       const mathLines = [trimmed.slice(2)];
       i++;
       while (i < lines.length) {
-        const cur = lines[i].trim();
+        const cur = lines[i].trim().replace(/[.,;]+$/, '');
         if (cur.endsWith('$$')) {
           mathLines.push(cur.slice(0, -2));
           i++;
@@ -522,15 +575,16 @@ export default function RichContent({
 
     // Display Math block: \[ ... \]
     if (trimmed.startsWith('\\[')) {
-      if (trimmed.endsWith('\\]') && trimmed.length > 4) {
-        blocks.push({ type: 'math', expr: trimmed.slice(2, -2).trim() });
+      const strippedEnd = trimmed.replace(/[.,;]+$/, '');
+      if (strippedEnd.endsWith('\\]') && strippedEnd.length > 4) {
+        blocks.push({ type: 'math', expr: strippedEnd.slice(2, -2).trim() });
         i++;
         continue;
       }
       const mathLines = [trimmed.slice(2)];
       i++;
       while (i < lines.length) {
-        const cur = lines[i].trim();
+        const cur = lines[i].trim().replace(/[.,;]+$/, '');
         if (cur.endsWith('\\]')) {
           mathLines.push(cur.slice(0, -2));
           i++;
@@ -598,7 +652,7 @@ export default function RichContent({
       continue;
     }
 
-    // Numbered item (1. ..., 2. ...) — keeps exact original number even when separated by formulas
+    // Numbered item (1. ..., 2. ...)
     const numMatch = line.match(/^\s*(\d+)\.\s+(.+)$/);
     if (numMatch) {
       const items = [];
@@ -612,12 +666,13 @@ export default function RichContent({
       continue;
     }
 
-    // Regular paragraph line
-    blocks.push({ type: 'paragraph', text: line });
+    // Regular paragraph line (bỏ dấu chấm dư đầu dòng nếu AI lỡ dính sau công thức)
+    const cleanParagraph = trimmed.startsWith('. ') && trimmed.length > 3 ? trimmed.slice(2) : line;
+    blocks.push({ type: 'paragraph', text: cleanParagraph });
     i++;
   }
 
-  const enableClick = isGerman && dictMode && Boolean(onWordClick);
+  const clickMode = dictMode && Boolean(onWordClick) ? (isGerman ? 'full' : mixedGerman ? 'mixed' : null) : null;
 
   return (
     <div className={`space-y-2.5 ${className}`}>
@@ -637,7 +692,7 @@ export default function RichContent({
               : 'text-sm sm:text-base font-extrabold text-indigo-700 dark:text-indigo-300 pt-1';
           return (
             <h3 key={bIdx} className={`${sizeCls} leading-snug`}>
-              {renderClickableInline(block.text, enableClick, onWordClick, block.text, `h${bIdx}`)}
+              {renderClickableInline(block.text, clickMode, onWordClick, block.text, `h${bIdx}`)}
             </h3>
           );
         }
@@ -650,7 +705,7 @@ export default function RichContent({
             >
               {block.lines.map((ql, qIdx) => (
                 <p key={qIdx} className="leading-relaxed">
-                  {renderClickableInline(ql, enableClick, onWordClick, ql, `q${bIdx}-${qIdx}`)}
+                  {renderClickableInline(ql, clickMode, onWordClick, ql, `q${bIdx}-${qIdx}`)}
                 </p>
               ))}
             </blockquote>
@@ -668,7 +723,7 @@ export default function RichContent({
                   <tr className="bg-slate-100 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
                     {block.data.headers.map((h, hIdx) => (
                       <th key={hIdx} className="px-3.5 py-2.5 font-bold text-slate-900 dark:text-slate-100">
-                        {renderClickableInline(h, enableClick, onWordClick, text, `th${bIdx}-${hIdx}`)}
+                        {renderClickableInline(h, clickMode, onWordClick, text, `th${bIdx}-${hIdx}`)}
                       </th>
                     ))}
                   </tr>
@@ -678,7 +733,7 @@ export default function RichContent({
                     <tr key={rIdx} className="hover:bg-slate-50 dark:hover:bg-slate-800/50">
                       {row.map((cell, cIdx) => (
                         <td key={cIdx} className="px-3.5 py-2.5 text-slate-800 dark:text-slate-200 align-top">
-                          {renderClickableInline(cell, enableClick, onWordClick, text, `td${bIdx}-${rIdx}-${cIdx}`)}
+                          {renderClickableInline(cell, clickMode, onWordClick, text, `td${bIdx}-${rIdx}-${cIdx}`)}
                         </td>
                       ))}
                     </tr>
@@ -694,7 +749,7 @@ export default function RichContent({
             <ul key={bIdx} className="list-disc pl-5 space-y-1.5">
               {block.items.map((item, idx) => (
                 <li key={idx} className="leading-relaxed">
-                  {renderClickableInline(item, enableClick, onWordClick, item, `li${bIdx}-${idx}`)}
+                  {renderClickableInline(item, clickMode, onWordClick, item, `li${bIdx}-${idx}`)}
                 </li>
               ))}
             </ul>
@@ -710,7 +765,7 @@ export default function RichContent({
                     {item.num}.
                   </span>
                   <div className="flex-1 min-w-0">
-                    {renderClickableInline(item.text, enableClick, onWordClick, item.text, `ol${bIdx}-${idx}`)}
+                    {renderClickableInline(item.text, clickMode, onWordClick, item.text, `ol${bIdx}-${idx}`)}
                   </div>
                 </div>
               ))}
@@ -720,7 +775,7 @@ export default function RichContent({
 
         return (
           <p key={bIdx} className="leading-relaxed">
-            {renderClickableInline(block.text, enableClick, onWordClick, block.text, `p${bIdx}`)}
+            {renderClickableInline(block.text, clickMode, onWordClick, block.text, `p${bIdx}`)}
           </p>
         );
       })}
