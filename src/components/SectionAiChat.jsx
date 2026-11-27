@@ -89,7 +89,8 @@ export default function SectionAiChat({
   const [attachedImg, setAttachedImg] = useState(null);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
-  const [chatDictMode, setChatDictMode] = useState(false);
+  // 'mixed' = tự nhận diện & bấm dịch mọi từ tiếng Đức trong câu trả lời (MẶC ĐỊNH BẬT) | 'full' = mọi từ | 'off' = tắt
+  const [chatDictMode, setChatDictMode] = useState('mixed');
   const [copiedId, setCopiedId] = useState(null);
   const [pinnedId, setPinnedId] = useState(null);
   // Nút nổi "↳ Hỏi Gia sư AI" khi người dùng tô đen chữ trong khung chat
@@ -436,20 +437,22 @@ export default function SectionAiChat({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
-          {/* Toggle chạm-dịch từ tiếng Đức trong câu trả lời AI */}
+          {/* Toggle chạm-dịch từ tiếng Đức trong câu trả lời AI (mặc định tự bật cho mọi từ tiếng Đức!) */}
           {onWordClick && (
             <button
               type="button"
-              onClick={() => setChatDictMode((v) => !v)}
-              title="Bật để bấm trực tiếp vào từ tiếng Đức trong câu trả lời của AI để tra từ điển"
+              onClick={() =>
+                setChatDictMode((v) => (v === 'mixed' ? 'full' : v === 'full' ? 'off' : 'mixed'))
+              }
+              title="Bấm để chuyển chế độ chạm-dịch từ tiếng Đức trong câu trả lời AI (Tự động DE -> Mọi từ -> Tắt)"
               className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-bold border transition ${
-                chatDictMode
+                chatDictMode !== 'off'
                   ? 'bg-emerald-600 text-white border-emerald-600'
                   : 'bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-indigo-400'
               }`}
             >
               <Languages className="w-3 h-3" />
-              Tra từ DE: {chatDictMode ? 'BẬT' : 'TẮT'}
+              Tra từ DE: {chatDictMode === 'mixed' ? 'BẬT' : chatDictMode === 'full' ? 'TẤT CẢ' : 'TẮT'}
             </button>
           )}
 
@@ -547,8 +550,9 @@ export default function SectionAiChat({
                       <div className="text-xs sm:text-sm text-slate-800 dark:text-slate-100 select-text">
                         <RichContent
                           text={msg.content}
-                          isGerman={chatDictMode}
-                          dictMode={chatDictMode}
+                          isGerman={chatDictMode === 'full'}
+                          mixedGerman={chatDictMode === 'mixed'}
+                          dictMode={chatDictMode !== 'off'}
                           onWordClick={onWordClick}
                         />
                       </div>
