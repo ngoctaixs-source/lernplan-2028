@@ -1,176 +1,208 @@
 import React, { useState } from 'react';
 import {
   CheckCircle2,
-  AlertCircle,
+  XCircle,
+  Loader2,
+  RotateCcw,
   Sparkles,
   Volume2,
-  Loader2,
   Award,
-  RotateCcw,
-  Send,
+  AlertCircle,
+  Plus,
   Camera,
   Trash2,
 } from 'lucide-react';
-import { callGeminiApi, compressImageToBase64 } from '../lib/api';
+import { callGeminiApi } from '../lib/api';
 import { speakGerman } from '../lib/tts';
-import { calcIhkGrade } from '../lib/seedData';
 import RichContent from './RichContent';
-import DiagramRenderer from './DiagramRenderer';
+
+function compressHandwrittenPhoto(file, maxWidth = 1400, quality = 0.8) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Không đọc được ảnh bài làm.'));
+    reader.onload = () => {
+      const img = new window.Image();
+      img.onerror = () => reject(new Error('Định dạng ảnh không hợp lệ.'));
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxWidth) {
+          height = Math.round((height * maxWidth) / width);
+          width = maxWidth;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, width, height);
+        ctx.drawImage(img, 0, 0, width, height);
+        const dataUrl = canvas.toDataURL('image/jpeg', quality);
+        resolve({
+          base64: dataUrl.split(',')[1],
+          mimeType: 'image/jpeg',
+          dataUrl,
+          name: file.name || 'bai-lam.jpg',
+        });
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
 
 export default function QuizPanel({
-  questions,
-  showVn,
-  ttsRate,
-  dictMode,
-  onWordClick,
-  isAdmin,
-  onSaveAttempt,
-  onLogMistakes,
-  onAppendMoreQuiz,
+  questions = [],
+  showVn = true,
+  ttsRate = 1.0,
+  dictMode = true,
+  onWordClick = null,
+  isAdmin = false,
+  onSaveAttempt = null,
+  onLogMistakes = null,
+  onAppendMoreQuiz = null,
 }) {
-  const [mcAnswers, setMcAnswers] = useState({});
-  const [essayAnswers, setEssayAnswers] = useState({});
-  const [essayImages, setEssayImages] = useState({}); // { [qId]: { base64, mimeType, previewUrl } }
+  const [mcAnswers, setMcAnswers] = useState({}); // { [qId]: optionIndex }
+  const [essayAnswers, setEssayAnswers] = useState({}); // { [qId]: string }
+  const [essayImages, setEssayImages] = useState({}); // { [qId]: { base64, mimeType, dataUrl, name } }
+  const [submitted, setSubmitted] = useState(false);
   const [grading, setGrading] = useState(false);
-  const [generating, setGenerating] = useState(false);
-  const [result, setResult] = useState(null);
+  const [gradeMap, setGradeMap] = useState({}); // { [qId]: { score, feedback_de, feedback_vn, musterloesung_de, musterloesung_vn } }
+  const [finalScore, setFinalScore] = useState(null);
   const [error, setError] = useState('');
+  const [appending, setAppending] = useState(false);
 
-  const handleUploadPaper = async (qId, file) => {
+  const handleUploadEssayPhoto = async (qId, file) => {
     if (!file) return;
+    setError('');
     try {
-      const compressed = await compressImageToBase64(file, 1400, 0.8);
+      const compressed = await compressHandwrittenPhoto(file);
       setEssayImages((prev) => ({ ...prev, [qId]: compressed }));
     } catch (err) {
-      setError(err.message || 'Không đọc được ảnh bài giải.');
+      setError(err.message || 'Không xử lý được ảnh giấy nháp.');
     }
   };
 
   const handleSubmit = async () => {
+    if (!questions.length || grading) return;
     setError('');
     setGrading(true);
+
     try {
-      const mcQuestions = questions.filter((q) => q.q_type === 'mc');
-      const essayQuestions = questions.filter((q) => q.q_type === 'essay');
+      const essayQs = questions.filter((q) => q.q_type === 'essay');
+      const nextGradeMap = {};
+
+      if (essayQs.length > 0) {
+        const essaysPayload = essayQs.map((q) => ({
+          question_id: String(q.id),
+          question_de: q.question_de || '',
+          model_answer_de: q.model_answer_de || '',
+          user_answer: (essayAnswers[q.id] || '').trim(),
+          image_base64: essayImages[q.id]?.base64 || null,
+          image_mime_type: essayImages[q.id]?.mimeType || 'image/jpeg',
+        }));
+
+        const data = await callGeminiApi('grade_quiz', { essays: essaysPayload });
+        const results = Array.isArray(data?.results) ? data.results : [];
+        results.forEach((r) => {
+          if (r?.question_id) {
+            nextGradeMap[String(r.question_id)] = {
+              score: Math.max(0, Math.min(100, Math.round(Number(r.score ?? 0)))),
+              feedback_de: r.feedback_de || '',
+              feedback_vn: r.feedback_vn || '',
+              musterloesung_de: r.musterloesung_de || '',
+              musterloesung_vn: r.musterloesung_vn || '',
+            };
+          }
+        });
+      }
 
       let totalPoints = 0;
-      const mcFeedback = {};
       const mistakes = [];
 
-      mcQuestions.forEach((q) => {
-        const chosen = mcAnswers[q.id];
-        const isCorrect = chosen === q.correct_index;
-        if (isCorrect) {
-          totalPoints += 100;
+      questions.forEach((q) => {
+        if (q.q_type === 'mc') {
+          const picked = mcAnswers[q.id];
+          const isRight = picked !== undefined && Number(picked) === Number(q.correct_index);
+          totalPoints += isRight ? 100 : 0;
+          if (!isRight) {
+            const pickedOpt = Array.isArray(q.options) && picked !== undefined ? q.options[picked] : null;
+            mistakes.push({
+              question: q,
+              userAnswer: pickedOpt ? `${String.fromCharCode(65 + picked)}) ${pickedOpt.de}` : '(Chưa chọn đáp án)',
+              feedbackVn: q.explanation_vn || q.explanation_de || '',
+            });
+          }
         } else {
-          mistakes.push({
-            question: q,
-            userAnswer: chosen !== undefined ? q.options?.[chosen]?.de || `Option ${chosen + 1}` : '(Bỏ trống)',
-            feedbackVn: q.explanation_vn || 'Trả lời sai câu trắc nghiệm.',
-          });
+          const g = nextGradeMap[String(q.id)];
+          const sc = g ? g.score : 0;
+          totalPoints += sc;
+          if (sc < 65) {
+            mistakes.push({
+              question: q,
+              userAnswer: (essayAnswers[q.id] || '').trim() || (essayImages[q.id] ? '(Nộp ảnh giấy nháp)' : '(Bỏ trống)'),
+              feedbackVn: g?.feedback_vn || q.explanation_vn || '',
+            });
+          }
         }
-        mcFeedback[q.id] = { isCorrect, chosen };
       });
 
-      const essayFeedback = {};
-      if (essayQuestions.length > 0) {
-        const essaysToGrade = essayQuestions.map((q) => {
-          const img = essayImages[q.id];
-          return {
-            question_id: q.id,
-            question_de: q.question_de,
-            model_answer_de: q.model_answer_de,
-            user_answer: (essayAnswers[q.id] || '').trim(),
-            image_base64: img?.base64 || '',
-            image_mime_type: img?.mimeType || 'image/jpeg',
-          };
+      const avgScore = Math.round(totalPoints / Math.max(1, questions.length));
+      setGradeMap(nextGradeMap);
+      setFinalScore(avgScore);
+      setSubmitted(true);
+
+      if (onSaveAttempt) {
+        await onSaveAttempt(avgScore, {
+          totalQuestions: questions.length,
+          mistakesCount: mistakes.length,
         });
-
-        try {
-          const graded = await callGeminiApi('grade_quiz', { essays: essaysToGrade });
-          (graded?.results || []).forEach((item) => {
-            essayFeedback[item.question_id] = item;
-            const sc = Number(item.score || 0);
-            totalPoints += sc;
-            if (sc < 70) {
-              const qObj = essayQuestions.find((q) => q.id === item.question_id);
-              if (qObj) {
-                mistakes.push({
-                  question: qObj,
-                  userAnswer: essayAnswers[qObj.id] || (essayImages[qObj.id] ? '[Đã nộp ảnh giấy nháp]' : '(Bỏ trống)'),
-                  feedbackVn: item.feedback_vn || 'Cần ôn lại câu tự luận này.',
-                });
-              }
-            }
-          });
-        } catch (aiErr) {
-          setError(`AI chưa chấm tự động được (${aiErr.message}). Đã hiện bài mẫu IHK để bạn tự đối chiếu.`);
-          essayQuestions.forEach((q) => {
-            const hasAns = Boolean((essayAnswers[q.id] || '').trim() || essayImages[q.id]);
-            const fallbackScore = hasAns ? 50 : 0;
-            totalPoints += fallbackScore;
-            essayFeedback[q.id] = {
-              question_id: q.id,
-              score: fallbackScore,
-              feedback_de: 'Bitte vergleichen Sie Ihre Lösung mit der IHK-Musterlösung.',
-              feedback_vn: 'Hãy đối chiếu bài làm của bạn với bài mẫu IHK bên dưới.',
-              musterloesung_de: q.model_answer_de,
-              musterloesung_vn: q.model_answer_vn,
-            };
-          });
-        }
       }
-
-      const finalPercent = questions.length > 0 ? Math.round(totalPoints / questions.length) : 0;
-      const finalResult = {
-        percent: finalPercent,
-        grade: calcIhkGrade(finalPercent),
-        mcFeedback,
-        essayFeedback,
-      };
-      setResult(finalResult);
-      onSaveAttempt?.(finalPercent, finalResult);
-      if (mistakes.length > 0) {
-        onLogMistakes?.(mistakes);
+      if (mistakes.length > 0 && onLogMistakes) {
+        await onLogMistakes(mistakes);
       }
+    } catch (err) {
+      setError(err.message || 'Lỗi khi chấm bài. Hãy bấm Nộp bài lại.');
     } finally {
       setGrading(false);
     }
   };
 
-  const handleReset = () => {
+  const handleRetry = () => {
     setMcAnswers({});
     setEssayAnswers({});
     setEssayImages({});
-    setResult(null);
+    setGradeMap({});
+    setFinalScore(null);
+    setSubmitted(false);
     setError('');
   };
 
-  const handleGenerateMore = async () => {
-    if (!onAppendMoreQuiz) return;
-    setGenerating(true);
+  const handleAppendQuiz = async () => {
+    if (!onAppendMoreQuiz || appending) return;
     setError('');
+    setAppending(true);
     try {
       await onAppendMoreQuiz();
     } catch (err) {
-      setError(err.message || 'Không tạo thêm được câu hỏi.');
+      setError(err.message || 'Không tạo thêm được câu hỏi mới.');
     } finally {
-      setGenerating(false);
+      setAppending(false);
     }
   };
 
   if (!questions.length) {
     return (
-      <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-8 text-center space-y-3">
-        <p className="text-slate-600 dark:text-slate-400 text-sm">Bài học này chưa có câu hỏi kiểm tra.</p>
+      <div className="bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 p-8 text-center space-y-4">
+        <p className="text-sm font-bold text-slate-600 dark:text-slate-300">Bài học này chưa có câu hỏi Test nào.</p>
         {isAdmin && onAppendMoreQuiz && (
           <button
-            onClick={handleGenerateMore}
-            disabled={generating}
-            className="inline-flex items-center gap-2 px-4 py-2.5 bg-indigo-600 text-white text-xs font-semibold rounded-xl hover:bg-indigo-700"
+            type="button"
+            disabled={appending}
+            onClick={handleAppendQuiz}
+            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold shadow-sm disabled:opacity-50"
           >
-            {generating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-            Tạo bộ câu hỏi IHK bằng AI
+            {appending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+            Tạo bộ câu hỏi Test bằng AI
           </button>
         )}
       </div>
@@ -179,299 +211,341 @@ export default function QuizPanel({
 
   return (
     <div className="space-y-5">
-      {/* Header Bar */}
-      <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-4 flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h3 className="text-sm font-bold text-slate-900 dark:text-white">
-            Bài kiểm tra bao quát ({questions.length} câu — Trắc nghiệm, Tự luận & Chụp ảnh giấy nháp)
-          </h3>
+      {/* Top Action Bar & Result Banner */}
+      <div className="bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 p-4 sm:p-5 flex flex-wrap items-center justify-between gap-3">
+        <div className="space-y-0.5">
+          <h2 className="text-sm sm:text-base font-extrabold text-slate-900 dark:text-white">
+            Bài kiểm tra chuẩn IHK ({questions.length} câu)
+          </h2>
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            Câu tính toán / vẽ biểu đồ bạn có thể viết ra giấy rồi bấm nút <strong>Chụp ảnh giấy nháp</strong> để AI chấm trực tiếp!
+            Bấm trực tiếp vào bất kỳ từ tiếng Đức nào trong đề, đáp án hoặc nhận xét AI để tra từ điển tức thì
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          {result && (
+
+        <div className="flex flex-wrap items-center gap-2">
+          {submitted && finalScore !== null && (
+            <span
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-black border ${
+                finalScore >= 80
+                  ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                  : finalScore >= 50
+                  ? 'bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800'
+                  : 'bg-rose-50 dark:bg-rose-950/60 text-rose-700 dark:text-rose-300 border-rose-200 dark:border-rose-800'
+              }`}
+            >
+              <Award className="w-4 h-4" /> Kết quả: {finalScore}%
+            </span>
+          )}
+
+          {submitted && (
             <button
-              onClick={handleReset}
-              className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 rounded-xl transition"
+              type="button"
+              onClick={handleRetry}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-xs font-bold text-slate-700 dark:text-slate-200"
             >
               <RotateCcw className="w-3.5 h-3.5" /> Làm lại
             </button>
           )}
+
           {isAdmin && onAppendMoreQuiz && (
             <button
-              onClick={handleGenerateMore}
-              disabled={generating}
-              className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-indigo-700 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/60 hover:bg-indigo-100 rounded-xl transition disabled:opacity-60"
+              type="button"
+              disabled={appending || grading}
+              onClick={handleAppendQuiz}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-indigo-50 dark:bg-indigo-950/60 hover:bg-indigo-100 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 text-xs font-bold disabled:opacity-50"
             >
-              {generating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
-              + Tạo thêm 5 câu mới
+              {appending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+              Tạo thêm 5 câu bằng AI
             </button>
           )}
         </div>
       </div>
 
-      {/* Result Banner */}
-      {result && (
-        <div className="bg-white dark:bg-slate-900 rounded-2xl border-2 border-indigo-300 dark:border-indigo-700 p-5 sm:p-6 shadow-sm flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-          <div className="flex items-center gap-4">
-            <div className="w-16 h-16 rounded-2xl bg-indigo-600 text-white flex flex-col items-center justify-center shrink-0">
-              <span className="text-xl font-extrabold leading-none">{result.percent}%</span>
-              <span className="text-[10px] text-indigo-200 font-semibold mt-0.5">ĐIỂM SỐ</span>
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <Award className="w-5 h-5 text-indigo-600 dark:text-indigo-400" />
-                <span className="text-base font-bold text-slate-900 dark:text-white">Kết quả chấm điểm chuẩn IHK</span>
-              </div>
-              <div className="mt-1.5 flex items-center gap-2 flex-wrap">
-                <span className={`px-3 py-1 rounded-full text-xs font-bold border ${result.grade.color}`}>
-                  IHK-Note: {result.grade.note}
-                </span>
-                <span className="text-xs text-slate-500 dark:text-slate-400">
-                  Các câu làm sai đã tự động lưu vào Kho câu sai để ôn lại!
-                </span>
-              </div>
-            </div>
-          </div>
-          <button
-            onClick={handleReset}
-            className="px-4 py-2 text-xs font-semibold text-indigo-700 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950 rounded-xl"
-          >
-            Làm lại đề này
-          </button>
-        </div>
-      )}
-
       {error && (
-        <div className="bg-amber-50 dark:bg-amber-950/60 border border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-200 text-xs rounded-xl p-3.5 flex items-start gap-2">
+        <div className="bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 rounded-2xl p-3.5 flex items-start gap-2.5 text-xs text-rose-700 dark:text-rose-200">
           <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
           <span>{error}</span>
         </div>
       )}
 
-      {/* Question List */}
+      {/* Question Cards */}
       <div className="space-y-4">
         {questions.map((q, idx) => {
           const isMc = q.q_type === 'mc';
-          const mcState = result?.mcFeedback?.[q.id];
-          const essayState = result?.essayFeedback?.[q.id];
-          const paperImg = essayImages[q.id];
+          const pickedIdx = mcAnswers[q.id];
+          const isMcCorrect = submitted && isMc && pickedIdx !== undefined && Number(pickedIdx) === Number(q.correct_index);
+          const aiGrade = !isMc ? gradeMap[String(q.id)] : null;
+          const uploadedImg = essayImages[q.id];
 
           return (
             <div
               key={q.id}
-              className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-4"
+              className="bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 p-5 sm:p-6 shadow-sm space-y-4"
             >
+              {/* Question Header */}
               <div className="flex items-start justify-between gap-3">
-                <div className="space-y-2 flex-1 min-w-0">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-slate-900 dark:bg-indigo-600 text-white">
-                      Câu {idx + 1}
-                    </span>
-                    <span
-                      className={`px-2.5 py-0.5 rounded-full text-[11px] font-bold ${
-                        isMc
-                          ? 'bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300'
-                          : 'bg-amber-50 dark:bg-amber-950 text-amber-700 dark:text-amber-300'
-                      }`}
-                    >
-                      {isMc ? 'Trắc nghiệm' : 'Tự luận / Tính toán / Vẽ hình'}
-                    </span>
-                  </div>
-                  <div className="text-base font-bold text-slate-900 dark:text-white">
-                    <RichContent text={q.question_de} isGerman dictMode={dictMode} onWordClick={onWordClick} />
-                  </div>
-                  {showVn && q.question_vn && (
-                    <div className="text-sm text-slate-600 dark:text-slate-300 bg-slate-50 dark:bg-slate-800/70 border-l-4 border-indigo-400 px-3.5 py-2 rounded-r-lg">
-                      <RichContent text={q.question_vn} />
-                    </div>
-                  )}
-                  {q.diagram_json && <DiagramRenderer diagram={q.diagram_json} />}
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="px-2.5 py-0.5 rounded-full text-[11px] font-extrabold bg-indigo-600 text-white">
+                    Câu {idx + 1}
+                  </span>
+                  <span
+                    className={`px-2.5 py-0.5 rounded-full text-[11px] font-bold border ${
+                      isMc
+                        ? 'bg-sky-50 dark:bg-sky-950/60 text-sky-700 dark:text-sky-300 border-sky-200 dark:border-sky-800'
+                        : 'bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800'
+                    }`}
+                  >
+                    {isMc ? 'Trắc nghiệm (Single Choice)' : 'Tự luận / Tính toán / Vẽ hình'}
+                  </span>
                 </div>
                 <button
                   type="button"
                   onClick={() => speakGerman(q.question_de, ttsRate)}
-                  className="p-2 text-slate-400 hover:text-indigo-600 rounded-xl transition shrink-0"
+                  title="Nghe câu hỏi tiếng Đức"
+                  className="p-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:text-indigo-600 shrink-0"
                 >
                   <Volume2 className="w-4 h-4" />
                 </button>
               </div>
 
+              {/* Question Text (DE clickable + VN) */}
+              <div className="space-y-2">
+                <div className="text-sm sm:text-base font-bold text-slate-900 dark:text-white leading-relaxed">
+                  <RichContent text={q.question_de} isGerman dictMode={dictMode} onWordClick={onWordClick} />
+                </div>
+                {showVn && q.question_vn && (
+                  <div className="bg-slate-50 dark:bg-slate-800/60 border-l-4 border-indigo-400 rounded-r-xl px-3.5 py-2.5 text-xs sm:text-sm text-slate-600 dark:text-slate-300">
+                    <RichContent text={q.question_vn} mixedGerman dictMode={dictMode} onWordClick={onWordClick} />
+                  </div>
+                )}
+              </div>
+
+              {/* MC OPTIONS */}
               {isMc ? (
-                <div className="space-y-2.5">
-                  {(q.options || []).map((opt, oIdx) => {
-                    const selected = mcAnswers[q.id] === oIdx;
-                    let cardStyle =
-                      'border-slate-200 dark:border-slate-700 hover:border-indigo-400 bg-white dark:bg-slate-900';
-                    if (result) {
-                      if (oIdx === q.correct_index) {
-                        cardStyle = 'border-emerald-500 bg-emerald-50/70 dark:bg-emerald-950/40';
-                      } else if (selected && oIdx !== q.correct_index) {
-                        cardStyle = 'border-rose-400 bg-rose-50/70 dark:bg-rose-950/40';
+                <div className="space-y-2">
+                  {(Array.isArray(q.options) ? q.options : []).map((opt, optIdx) => {
+                    const selected = pickedIdx === optIdx;
+                    const isRightOpt = Number(q.correct_index) === optIdx;
+                    let cls =
+                      'bg-slate-50 dark:bg-slate-800/50 border-slate-200 dark:border-slate-700 hover:border-indigo-400 text-slate-800 dark:text-slate-100';
+
+                    if (submitted) {
+                      if (isRightOpt) {
+                        cls =
+                          'bg-emerald-50 dark:bg-emerald-950/50 border-emerald-500 text-emerald-950 dark:text-emerald-100';
+                      } else if (selected && !isRightOpt) {
+                        cls = 'bg-rose-50 dark:bg-rose-950/50 border-rose-500 text-rose-950 dark:text-rose-100';
                       } else {
-                        cardStyle = 'border-slate-200 dark:border-slate-800 opacity-65';
+                        cls = 'bg-slate-50/50 dark:bg-slate-900/40 border-slate-200 dark:border-slate-800 opacity-60';
                       }
                     } else if (selected) {
-                      cardStyle = 'border-indigo-600 bg-indigo-50/60 dark:bg-indigo-950/50 ring-1 ring-indigo-600';
+                      cls = 'bg-indigo-50 dark:bg-indigo-950/60 border-indigo-500 text-indigo-950 dark:text-indigo-100';
                     }
 
                     return (
-                      <button
-                        key={oIdx}
-                        type="button"
-                        disabled={Boolean(result)}
-                        onClick={() => setMcAnswers({ ...mcAnswers, [q.id]: oIdx })}
-                        className={`w-full text-left p-3.5 rounded-xl border transition flex items-start gap-3 ${cardStyle}`}
+                      <div
+                        key={optIdx}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => !submitted && setMcAnswers((prev) => ({ ...prev, [q.id]: optIdx }))}
+                        onKeyDown={(e) => {
+                          if ((e.key === 'Enter' || e.key === ' ') && !submitted) {
+                            e.preventDefault();
+                            setMcAnswers((prev) => ({ ...prev, [q.id]: optIdx }));
+                          }
+                        }}
+                        className={`w-full text-left p-3.5 rounded-2xl border-2 transition flex items-start gap-3 ${
+                          submitted ? 'cursor-default' : 'cursor-pointer'
+                        } ${cls}`}
                       >
                         <span
-                          className={`w-6 h-6 rounded-full text-xs font-bold flex items-center justify-center shrink-0 mt-0.5 ${
-                            selected ? 'bg-indigo-600 text-white' : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300'
+                          className={`w-6 h-6 rounded-lg text-xs font-extrabold flex items-center justify-center shrink-0 mt-0.5 ${
+                            submitted && isRightOpt
+                              ? 'bg-emerald-600 text-white'
+                              : submitted && selected && !isRightOpt
+                              ? 'bg-rose-600 text-white'
+                              : selected
+                              ? 'bg-indigo-600 text-white'
+                              : 'bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300'
                           }`}
                         >
-                          {String.fromCharCode(65 + oIdx)}
+                          {String.fromCharCode(65 + optIdx)}
                         </span>
-                        <div className="space-y-0.5">
-                          <p className="text-sm font-semibold text-slate-900 dark:text-white">{opt.de}</p>
-                          {showVn && opt.vn && <p className="text-xs text-slate-600 dark:text-slate-400">{opt.vn}</p>}
+                        <div className="flex-1 min-w-0 space-y-0.5">
+                          <div className="text-xs sm:text-sm font-semibold">
+                            <RichContent text={opt.de || ''} isGerman dictMode={dictMode} onWordClick={onWordClick} />
+                          </div>
+                          {showVn && opt.vn && (
+                            <div className="text-[11px] sm:text-xs text-slate-500 dark:text-slate-400">
+                              <RichContent text={opt.vn} mixedGerman dictMode={dictMode} onWordClick={onWordClick} />
+                            </div>
+                          )}
                         </div>
-                      </button>
+                        {submitted && isRightOpt && <CheckCircle2 className="w-5 h-5 text-emerald-500 shrink-0 mt-0.5" />}
+                        {submitted && selected && !isRightOpt && <XCircle className="w-5 h-5 text-rose-500 shrink-0 mt-0.5" />}
+                      </div>
                     );
                   })}
 
-                  {mcState && (
+                  {/* MC Explanation after submit */}
+                  {submitted && (
                     <div
-                      className={`mt-3 rounded-xl p-4 border text-sm space-y-1.5 ${
-                        mcState.isCorrect
-                          ? 'bg-emerald-50 dark:bg-emerald-950/50 border-emerald-200 dark:border-emerald-800 text-emerald-900 dark:text-emerald-200'
-                          : 'bg-rose-50 dark:bg-rose-950/50 border-rose-200 dark:border-rose-800 text-rose-900 dark:text-rose-200'
+                      className={`mt-3 rounded-2xl border p-4 space-y-2 ${
+                        isMcCorrect
+                          ? 'bg-emerald-50/70 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800'
+                          : 'bg-rose-50/70 dark:bg-rose-950/30 border-rose-200 dark:border-rose-800'
                       }`}
                     >
-                      <p className="font-bold flex items-center gap-1.5">
-                        {mcState.isCorrect ? (
+                      <div
+                        className={`text-xs font-extrabold flex items-center gap-1.5 ${
+                          isMcCorrect ? 'text-emerald-700 dark:text-emerald-300' : 'text-rose-700 dark:text-rose-300'
+                        }`}
+                      >
+                        {isMcCorrect ? (
                           <>
-                            <CheckCircle2 className="w-4 h-4 text-emerald-600" /> Chính xác! (100%)
+                            <CheckCircle2 className="w-4 h-4" /> Chính xác! (100%)
                           </>
                         ) : (
                           <>
-                            <AlertCircle className="w-4 h-4 text-rose-600" /> Sai — Đáp án đúng là{' '}
-                            {String.fromCharCode(65 + q.correct_index)}
+                            <XCircle className="w-4 h-4" /> Chưa chính xác — Đáp án đúng là{' '}
+                            {String.fromCharCode(65 + Number(q.correct_index ?? 0))}
                           </>
                         )}
-                      </p>
-                      {q.explanation_de && <p className="text-xs leading-relaxed">{q.explanation_de}</p>}
+                      </div>
+                      {q.explanation_de && (
+                        <div className="text-xs sm:text-sm text-slate-800 dark:text-slate-100">
+                          <RichContent text={q.explanation_de} isGerman dictMode={dictMode} onWordClick={onWordClick} />
+                        </div>
+                      )}
                       {showVn && q.explanation_vn && (
-                        <p className="text-xs opacity-90 pt-1 border-t border-black/10 dark:border-white/10">{q.explanation_vn}</p>
+                        <div className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 pt-1 border-t border-slate-200/70 dark:border-slate-700/70">
+                          <RichContent text={q.explanation_vn} mixedGerman dictMode={dictMode} onWordClick={onWordClick} />
+                        </div>
                       )}
                     </div>
                   )}
                 </div>
               ) : (
+                /* ESSAY / CALCULATION QUESTION */
                 <div className="space-y-3">
                   <textarea
                     rows={4}
-                    disabled={Boolean(result)}
+                    disabled={submitted || grading}
                     value={essayAnswers[q.id] || ''}
-                    onChange={(e) => setEssayAnswers({ ...essayAnswers, [q.id]: e.target.value })}
-                    placeholder="Gõ bài làm của bạn (tiếng Đức hoặc tiếng Việt), HOẶC viết công thức / vẽ biểu đồ ra giấy rồi bấm nút chụp ảnh ngay bên dưới..."
-                    className="w-full p-3.5 text-sm bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white border border-slate-200 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-75"
+                    onChange={(e) => setEssayAnswers((prev) => ({ ...prev, [q.id]: e.target.value }))}
+                    placeholder="Gõ câu trả lời bằng tiếng Đức, tiếng Việt hoặc kết quả tính toán... (hoặc chụp ảnh giấy nháp bên dưới)"
+                    className="w-full p-3.5 text-sm bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-2xl text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-75"
                   />
 
-                  {/* Handwritten Scratch Paper Photo Upload */}
-                  {!result && (
-                    <div className="flex flex-wrap items-center gap-3">
-                      <label className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold bg-indigo-50 dark:bg-indigo-950/70 hover:bg-indigo-100 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 cursor-pointer transition">
-                        <Camera className="w-4 h-4" />
-                        {paperImg ? 'Đổi ảnh bài giải giấy nháp' : 'Chụp / Tải ảnh bài giải giấy nháp'}
+                  {/* Handwritten paper photo upload */}
+                  {!submitted && (
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <label className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-indigo-50 dark:hover:bg-indigo-950/60 text-slate-700 dark:text-slate-200 text-xs font-bold border border-slate-200 dark:border-slate-700 cursor-pointer transition">
+                        <Camera className="w-4 h-4 text-indigo-500" />
+                        <span>{uploadedImg ? 'Đổi ảnh giấy nháp' : 'Chụp / tải ảnh giấy nháp (T-Konto, tính toán)'}</span>
                         <input
                           type="file"
                           accept="image/*"
-                          capture="environment"
                           className="hidden"
                           onChange={(e) => {
-                            handleUploadPaper(q.id, e.target.files?.[0]);
+                            handleUploadEssayPhoto(q.id, e.target.files?.[0]);
                             e.target.value = '';
                           }}
                         />
                       </label>
-                      {paperImg && (
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setEssayImages((prev) => {
-                              const next = { ...prev };
-                              delete next[q.id];
-                              return next;
-                            })
-                          }
-                          className="inline-flex items-center gap-1 text-xs font-semibold text-rose-600 hover:underline"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" /> Gỡ ảnh
-                        </button>
+
+                      {uploadedImg && (
+                        <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-200 dark:border-indigo-800">
+                          <img src={uploadedImg.dataUrl} alt="Giấy nháp" className="w-8 h-8 rounded object-cover" />
+                          <span className="text-[11px] font-bold text-indigo-800 dark:text-indigo-200 max-w-[160px] truncate">
+                            {uploadedImg.name}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setEssayImages((prev) => {
+                                const next = { ...prev };
+                                delete next[q.id];
+                                return next;
+                              })
+                            }
+                            className="p-1 text-slate-400 hover:text-rose-600"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
                       )}
                     </div>
                   )}
 
-                  {paperImg && (
-                    <div className="rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden max-w-sm bg-slate-100 dark:bg-slate-800">
-                      <img src={paperImg.previewUrl} alt="Bài giải viết tay" className="w-full max-h-56 object-contain" />
+                  {/* AI Grading Feedback Box — RENDERED WITH RICHCONTENT (NO MORE RAW ** / $$ / ` BUGS!) */}
+                  {submitted && aiGrade && (
+                    <div
+                      className={`rounded-2xl border p-4 sm:p-5 space-y-3 ${
+                        aiGrade.score >= 80
+                          ? 'bg-emerald-50/60 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800'
+                          : aiGrade.score >= 50
+                          ? 'bg-amber-50/60 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800'
+                          : 'bg-rose-50/60 dark:bg-rose-950/30 border-rose-200 dark:border-rose-800'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-extrabold uppercase tracking-wider text-emerald-700 dark:text-emerald-300">
+                          AI Chấm điểm & Sửa lỗi (kể cả ảnh giấy nháp)
+                        </span>
+                        <span className="px-2.5 py-0.5 rounded-full text-xs font-black bg-slate-900 dark:bg-slate-800 text-white">
+                          {aiGrade.score}%
+                        </span>
+                      </div>
+
+                      {aiGrade.feedback_de && (
+                        <div className="text-xs sm:text-sm text-slate-900 dark:text-slate-100 font-medium">
+                          <RichContent text={aiGrade.feedback_de} isGerman dictMode={dictMode} onWordClick={onWordClick} />
+                        </div>
+                      )}
+
+                      {showVn && aiGrade.feedback_vn && (
+                        <div className="pt-2.5 border-t border-slate-200/70 dark:border-slate-700/70 text-xs sm:text-sm text-slate-700 dark:text-slate-200">
+                          <RichContent text={aiGrade.feedback_vn} mixedGerman dictMode={dictMode} onWordClick={onWordClick} />
+                        </div>
+                      )}
                     </div>
                   )}
 
-                  {/* Essay AI Grading Result */}
-                  {essayState && (
-                    <div className="space-y-3 pt-1">
-                      <div
-                        className={`rounded-xl p-4 border space-y-2 ${
-                          essayState.score >= 70
-                            ? 'bg-emerald-50 dark:bg-emerald-950/50 border-emerald-200 dark:border-emerald-800'
-                            : essayState.score >= 40
-                            ? 'bg-amber-50 dark:bg-amber-950/50 border-amber-200 dark:border-amber-800'
-                            : 'bg-rose-50 dark:bg-rose-950/50 border-rose-200 dark:border-rose-800'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-bold uppercase tracking-wider text-slate-800 dark:text-slate-100">
-                            AI Chấm điểm & Sửa lỗi (kể cả ảnh giấy nháp)
-                          </span>
-                          <span className="px-2.5 py-0.5 rounded-full text-xs font-extrabold bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white">
-                            {essayState.score}%
-                          </span>
-                        </div>
-                        <p className="text-sm text-slate-900 dark:text-slate-100 leading-relaxed">{essayState.feedback_de}</p>
-                        {showVn && essayState.feedback_vn && (
-                          <p className="text-xs text-slate-700 dark:text-slate-300 pt-1.5 border-t border-black/10 dark:border-white/10 leading-relaxed">
-                            {essayState.feedback_vn}
-                          </p>
-                        )}
+                  {/* IHK Musterlösung Box */}
+                  {submitted && (aiGrade?.musterloesung_de || q.model_answer_de) && (
+                    <div className="rounded-2xl border border-indigo-200 dark:border-indigo-800/80 bg-indigo-50/40 dark:bg-indigo-950/30 p-4 sm:p-5 space-y-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-extrabold uppercase tracking-wider text-indigo-700 dark:text-indigo-300">
+                          IHK-Musterlösung (Bài mẫu chuẩn đi thi)
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => speakGerman(aiGrade?.musterloesung_de || q.model_answer_de, ttsRate)}
+                          className="p-1.5 rounded-lg bg-white/80 dark:bg-slate-800 text-indigo-600 dark:text-indigo-300"
+                          title="Nghe bài mẫu tiếng Đức"
+                        >
+                          <Volume2 className="w-3.5 h-3.5" />
+                        </button>
                       </div>
-
-                      <div className="bg-slate-900 dark:bg-slate-950 text-white rounded-xl p-4 space-y-2 border border-slate-800">
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-bold uppercase tracking-wider text-indigo-300">
-                            IHK-Musterlösung (Bài mẫu chuẩn đi thi)
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => speakGerman(essayState.musterloesung_de || q.model_answer_de, ttsRate)}
-                            className="p-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white"
-                          >
-                            <Volume2 className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
+                      <div className="text-xs sm:text-sm text-slate-900 dark:text-slate-100">
                         <RichContent
-                          text={essayState.musterloesung_de || q.model_answer_de}
+                          text={aiGrade?.musterloesung_de || q.model_answer_de}
                           isGerman
                           dictMode={dictMode}
                           onWordClick={onWordClick}
-                          className="text-sm text-slate-100"
                         />
-                        {showVn && (essayState.musterloesung_vn || q.model_answer_vn) && (
-                          <div className="text-xs text-indigo-200 bg-white/10 px-3 py-2 rounded-lg leading-relaxed">
-                            <RichContent text={essayState.musterloesung_vn || q.model_answer_vn} />
-                          </div>
-                        )}
                       </div>
+                      {showVn && (aiGrade?.musterloesung_vn || q.model_answer_vn) && (
+                        <div className="pt-2.5 border-t border-indigo-200/70 dark:border-indigo-800/60 text-xs sm:text-sm text-slate-700 dark:text-slate-300">
+                          <RichContent
+                            text={aiGrade?.musterloesung_vn || q.model_answer_vn}
+                            mixedGerman
+                            dictMode={dictMode}
+                            onWordClick={onWordClick}
+                          />
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -481,21 +555,22 @@ export default function QuizPanel({
         })}
       </div>
 
-      {!result && (
+      {/* Submit CTA */}
+      {!submitted && (
         <div className="flex justify-end pt-2">
           <button
             type="button"
-            onClick={handleSubmit}
             disabled={grading}
-            className="w-full sm:w-auto px-6 py-3.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-sm rounded-2xl shadow-md transition flex items-center justify-center gap-2 disabled:opacity-60"
+            onClick={handleSubmit}
+            className="px-6 py-3 rounded-2xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white text-sm font-extrabold shadow-md inline-flex items-center gap-2 transition"
           >
             {grading ? (
               <>
-                <Loader2 className="w-4 h-4 animate-spin" /> AI đang chấm bài & soi ảnh giấy nháp...
+                <Loader2 className="w-4 h-4 animate-spin" /> AI đang chấm điểm chuẩn Teilpunkte IHK...
               </>
             ) : (
               <>
-                <Send className="w-4 h-4" /> Nộp bài & Chấm điểm ngay
+                <Sparkles className="w-4 h-4" /> Nộp bài & Chấm điểm AI
               </>
             )}
           </button>
