@@ -354,6 +354,7 @@ export default function App() {
   const boardTouchRef = useRef({ mode: null, startX: 0, startY: 0, startDist: 0, startZoom: 1, moved: false });
   const edgeSwipeRef = useRef({ active: false, startX: 0, startY: 0, triggered: false });
   const drawerTouchRef = useRef({ active: false, startX: 0, startY: 0 });
+  const wordLookupSeqRef = useRef(0);
   const [openExplainIds, setOpenExplainIds] = useState({});
   const [loadingExplainId, setLoadingExplainId] = useState(null);
   const [editingSectionId, setEditingSectionId] = useState(null);
@@ -1030,81 +1031,122 @@ export default function App() {
     [wrongQuestions]
   );
 
-  // ==================== CLICK-TO-TRANSLATE DICTIONARY HANDLER (0ms LOCAL + SIÊU TỐC) ====================
+  // ==================== CLICK-TO-TRANSLATE & FULL GERMAN-VIETNAMESE DICTIONARY ENGINE ====================
+  const lookupWordCore = async (cleaned, contextSentence = '') => {
+    const key = cleaned.toLowerCase();
+
+    // Tầng 1 (0ms): Đã có trong cache bộ nhớ / localStorage / Supabase
+    if (dictCache[key]) {
+      return { entry: dictCache[key], alreadyInVocab: false };
+    }
+
+    // Tầng 2 (0ms): Khớp trực tiếp hoặc khớp dạng số nhiều trong kho Từ vựng IHK
+    const vocabMatch = vocabularies.find((v) => {
+      const w = (v.word_de || '').trim().toLowerCase();
+      if (!w) return false;
+      if (w === key) return true;
+      const pl = (v.plural || '').replace(/^die\s+/i, '').trim().toLowerCase();
+      return Boolean(pl && pl === key);
+    });
+    if (vocabMatch) {
+      return {
+        entry: {
+          word_key: key,
+          lemma_de: vocabMatch.word_de || cleaned,
+          article: vocabMatch.article || '',
+          plural: vocabMatch.plural || '',
+          word_type: vocabMatch.word_type || 'Fachbegriff',
+          meaning_vn: vocabMatch.meaning_vn || '',
+          example_de: vocabMatch.example_de || '',
+          example_vn: vocabMatch.example_vn || '',
+          grammar_note_vn: vocabMatch.grammar_note_vn || '',
+        },
+        alreadyInVocab: true,
+      };
+    }
+
+    // Tầng 3 (~0.25s): Gọi Groq Instant (có tự thử lại 1 lần nếu nghẽn mạng ngắn)
+    let data = null;
+    try {
+      data = await callGeminiApi('lookup_word', { word: cleaned, contextSentence });
+    } catch {
+      await new Promise((r) => setTimeout(r, 350));
+      data = await callGeminiApi('lookup_word', { word: cleaned, contextSentence });
+    }
+
+    const entry = {
+      word_key: key,
+      lemma_de: data?.lemma_de || cleaned,
+      article: data?.article || '',
+      plural: data?.plural || '',
+      word_type: data?.word_type || 'Fachbegriff',
+      meaning_vn: data?.meaning_vn || '',
+      example_de: data?.example_de || '',
+      example_vn: data?.example_vn || '',
+      grammar_note_vn: data?.grammar_note_vn || '',
+    };
+
+    setDictCache((prev) => {
+      const next = {
+        ...prev,
+        [key]: entry,
+        ...(entry.lemma_de ? { [entry.lemma_de.toLowerCase()]: entry } : {}),
+      };
+      try {
+        localStorage.setItem(LOCAL_DICT_CACHE_KEY, JSON.stringify(next));
+      } catch {
+        // ignore storage quota
+      }
+      return next;
+    });
+
+    if (supabase) {
+      supabase.from('dictionary_cache').upsert(entry, { onConflict: 'word_key' }).then(() => {});
+    }
+    return { entry, alreadyInVocab: false };
+  };
+
   const handleWordClick = async (rawWord, contextSentence = '') => {
     // Nếu người dùng đang kéo chuột tô đen nhiều chữ để bấm "↳ Hỏi Gia sư AI", không bật popup tra 1 từ
     if (typeof window !== 'undefined') {
       const selStr = (window.getSelection()?.toString() || '').trim();
       if (selStr.length >= 2) return;
     }
-    const cleaned = rawWord.trim();
+    const cleaned = String(rawWord || '').trim();
     if (!cleaned) return;
     const key = cleaned.toLowerCase();
 
-    // Tầng 1 (0ms): Đã từng tra trước đó (RAM / localStorage / Supabase cache)
+    const reqSeq = ++wordLookupSeqRef.current;
+
+    // Trả về 0ms ngay lập tức nếu đã có sẵn trong cache
     if (dictCache[key]) {
       setWordLookup({ word: cleaned, loading: false, data: dictCache[key], error: '', saved: false });
       return;
     }
 
-    // Tầng 2 (0ms): Đã có sẵn trong kho Từ vựng IHK của các bài học
-    const vocabMatch = vocabularies.find(
-      (v) => (v.word_de || '').trim().toLowerCase() === key
-    );
-    if (vocabMatch) {
-      const entry = {
-        word_key: key,
-        lemma_de: vocabMatch.word_de || cleaned,
-        article: vocabMatch.article || '',
-        plural: vocabMatch.plural || '',
-        word_type: vocabMatch.word_type || 'Fachbegriff',
-        meaning_vn: vocabMatch.meaning_vn || '',
-        example_de: vocabMatch.example_de || '',
-        example_vn: vocabMatch.example_vn || '',
-        grammar_note_vn: vocabMatch.grammar_note_vn || '',
-      };
-      setWordLookup({ word: cleaned, loading: false, data: entry, error: '', saved: true });
-      return;
-    }
-
-    // Tầng 3 (~0.3-0.5s): Từ hoàn toàn mới -> gọi Groq llama-3.1-8b-instant siêu tốc
     setWordLookup({ word: cleaned, loading: true, data: null, error: '', saved: false });
     try {
-      const data = await callGeminiApi('lookup_word', { word: cleaned, contextSentence });
-      const entry = {
-        word_key: key,
-        lemma_de: data.lemma_de || cleaned,
-        article: data.article || '',
-        plural: data.plural || '',
-        word_type: data.word_type || 'Fachbegriff',
-        meaning_vn: data.meaning_vn || '',
-        example_de: data.example_de || '',
-        example_vn: data.example_vn || '',
-        grammar_note_vn: data.grammar_note_vn || '',
-      };
-
-      setDictCache((prev) => {
-        const next = {
-          ...prev,
-          [key]: entry,
-          ...(entry.lemma_de ? { [entry.lemma_de.toLowerCase()]: entry } : {}),
-        };
-        try {
-          localStorage.setItem(LOCAL_DICT_CACHE_KEY, JSON.stringify(next));
-        } catch {
-          // ignore storage quota
-        }
-        return next;
-      });
-      setWordLookup({ word: cleaned, loading: false, data: entry, error: '', saved: false });
-
-      // Save to Supabase shared dictionary_cache asynchronously
-      if (supabase) {
-        supabase.from('dictionary_cache').upsert(entry, { onConflict: 'word_key' }).then(() => {});
-      }
+      const { entry, alreadyInVocab } = await lookupWordCore(cleaned, contextSentence);
+      if (wordLookupSeqRef.current !== reqSeq) return; // Tránh đè kết quả nếu user vừa bấm sang từ khác
+      setWordLookup({ word: cleaned, loading: false, data: entry, error: '', saved: alreadyInVocab });
     } catch (err) {
-      setWordLookup({ word: cleaned, loading: false, data: null, error: err.message || 'Không dịch được từ này.', saved: false });
+      if (wordLookupSeqRef.current !== reqSeq) return;
+      setWordLookup({
+        word: cleaned,
+        loading: false,
+        data: null,
+        error: err.message || 'Tạm chưa dịch được từ này, bạn thử bấm lại nhé.',
+        saved: false,
+      });
     }
+  };
+
+  // Tra cứu trực tiếp trong mục Từ điển Đức–Việt (VocabView)
+  const handleDirectDictionaryLookup = async (queryText) => {
+    const cleaned = String(queryText || '').trim();
+    if (!cleaned) throw new Error('Vui lòng nhập từ cần tra.');
+    const { entry } = await lookupWordCore(cleaned, '');
+    return entry;
   };
 
   const handleSavePopoverWordToLessonVocab = async (entry) => {
@@ -3765,7 +3807,7 @@ ${item.text}`
                   </div>
                   {showVn && activeLesson.overview_vn && (
                     <div className="bg-white dark:bg-slate-900 border-l-4 border-indigo-400 rounded-r-xl px-4 py-3 text-sm text-slate-600 dark:text-slate-300">
-                      <RichContent text={activeLesson.overview_vn} />
+                      <RichContent text={activeLesson.overview_vn} mixedGerman dictMode={dictMode} onWordClick={handleWordClick} />
                     </div>
                   )}
                 </div>
@@ -3905,7 +3947,7 @@ ${item.text}`
                             {/* Vietnamese Content */}
                             {showVn && sec.content_vn && (
                               <div className="bg-slate-50 dark:bg-slate-800/60 border-l-4 border-indigo-400 border border-slate-200/70 dark:border-slate-700 rounded-r-2xl px-4 py-3.5 text-sm text-slate-600 dark:text-slate-300">
-                                <RichContent text={sec.content_vn} />
+                                <RichContent text={sec.content_vn} mixedGerman dictMode={dictMode} onWordClick={handleWordClick} />
                               </div>
                             )}
 
@@ -4080,9 +4122,9 @@ ${item.text}`
                                     />
                                   )}
                                   {showVn && sec.explanation_vn && (
-                                    <p className="text-sm text-emerald-950 dark:text-emerald-100 bg-white/80 dark:bg-slate-900/70 border-l-4 border-emerald-500 rounded-r-xl px-3.5 py-2.5 leading-relaxed">
-                                      {sec.explanation_vn}
-                                    </p>
+                                    <div className="text-sm text-emerald-950 dark:text-emerald-100 bg-white/80 dark:bg-slate-900/70 border-l-4 border-emerald-500 rounded-r-xl px-3.5 py-2.5 leading-relaxed">
+                                      <RichContent text={sec.explanation_vn} mixedGerman dictMode={dictMode} onWordClick={handleWordClick} />
+                                    </div>
                                   )}
                                 </div>
                                 {(sec.example_de || sec.example_vn) && (
@@ -4090,13 +4132,22 @@ ${item.text}`
                                     <span className="text-xs font-extrabold uppercase tracking-wider text-teal-800 dark:text-teal-300">
                                       Ví dụ thực tế ngành sự kiện
                                     </span>
-                                    {sec.example_de && <p className="text-sm text-slate-800 dark:text-slate-200">{sec.example_de}</p>}
-                                    {showVn && sec.example_vn && <p className="text-xs text-slate-600 dark:text-slate-400 italic">{sec.example_vn}</p>}
+                                    {sec.example_de && (
+                                      <div className="text-sm text-slate-800 dark:text-slate-200">
+                                        <RichContent text={sec.example_de} isGerman dictMode={dictMode} onWordClick={handleWordClick} />
+                                      </div>
+                                    )}
+                                    {showVn && sec.example_vn && (
+                                      <div className="text-xs text-slate-600 dark:text-slate-400 italic">
+                                        <RichContent text={sec.example_vn} mixedGerman dictMode={dictMode} onWordClick={handleWordClick} />
+                                      </div>
+                                    )}
                                   </div>
                                 )}
                                 {sec.exam_tip_vn && (
-                                  <div className="bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 rounded-xl px-3.5 py-2.5 text-xs text-amber-900 dark:text-amber-200">
-                                    <strong>Mẹo đi thi IHK:</strong> {sec.exam_tip_vn}
+                                  <div className="bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 rounded-xl px-3.5 py-2.5 text-xs text-amber-900 dark:text-amber-200 space-y-1">
+                                    <strong className="block">Mẹo đi thi IHK:</strong>
+                                    <RichContent text={sec.exam_tip_vn} mixedGerman dictMode={dictMode} onWordClick={handleWordClick} />
                                   </div>
                                 )}
                               </div>
@@ -4170,12 +4221,15 @@ ${item.text}`
               {lessonTab === 'vocab' && (
                 <VocabView
                   vocabularies={activeVocabs}
+                  dictCache={dictCache}
                   ttsRate={ttsRate}
                   isAdmin={isAdmin}
                   isLessonScoped
                   onGenerateMoreVocab={handleGenerateMoreVocab}
                   onAddManualVocab={handleAddManualVocab}
                   onDeleteVocab={handleDeleteVocab}
+                  onLookupDictionary={handleDirectDictionaryLookup}
+                  onWordClick={handleWordClick}
                 />
               )}
 
@@ -4299,10 +4353,13 @@ ${item.text}`
               vocabularies={vocabularies}
               subjects={subjects}
               lessons={lessons}
+              dictCache={dictCache}
               ttsRate={ttsRate}
               isAdmin={isAdmin}
               onDeleteVocab={handleDeleteVocab}
               onOpenLesson={(lid) => openLesson(lid, 'vocab')}
+              onLookupDictionary={handleDirectDictionaryLookup}
+              onWordClick={handleWordClick}
             />
           )}
 
