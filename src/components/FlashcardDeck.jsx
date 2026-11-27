@@ -1,52 +1,53 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   Volume2,
+  RotateCw,
+  ChevronLeft,
+  ChevronRight,
   Shuffle,
   List,
   Layers,
-  ChevronLeft,
-  ChevronRight,
   Sparkles,
   Plus,
-  CheckCircle2,
-  RotateCcw,
-  Loader2,
   Trash2,
-  Clock,
+  Loader2,
+  Languages,
+  Eye,
+  EyeOff,
+  X,
 } from 'lucide-react';
-import { speakGerman } from '../lib/tts';
 import { isCardDue } from '../lib/seedData';
+import { speakGerman } from '../lib/tts';
+import { callGeminiApi } from '../lib/api';
 import RichContent from './RichContent';
 
-const STATUS_META = {
-  new: { label: 'Chưa thuộc', cls: 'bg-rose-50 dark:bg-rose-950/60 text-rose-700 dark:text-rose-300 border-rose-200 dark:border-rose-800' },
-  learning: { label: 'Tạm nhớ', cls: 'bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800' },
-  mastered: { label: 'Đã thuộc', cls: 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800' },
-};
-
 export default function FlashcardDeck({
-  cards,
-  progressMap, // { [id]: { status, interval_days, next_review_at, repetitions, ease_factor } }
+  cards = [],
+  progressMap = {},
   onSetMastery,
-  showVn,
-  ttsRate,
-  dictMode,
-  onWordClick,
-  isAdmin,
-  onGenerateMoreCards,
-  onAddManualCard,
-  onDeleteCard,
-  subjectMap = {},
+  showVn = true,
+  ttsRate = 1.0,
+  dictMode = true,
+  onWordClick = null,
+  isAdmin = false,
+  onGenerateMoreCards = null,
+  onAddManualCard = null,
+  onDeleteCard = null,
+  subjectMap = null,
 }) {
-  const [filter, setFilter] = useState('due'); // 'due' | 'all' | 'mastered'
-  const [viewMode, setViewMode] = useState('deck');
-  const [orderedIds, setOrderedIds] = useState([]);
-  const [currentIndex, setCurrentIndex] = useState(0);
+  const [filterMode, setFilterMode] = useState('due'); // 'due' | 'all' | 'mastered'
+  const [viewMode, setViewMode] = useState('deck'); // 'deck' | 'list'
+  const [shuffledOrder, setShuffledOrder] = useState(null);
+  const [currentIdx, setCurrentIdx] = useState(0);
   const [flipped, setFlipped] = useState(false);
-  const [showHint, setShowHint] = useState(false);
+  // Luôn hiển thị bản dịch / gợi ý tiếng Việt ngay mặt trước khi Dịch VN đang BẬT (có thể bật/tắt nhanh)
+  const [showFrontVn, setShowFrontVn] = useState(true);
+  const [frontTranslations, setFrontTranslations] = useState({}); // { [cardId]: string }
+  const [translatingCardId, setTranslatingCardId] = useState(null);
+
   const [generating, setGenerating] = useState(false);
   const [showAddForm, setShowAddForm] = useState(false);
-  const [newCard, setNewCard] = useState({
+  const [draft, setDraft] = useState({
     category: 'Fachbegriff',
     front_de: '',
     hint_vn: '',
@@ -55,111 +56,130 @@ export default function FlashcardDeck({
     example_de: '',
     example_vn: '',
   });
+  const [savingCard, setSavingCard] = useState(false);
 
-  const getRec = (id) => progressMap[id] || { status: 'new', interval_days: 0, repetitions: 0 };
+  const dueCount = useMemo(() => cards.filter((c) => isCardDue(progressMap[c.id])).length, [cards, progressMap]);
+  const masteredCount = useMemo(
+    () => cards.filter((c) => progressMap[c.id]?.status === 'mastered').length,
+    [cards, progressMap]
+  );
 
-  // Smart Anki sort: 'new' first -> 'learning' -> overdue 'mastered'
   const filteredCards = useMemo(() => {
-    const list = cards.filter((c) => {
-      const rec = getRec(c.id);
-      if (filter === 'due') return isCardDue(rec);
-      if (filter === 'mastered') return rec.status === 'mastered';
-      return true;
-    });
-    const priority = { new: 0, learning: 1, mastered: 2 };
-    return [...list].sort((a, b) => (priority[getRec(a.id).status] ?? 0) - (priority[getRec(b.id).status] ?? 0));
-  }, [cards, progressMap, filter]);
-
-  useEffect(() => {
-    setOrderedIds(filteredCards.map((c) => c.id));
-    setCurrentIndex(0);
-    setFlipped(false);
-    setShowHint(false);
-  }, [filter, cards.length]);
-
-  const deckCards = useMemo(() => {
-    const map = new Map(filteredCards.map((c) => [c.id, c]));
-    const arranged = orderedIds.map((id) => map.get(id)).filter(Boolean);
-    const arrangedSet = new Set(arranged.map((c) => c.id));
-    filteredCards.forEach((c) => {
-      if (!arrangedSet.has(c.id)) arranged.push(c);
-    });
-    return arranged;
-  }, [filteredCards, orderedIds]);
-
-  const currentCard = deckCards[currentIndex] || null;
-  const currentRec = currentCard ? getRec(currentCard.id) : null;
-
-  const masteredCount = cards.filter((c) => getRec(c.id).status === 'mastered').length;
-  const dueCount = cards.filter((c) => isCardDue(getRec(c.id))).length;
-  const pct = cards.length ? Math.round((masteredCount / cards.length) * 100) : 0;
-
-  const goNext = () => {
-    if (!deckCards.length) return;
-    setFlipped(false);
-    setShowHint(false);
-    setCurrentIndex((prev) => (prev + 1) % deckCards.length);
-  };
-
-  const goPrev = () => {
-    if (!deckCards.length) return;
-    setFlipped(false);
-    setShowHint(false);
-    setCurrentIndex((prev) => (prev - 1 + deckCards.length) % deckCards.length);
-  };
-
-  const handleShuffle = () => {
-    const ids = [...deckCards.map((c) => c.id)];
-    for (let i = ids.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [ids[i], ids[j]] = [ids[j], ids[i]];
+    let base = cards;
+    if (filterMode === 'due') {
+      base = cards.filter((c) => isCardDue(progressMap[c.id]));
+      if (base.length === 0 && cards.length > 0) base = cards;
+    } else if (filterMode === 'mastered') {
+      base = cards.filter((c) => progressMap[c.id]?.status === 'mastered');
     }
-    setOrderedIds(ids);
-    setCurrentIndex(0);
-    setFlipped(false);
-    setShowHint(false);
-  };
 
-  const handleRate = (status) => {
-    if (!currentCard) return;
-    onSetMastery(currentCard.id, status);
-    if (deckCards.length > 1) {
-      setTimeout(() => {
-        setFlipped(false);
-        setShowHint(false);
-        setCurrentIndex((prev) => (prev + 1) % deckCards.length);
-      }, 150);
+    if (Array.isArray(shuffledOrder) && shuffledOrder.length > 0) {
+      const byId = new Map(base.map((c) => [c.id, c]));
+      const ordered = shuffledOrder.map((id) => byId.get(id)).filter(Boolean);
+      const seen = new Set(ordered.map((c) => c.id));
+      base.forEach((c) => {
+        if (!seen.has(c.id)) ordered.push(c);
+      });
+      return ordered;
     }
-  };
+    return base;
+  }, [cards, progressMap, filterMode, shuffledOrder]);
 
+  const safeIdx = Math.min(currentIdx, Math.max(0, filteredCards.length - 1));
+  const activeCard = filteredCards[safeIdx] || null;
+
+  // Reset flip when changing card
   useEffect(() => {
-    if (viewMode !== 'deck' || showAddForm) return;
-    const onKeyDown = (e) => {
-      const tag = e.target?.tagName?.toLowerCase();
+    setFlipped(false);
+  }, [safeIdx, filterMode]);
+
+  // Phím tắt Space (lật thẻ), mũi tên trái/phải (đổi thẻ), 1/2/3 (đánh giá SRS)
+  useEffect(() => {
+    if (viewMode !== 'deck' || !activeCard || showAddForm) return undefined;
+    const onKey = (e) => {
+      const tag = (e.target?.tagName || '').toLowerCase();
       if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
       if (e.code === 'Space') {
         e.preventDefault();
         setFlipped((f) => !f);
-      } else if (e.code === 'ArrowRight') {
+      } else if (e.key === 'ArrowRight') {
         e.preventDefault();
-        goNext();
-      } else if (e.code === 'ArrowLeft') {
+        setCurrentIdx((i) => (i + 1) % Math.max(1, filteredCards.length));
+      } else if (e.key === 'ArrowLeft') {
         e.preventDefault();
-        goPrev();
+        setCurrentIdx((i) => (i - 1 + Math.max(1, filteredCards.length)) % Math.max(1, filteredCards.length));
       } else if (e.key === '1') {
-        handleRate('new');
-      } else if (e.key === '2') {
         handleRate('learning');
+      } else if (e.key === '2') {
+        handleRate('review');
       } else if (e.key === '3') {
         handleRate('mastered');
       }
     };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  });
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [viewMode, activeCard, filteredCards.length, showAddForm]);
 
-  const handleAiGenerate = async () => {
-    if (!onGenerateMoreCards) return;
+  const handleRate = async (status) => {
+    if (!activeCard || !onSetMastery) return;
+    await onSetMastery(activeCard.id, status);
+    setFlipped(false);
+    if (filteredCards.length > 1) {
+      setCurrentIdx((i) => (i + 1) % filteredCards.length);
+    }
+  };
+
+  const handleShuffle = () => {
+    const ids = filteredCards.map((c) => c.id);
+    for (let i = ids.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [ids[i], ids[j]] = [ids[j], ids[i]];
+    }
+    setShuffledOrder(ids);
+    setCurrentIdx(0);
+    setFlipped(false);
+  };
+
+  const handleTranslateFront = async (card, e) => {
+    if (e) e.stopPropagation();
+    if (!card?.front_de || translatingCardId === card.id) return;
+    setTranslatingCardId(card.id);
+    try {
+      const res = await callGeminiApi('translate_phrase', { text: card.front_de });
+      if (res?.translation_vn) {
+        setFrontTranslations((prev) => ({ ...prev, [card.id]: res.translation_vn }));
+        setShowFrontVn(true);
+      }
+    } catch {
+      // ignore transient error
+    } finally {
+      setTranslatingCardId(null);
+    }
+  };
+
+  const handleCreateManual = async (e) => {
+    e.preventDefault();
+    if (!draft.front_de.trim() || !draft.back_de.trim() || !onAddManualCard) return;
+    setSavingCard(true);
+    try {
+      await onAddManualCard(draft);
+      setDraft({
+        category: 'Fachbegriff',
+        front_de: '',
+        hint_vn: '',
+        back_de: '',
+        back_vn: '',
+        example_de: '',
+        example_vn: '',
+      });
+      setShowAddForm(false);
+    } finally {
+      setSavingCard(false);
+    }
+  };
+
+  const handleGenerateAI = async () => {
+    if (!onGenerateMoreCards || generating) return;
     setGenerating(true);
     try {
       await onGenerateMoreCards();
@@ -168,406 +188,449 @@ export default function FlashcardDeck({
     }
   };
 
-  const handleManualSubmit = async (e) => {
-    e.preventDefault();
-    if (!newCard.front_de.trim() || !newCard.back_de.trim()) return;
-    await onAddManualCard?.(newCard);
-    setNewCard({
-      category: 'Fachbegriff',
-      front_de: '',
-      hint_vn: '',
-      back_de: '',
-      back_vn: '',
-      example_de: '',
-      example_vn: '',
-    });
-    setShowAddForm(false);
-  };
-
-  const nextMasteredDays = currentRec?.repetitions >= 2 ? '14+ ngày' : currentRec?.repetitions === 1 ? '7 ngày' : '3 ngày';
+  const pct = cards.length ? Math.round((masteredCount / cards.length) * 100) : 0;
 
   return (
     <div className="space-y-5">
-      {/* Progress & Controls Bar */}
-      <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-4 sm:p-5 space-y-4">
+      {/* Header Controls Card */}
+      <div className="bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 p-4 sm:p-5 space-y-4 shadow-sm">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
-              <span>Lặp lại ngắt quãng (SRS kiểu Anki): {masteredCount}/{cards.length} thẻ ({pct}%)</span>
-            </div>
-            <div className="w-56 sm:w-72 h-2 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden mt-1.5">
-              <div className="h-full bg-emerald-500 rounded-full transition-all duration-300" style={{ width: `${pct}%` }} />
-            </div>
+          <div className="space-y-1">
+            <h2 className="text-sm sm:text-base font-extrabold text-slate-900 dark:text-white">
+              Lặp lại ngắt quãng (SRS kiểu Anki): {masteredCount}/{cards.length} thẻ ({pct}%)
+            </h2>
+            <p className="text-[11px] text-slate-500 dark:text-slate-400">
+              Bấm trực tiếp vào bất kỳ từ tiếng Đức nào trên thẻ để tra từ điển (không bị lật nhầm thẻ) · Bấm vùng trống trên thẻ hoặc Space để lật
+            </p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="inline-flex bg-slate-100 dark:bg-slate-800 p-1 rounded-xl text-xs font-semibold">
-              {[
-                { id: 'due', label: `Cần ôn hôm nay (${dueCount})` },
-                { id: 'all', label: `Tất cả (${cards.length})` },
-                { id: 'mastered', label: `Đã thuộc (${masteredCount})` },
-              ].map((tab) => (
-                <button
-                  key={tab.id}
-                  onClick={() => setFilter(tab.id)}
-                  className={`px-2.5 py-1.5 rounded-lg transition ${
-                    filter === tab.id
-                      ? 'bg-white dark:bg-slate-900 text-indigo-700 dark:text-indigo-300 shadow-sm'
-                      : 'text-slate-600 dark:text-slate-400'
-                  }`}
-                >
-                  {tab.label}
-                </button>
-              ))}
-            </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {[
+              { id: 'due', label: `Cần ôn hôm nay (${dueCount})` },
+              { id: 'all', label: `Tất cả (${cards.length})` },
+              { id: 'mastered', label: `Đã thuộc (${masteredCount})` },
+            ].map((f) => (
+              <button
+                key={f.id}
+                type="button"
+                onClick={() => {
+                  setFilterMode(f.id);
+                  setCurrentIdx(0);
+                }}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition ${
+                  filterMode === f.id
+                    ? 'bg-indigo-600 text-white border-indigo-600'
+                    : 'bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-indigo-400'
+                }`}
+              >
+                {f.label}
+              </button>
+            ))}
 
             <button
+              type="button"
               onClick={handleShuffle}
-              title="Trộn thẻ"
-              className="p-2 text-slate-600 dark:text-slate-300 bg-slate-100 dark:bg-slate-800 hover:bg-indigo-50 dark:hover:bg-indigo-950 rounded-xl transition"
+              title="Trộn ngẫu nhiên thứ tự thẻ"
+              className="p-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-indigo-100 dark:hover:bg-indigo-950 text-slate-600 dark:text-slate-300"
             >
               <Shuffle className="w-4 h-4" />
             </button>
+
             <button
-              onClick={() => setViewMode(viewMode === 'deck' ? 'list' : 'deck')}
-              className="flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-xl transition"
+              type="button"
+              onClick={() => setViewMode((m) => (m === 'deck' ? 'list' : 'deck'))}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-xs font-bold text-slate-700 dark:text-slate-200"
             >
-              {viewMode === 'deck' ? <List className="w-4 h-4" /> : <Layers className="w-4 h-4" />}
-              {viewMode === 'deck' ? 'Danh sách' : 'Thẻ 3D'}
+              {viewMode === 'deck' ? <List className="w-3.5 h-3.5" /> : <Layers className="w-3.5 h-3.5" />}
+              {viewMode === 'deck' ? 'Danh sách' : 'Xem thẻ'}
             </button>
           </div>
         </div>
 
-        {isAdmin && (onGenerateMoreCards || onAddManualCard) && (
-          <div className="flex flex-wrap items-center gap-2 pt-3 border-t border-slate-100 dark:border-slate-800">
-            {onGenerateMoreCards && (
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+          <div className="flex flex-wrap items-center gap-2">
+            {isAdmin && onGenerateMoreCards && (
               <button
-                onClick={handleAiGenerate}
+                type="button"
                 disabled={generating}
-                className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-indigo-700 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/60 hover:bg-indigo-100 rounded-xl transition disabled:opacity-60"
+                onClick={handleGenerateAI}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-50 dark:bg-indigo-950/60 hover:bg-indigo-100 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 text-xs font-bold disabled:opacity-50"
               >
                 {generating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
                 + Tạo thêm 5 thẻ bằng AI
               </button>
             )}
-            {onAddManualCard && (
+            {isAdmin && onAddManualCard && (
               <button
-                onClick={() => setShowAddForm((s) => !s)}
-                className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 rounded-xl transition"
+                type="button"
+                onClick={() => setShowAddForm((v) => !v)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-bold"
               >
-                <Plus className="w-3.5 h-3.5" />
-                Tự thêm thẻ mới
+                <Plus className="w-3.5 h-3.5" /> Tự thêm thẻ mới
               </button>
             )}
           </div>
-        )}
 
-        {showAddForm && (
+          {showVn && viewMode === 'deck' && (
+            <button
+              type="button"
+              onClick={() => setShowFrontVn((v) => !v)}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold border transition ${
+                showFrontVn
+                  ? 'bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                  : 'bg-slate-100 dark:bg-slate-800 text-slate-500 border-slate-200 dark:border-slate-700'
+              }`}
+            >
+              {showFrontVn ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+              Dịch VN mặt trước: {showFrontVn ? 'HIỆN' : 'ẨN'}
+            </button>
+          )}
+        </div>
+
+        {/* Manual Add Card Form */}
+        {isAdmin && showAddForm && (
           <form
-            onSubmit={handleManualSubmit}
-            className="bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 rounded-xl p-4 space-y-3"
+            onSubmit={handleCreateManual}
+            className="pt-3 border-t border-slate-200 dark:border-slate-700 space-y-2.5 text-xs"
           >
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">Phân loại</label>
-                <select
-                  value={newCard.category}
-                  onChange={(e) => setNewCard({ ...newCard, category: e.target.value })}
-                  className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg"
-                >
-                  <option value="Fachbegriff">Fachbegriff</option>
-                  <option value="Recht">Recht</option>
-                  <option value="Formel">Formel</option>
-                  <option value="Praxis">Praxis</option>
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">Gợi ý VN</label>
-                <input
-                  value={newCard.hint_vn}
-                  onChange={(e) => setNewCard({ ...newCard, hint_vn: e.target.value })}
-                  className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg"
-                />
-              </div>
-              <div className="sm:col-span-2">
-                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">Mặt trước (Tiếng Đức) *</label>
-                <input
-                  required
-                  value={newCard.front_de}
-                  onChange={(e) => setNewCard({ ...newCard, front_de: e.target.value })}
-                  className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">Đáp án IHK (Đức) *</label>
-                <textarea
-                  required
-                  rows={2}
-                  value={newCard.back_de}
-                  onChange={(e) => setNewCard({ ...newCard, back_de: e.target.value })}
-                  className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">Bản dịch Việt *</label>
-                <textarea
-                  required
-                  rows={2}
-                  value={newCard.back_vn}
-                  onChange={(e) => setNewCard({ ...newCard, back_vn: e.target.value })}
-                  className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg"
-                />
-              </div>
-            </div>
-            <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => setShowAddForm(false)} className="px-3 py-1.5 text-xs text-slate-500">
-                Hủy
+            <div className="flex items-center justify-between">
+              <span className="font-extrabold text-indigo-600">Tạo Flashcard mới</span>
+              <button type="button" onClick={() => setShowAddForm(false)} className="text-slate-400 hover:text-slate-600">
+                <X className="w-4 h-4" />
               </button>
-              <button type="submit" className="px-4 py-1.5 text-xs font-semibold text-white bg-indigo-600 rounded-lg">
-                Lưu thẻ
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <input
+                value={draft.front_de}
+                onChange={(e) => setDraft({ ...draft, front_de: e.target.value })}
+                placeholder="Mặt trước tiếng Đức (Câu hỏi / Thuật ngữ) *"
+                className="px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl"
+                required
+              />
+              <input
+                value={draft.hint_vn}
+                onChange={(e) => setDraft({ ...draft, hint_vn: e.target.value })}
+                placeholder="Dịch tiếng Việt / Gợi ý mặt trước"
+                className="px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl"
+              />
+              <textarea
+                rows={2}
+                value={draft.back_de}
+                onChange={(e) => setDraft({ ...draft, back_de: e.target.value })}
+                placeholder="Mặt sau đáp án tiếng Đức *"
+                className="px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl"
+                required
+              />
+              <textarea
+                rows={2}
+                value={draft.back_vn}
+                onChange={(e) => setDraft({ ...draft, back_vn: e.target.value })}
+                placeholder="Giải thích / Dịch đáp án tiếng Việt"
+                className="px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl"
+              />
+            </div>
+            <div className="flex justify-end">
+              <button
+                type="submit"
+                disabled={savingCard}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl"
+              >
+                {savingCard ? 'Đang lưu...' : 'Lưu thẻ'}
               </button>
             </div>
           </form>
         )}
       </div>
 
-      {/* Deck or Empty */}
-      {deckCards.length === 0 ? (
-        <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-10 text-center space-y-3">
-          <CheckCircle2 className="w-10 h-10 text-emerald-500 mx-auto" />
-          <p className="text-base font-bold text-slate-800 dark:text-white">
-            {filter === 'due' ? 'Xuất sắc! Hôm nay bạn đã ôn hết toàn bộ thẻ đến hạn.' : 'Chưa có thẻ Flashcard nào.'}
-          </p>
-          {filter !== 'all' && (
+      {/* Empty State */}
+      {filteredCards.length === 0 ? (
+        <div className="bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 p-10 text-center space-y-2">
+          <p className="text-sm font-bold text-slate-600 dark:text-slate-300">Không có thẻ nào trong bộ lọc này.</p>
+          {cards.length > 0 && (
             <button
-              onClick={() => setFilter('all')}
-              className="px-4 py-2 text-xs font-semibold text-indigo-700 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950 rounded-xl"
+              type="button"
+              onClick={() => setFilterMode('all')}
+              className="text-xs font-bold text-indigo-600 dark:text-indigo-400 hover:underline"
             >
-              Ôn lại toàn bộ ({cards.length} thẻ)
+              Xem tất cả {cards.length} thẻ
             </button>
           )}
         </div>
-      ) : viewMode === 'deck' ? (
-        <div className="max-w-2xl mx-auto space-y-4">
-          <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 px-1">
-            <span>
-              Thẻ <strong>{currentIndex + 1}</strong> / {deckCards.length}
-              {subjectMap[currentCard.subject_id] && (
-                <span className="ml-2 text-indigo-600 dark:text-indigo-400 font-medium">· {subjectMap[currentCard.subject_id]}</span>
-              )}
-            </span>
-            <div className="flex items-center gap-2">
-              {currentRec?.interval_days > 0 && (
-                <span className="inline-flex items-center gap-1 text-[11px] text-slate-400">
-                  <Clock className="w-3 h-3" /> Chu kỳ: {currentRec.interval_days} ngày
-                </span>
-              )}
-              <span className={`px-2.5 py-0.5 rounded-full border font-semibold ${STATUS_META[currentRec.status || 'new'].cls}`}>
-                {STATUS_META[currentRec.status || 'new'].label}
-              </span>
-            </div>
-          </div>
+      ) : viewMode === 'list' ? (
+        /* LIST VIEW */
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {filteredCards.map((c) => {
+            const prog = progressMap[c.id];
+            const status = prog?.status || 'new';
+            return (
+              <div
+                key={c.id}
+                className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-4 space-y-2.5 shadow-sm"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className="px-2 py-0.5 rounded-md text-[10px] font-extrabold uppercase bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300">
+                      {c.category || 'Fachbegriff'}
+                    </span>
+                    {subjectMap && c.subject_id && subjectMap[c.subject_id] && (
+                      <span className="text-[10px] font-semibold text-slate-400 truncate max-w-[140px]">
+                        {subjectMap[c.subject_id].split('·')[0].trim()}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => speakGerman(c.front_de, ttsRate)}
+                      className="p-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-indigo-600"
+                    >
+                      <Volume2 className="w-3.5 h-3.5" />
+                    </button>
+                    {isAdmin && onDeleteCard && (
+                      <button
+                        type="button"
+                        onClick={() => onDeleteCard(c.id)}
+                        className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                </div>
 
-          <div onClick={() => setFlipped((f) => !f)} className="perspective-1000 cursor-pointer select-none">
-            <div
-              className={`relative w-full min-h-[340px] sm:min-h-[370px] transition-transform duration-500 transform-style-3d ${
-                flipped ? 'rotate-y-180' : ''
+                <div className="text-sm font-extrabold text-slate-900 dark:text-white">
+                  <RichContent text={c.front_de} isGerman dictMode={dictMode} onWordClick={onWordClick} />
+                </div>
+                {showVn && (frontTranslations[c.id] || c.hint_vn) && (
+                  <p className="text-xs font-semibold text-indigo-600 dark:text-indigo-400">
+                    {frontTranslations[c.id] || c.hint_vn}
+                  </p>
+                )}
+
+                <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-1.5">
+                  <div className="text-xs sm:text-sm text-slate-800 dark:text-slate-200">
+                    <RichContent text={c.back_de} isGerman dictMode={dictMode} onWordClick={onWordClick} />
+                  </div>
+                  {showVn && c.back_vn && (
+                    <div className="text-xs text-slate-500 dark:text-slate-400">
+                      <RichContent text={c.back_vn} mixedGerman dictMode={dictMode} onWordClick={onWordClick} />
+                    </div>
+                  )}
+                </div>
+                <div className="text-[10px] font-bold text-slate-400">
+                  Trạng thái: {status === 'mastered' ? 'Đã thuộc' : status === 'review' ? 'Tạm nhớ' : 'Chưa thuộc'}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        /* DECK INTERACTIVE VIEW */
+        <div className="space-y-4">
+          <div className="flex items-center justify-between text-xs px-1">
+            <span className="font-bold text-slate-500 dark:text-slate-400">
+              Thẻ {safeIdx + 1} / {filteredCards.length}
+            </span>
+            <span
+              className={`px-2.5 py-1 rounded-full text-[11px] font-bold ${
+                progressMap[activeCard.id]?.status === 'mastered'
+                  ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300'
+                  : progressMap[activeCard.id]?.status === 'review'
+                  ? 'bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300'
+                  : 'bg-rose-50 dark:bg-rose-950/60 text-rose-700 dark:text-rose-300'
               }`}
             >
-              {/* FRONT */}
-              <div className="absolute inset-0 backface-hidden bg-white dark:bg-slate-900 rounded-3xl border-2 border-slate-200 dark:border-slate-700 shadow-sm hover:border-indigo-400 transition p-6 sm:p-8 flex flex-col justify-between">
-                <div className="flex items-center justify-between">
-                  <span className="px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 border border-indigo-100 dark:border-indigo-800">
-                    {currentCard.category || 'Fachbegriff'}
-                  </span>
+              {progressMap[activeCard.id]?.status === 'mastered'
+                ? 'Đã thuộc'
+                : progressMap[activeCard.id]?.status === 'review'
+                ? 'Tạm nhớ'
+                : 'Chưa thuộc'}
+            </span>
+          </div>
+
+          {/* Interactive Flashcard Face */}
+          <div
+            onClick={() => setFlipped((f) => !f)}
+            className="min-h-[290px] sm:min-h-[330px] bg-white dark:bg-slate-900 rounded-3xl border-2 border-slate-200 dark:border-slate-800 hover:border-indigo-400 dark:hover:border-indigo-700 p-6 sm:p-8 shadow-md cursor-pointer transition-all flex flex-col justify-between gap-5"
+          >
+            {/* Card Top Bar */}
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="px-3 py-1 rounded-full text-[11px] font-extrabold uppercase bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800">
+                  {activeCard.category || 'Fachbegriff'}
+                </span>
+                <span className="px-2.5 py-1 rounded-full text-[10px] font-bold bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400">
+                  {flipped ? 'Mặt sau · Đáp án' : 'Mặt trước · Câu hỏi'}
+                </span>
+              </div>
+
+              <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+                <button
+                  type="button"
+                  onClick={() => speakGerman(flipped ? activeCard.back_de : activeCard.front_de, ttsRate)}
+                  title="Nghe phát âm tiếng Đức"
+                  className="p-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-indigo-100 dark:hover:bg-indigo-950 text-slate-600 dark:text-slate-300 hover:text-indigo-600"
+                >
+                  <Volume2 className="w-4 h-4" />
+                </button>
+                {isAdmin && onDeleteCard && (
                   <button
                     type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      speakGerman(currentCard.front_de, ttsRate);
-                    }}
-                    className="p-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-indigo-100 text-slate-700 dark:text-slate-200 transition"
+                    onClick={() => onDeleteCard(activeCard.id)}
+                    title="Xóa thẻ này"
+                    className="p-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-400 hover:text-rose-600"
                   >
-                    <Volume2 className="w-5 h-5" />
+                    <Trash2 className="w-4 h-4" />
                   </button>
+                )}
+              </div>
+            </div>
+
+            {/* Card Center Content */}
+            {!flipped ? (
+              <div className="flex-1 flex flex-col items-center justify-center text-center space-y-4 py-3">
+                {/* CLICKABLE GERMAN QUESTION/TERM */}
+                <div className="text-xl sm:text-2xl lg:text-3xl font-extrabold text-slate-900 dark:text-white leading-snug max-w-2xl">
+                  <RichContent text={activeCard.front_de} isGerman dictMode={dictMode} onWordClick={onWordClick} />
                 </div>
 
-                <div className="text-center my-auto py-4 space-y-4">
-                  <h3 className="text-2xl sm:text-3xl font-extrabold text-slate-900 dark:text-white leading-snug">
-                    {currentCard.front_de}
-                  </h3>
-                  {currentCard.hint_vn && (
-                    <div>
-                      {showHint ? (
-                        <span className="inline-block px-3.5 py-1.5 rounded-xl bg-amber-50 dark:bg-amber-950/60 border border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300 text-sm font-medium">
-                          Gợi ý VN: {currentCard.hint_vn}
-                        </span>
-                      ) : (
+                {/* VIETNAMESE TRANSLATION / HINT RIGHT ON FRONT FACE */}
+                {showVn && showFrontVn && (
+                  <div
+                    className="max-w-xl w-full space-y-2"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    {(frontTranslations[activeCard.id] || activeCard.hint_vn) ? (
+                      <div className="inline-block px-4 py-2 rounded-2xl bg-indigo-50/80 dark:bg-indigo-950/50 border border-indigo-200/80 dark:border-indigo-800/80 text-xs sm:text-sm font-semibold text-indigo-800 dark:text-indigo-200">
+                        <RichContent
+                          text={frontTranslations[activeCard.id] || activeCard.hint_vn}
+                          mixedGerman
+                          dictMode={dictMode}
+                          onWordClick={onWordClick}
+                        />
+                      </div>
+                    ) : null}
+
+                    {/* Nút dịch đầy đủ câu hỏi bằng AI nếu thẻ cũ chưa có bản dịch rõ ràng */}
+                    {!frontTranslations[activeCard.id] && (
+                      <div>
                         <button
                           type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setShowHint(true);
-                          }}
-                          className="text-xs font-semibold text-slate-500 hover:text-indigo-600 underline underline-offset-4"
+                          disabled={translatingCardId === activeCard.id}
+                          onClick={(e) => handleTranslateFront(activeCard, e)}
+                          className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl text-[11px] font-bold text-slate-500 dark:text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-300 bg-slate-100/80 dark:bg-slate-800/70 transition"
                         >
-                          Xem gợi ý tiếng Việt
+                          {translatingCardId === activeCard.id ? (
+                            <>
+                              <Loader2 className="w-3 h-3 animate-spin" /> Đang dịch câu hỏi...
+                            </>
+                          ) : (
+                            <>
+                              <Languages className="w-3 h-3" />
+                              {activeCard.hint_vn ? 'Dịch sát nghĩa cả câu tiếng Đức' : 'Dịch câu hỏi sang tiếng Việt'}
+                            </>
+                          )}
                         </button>
-                      )}
-                    </div>
-                  )}
-                </div>
-
-                <div className="text-center text-xs text-slate-400 font-medium">
-                  Bấm vào thẻ hoặc nhấn <kbd className="px-1.5 py-0.5 bg-slate-100 dark:bg-slate-800 rounded">Space</kbd> để lật
-                </div>
-              </div>
-
-              {/* BACK */}
-              <div className="absolute inset-0 backface-hidden rotate-y-180 bg-slate-900 dark:bg-slate-950 text-white rounded-3xl border-2 border-indigo-500/50 shadow-lg p-6 sm:p-8 flex flex-col justify-between overflow-y-auto">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold uppercase tracking-wider text-indigo-300">IHK-Definition & Bản dịch</span>
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      speakGerman(currentCard.back_de, ttsRate);
-                    }}
-                    className="p-2 rounded-xl bg-white/10 hover:bg-white/20 text-white transition"
-                  >
-                    <Volume2 className="w-4 h-4" />
-                  </button>
-                </div>
-
-                <div className="space-y-4 my-auto py-3" onClick={(e) => dictMode && e.stopPropagation()}>
-                  <div className="text-base sm:text-lg font-medium leading-relaxed text-white">
-                    <RichContent
-                      text={currentCard.back_de}
-                      isGerman
-                      dictMode={dictMode}
-                      onWordClick={onWordClick}
-                    />
+                      </div>
+                    )}
                   </div>
-                  {showVn && currentCard.back_vn && (
-                    <div className="bg-white/10 border-l-2 border-indigo-400 rounded-r-xl px-4 py-3 text-sm text-indigo-100 leading-relaxed">
-                      {currentCard.back_vn}
-                    </div>
-                  )}
-                  {(currentCard.example_de || currentCard.example_vn) && (
-                    <div className="bg-emerald-500/15 border border-emerald-400/30 rounded-xl px-4 py-2.5 text-xs space-y-1">
-                      <p className="text-emerald-200 font-semibold">Praxisbeispiel:</p>
-                      {currentCard.example_de && <p className="text-white/95">{currentCard.example_de}</p>}
-                      {showVn && currentCard.example_vn && (
-                        <p className="text-emerald-100/80 italic">{currentCard.example_vn}</p>
-                      )}
-                    </div>
-                  )}
+                )}
+              </div>
+            ) : (
+              <div className="flex-1 flex flex-col justify-center space-y-4 py-2">
+                <div className="text-base sm:text-lg font-bold text-slate-900 dark:text-white leading-relaxed">
+                  <RichContent text={activeCard.back_de} isGerman dictMode={dictMode} onWordClick={onWordClick} />
                 </div>
 
-                <div className="text-center text-xs text-slate-400">Đánh giá SRS bên dưới (phím 1 · 2 · 3)</div>
+                {showVn && activeCard.back_vn && (
+                  <div className="bg-indigo-50/60 dark:bg-indigo-950/40 border-l-4 border-indigo-500 rounded-r-2xl px-4 py-3 text-sm text-slate-700 dark:text-slate-200">
+                    <RichContent text={activeCard.back_vn} mixedGerman dictMode={dictMode} onWordClick={onWordClick} />
+                  </div>
+                )}
+
+                {(activeCard.example_de || activeCard.example_vn) && (
+                  <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-1.5">
+                    <span className="text-[10px] font-extrabold uppercase tracking-wider text-emerald-600 dark:text-emerald-400">
+                      Ví dụ thực tế (Beispiel)
+                    </span>
+                    {activeCard.example_de && (
+                      <div className="text-xs sm:text-sm text-slate-800 dark:text-slate-200">
+                        <RichContent text={activeCard.example_de} isGerman dictMode={dictMode} onWordClick={onWordClick} />
+                      </div>
+                    )}
+                    {showVn && activeCard.example_vn && (
+                      <div className="text-xs text-slate-500 dark:text-slate-400 italic">
+                        <RichContent text={activeCard.example_vn} mixedGerman dictMode={dictMode} onWordClick={onWordClick} />
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
+            )}
+
+            {/* Card Footer Hint */}
+            <div className="text-center text-[11px] text-slate-400 font-medium">
+              Bấm khoảng trống trên thẻ hoặc nhấn <kbd className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">Space</kbd> để lật · Bấm trực tiếp từng từ tiếng Đức để tra từ điển
             </div>
           </div>
 
-          {/* Controls */}
-          <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-1">
+          {/* Bottom Nav & SRS Rating Buttons */}
+          <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
             <div className="flex items-center gap-2">
               <button
-                onClick={goPrev}
-                className="p-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800"
+                type="button"
+                onClick={() =>
+                  setCurrentIdx((i) => (i - 1 + filteredCards.length) % filteredCards.length)
+                }
+                className="p-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:border-indigo-400"
+                title="Thẻ trước (←)"
               >
-                <ChevronLeft className="w-5 h-5" />
+                <ChevronLeft className="w-4 h-4" />
               </button>
               <button
+                type="button"
                 onClick={() => setFlipped((f) => !f)}
-                className="px-4 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-xs font-semibold flex items-center gap-1.5"
+                className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:border-indigo-400 text-xs font-bold"
               >
-                <RotateCcw className="w-4 h-4" /> Lật thẻ
+                <RotateCw className="w-3.5 h-3.5" /> Lật thẻ
               </button>
               <button
-                onClick={goNext}
-                className="p-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800"
+                type="button"
+                onClick={() => setCurrentIdx((i) => (i + 1) % filteredCards.length)}
+                className="p-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:border-indigo-400"
+                title="Thẻ sau (→)"
               >
-                <ChevronRight className="w-5 h-5" />
+                <ChevronRight className="w-4 h-4" />
               </button>
             </div>
 
             <div className="grid grid-cols-3 gap-2 w-full sm:w-auto">
               <button
-                onClick={() => handleRate('new')}
-                className="px-3 py-2 rounded-xl bg-rose-50 dark:bg-rose-950/60 hover:bg-rose-100 border border-rose-200 dark:border-rose-800 text-rose-700 dark:text-rose-300 text-xs font-bold transition text-center"
-              >
-                <div>1. Quên</div>
-                <div className="text-[10px] opacity-75">Ôn ngay</div>
-              </button>
-              <button
+                type="button"
                 onClick={() => handleRate('learning')}
-                className="px-3 py-2 rounded-xl bg-amber-50 dark:bg-amber-950/60 hover:bg-amber-100 border border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300 text-xs font-bold transition text-center"
+                className="px-4 py-2.5 rounded-xl bg-rose-600/90 hover:bg-rose-600 text-white text-center transition"
               >
-                <div>2. Tạm nhớ</div>
-                <div className="text-[10px] opacity-75">Hẹn 1 ngày</div>
+                <div className="text-xs font-extrabold">1. Quên</div>
+                <div className="text-[10px] text-rose-100">Ôn ngay</div>
               </button>
               <button
-                onClick={() => handleRate('mastered')}
-                className="px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-sm transition text-center"
+                type="button"
+                onClick={() => handleRate('review')}
+                className="px-4 py-2.5 rounded-xl bg-amber-600/90 hover:bg-amber-600 text-white text-center transition"
               >
-                <div>3. Đã thuộc</div>
-                <div className="text-[10px] text-emerald-100">Hẹn {nextMasteredDays}</div>
+                <div className="text-xs font-extrabold">2. Tạm nhớ</div>
+                <div className="text-[10px] text-amber-100">Hẹn 1 ngày</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleRate('mastered')}
+                className="px-4 py-2.5 rounded-xl bg-emerald-600/90 hover:bg-emerald-600 text-white text-center transition"
+              >
+                <div className="text-xs font-extrabold">3. Đã thuộc</div>
+                <div className="text-[10px] text-emerald-100">Hẹn 3+ ngày</div>
               </button>
             </div>
           </div>
-        </div>
-      ) : (
-        <div className="grid grid-cols-1 gap-3">
-          {deckCards.map((card) => {
-            const rec = getRec(card.id);
-            return (
-              <div
-                key={card.id}
-                className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-4 sm:p-5 space-y-2.5"
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300">
-                      {card.category}
-                    </span>
-                    <h4 className="font-bold text-slate-900 dark:text-white text-base">{card.front_de}</h4>
-                    <button onClick={() => speakGerman(card.front_de, ttsRate)} className="p-1.5 text-slate-400 hover:text-indigo-600">
-                      <Volume2 className="w-4 h-4" />
-                    </button>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <select
-                      value={rec.status}
-                      onChange={(e) => onSetMastery(card.id, e.target.value)}
-                      className={`text-xs font-semibold px-2.5 py-1 rounded-lg border ${STATUS_META[rec.status].cls}`}
-                    >
-                      <option value="new">Chưa thuộc</option>
-                      <option value="learning">Tạm nhớ</option>
-                      <option value="mastered">Đã thuộc</option>
-                    </select>
-                    {isAdmin && onDeleteCard && (
-                      <button onClick={() => onDeleteCard(card.id)} className="p-1.5 text-slate-400 hover:text-rose-600">
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    )}
-                  </div>
-                </div>
-                <RichContent
-                  text={card.back_de}
-                  isGerman
-                  dictMode={dictMode}
-                  onWordClick={onWordClick}
-                  className="text-sm text-slate-800 dark:text-slate-200"
-                />
-                {showVn && card.back_vn && (
-                  <p className="text-sm text-slate-600 dark:text-slate-400 bg-slate-50 dark:bg-slate-800/60 border-l-4 border-indigo-400 px-3 py-2 rounded-r-lg">
-                    {card.back_vn}
-                  </p>
-                )}
-              </div>
-            );
-          })}
         </div>
       )}
     </div>
