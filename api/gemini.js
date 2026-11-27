@@ -1100,10 +1100,10 @@ BEWERTUNGSKRITERIEN (IHK-TEILPUNKTE-SCHEMA):
 
 PFLICHTINHALTE FÜR JEDE AUFGABE:
 - **"feedback_de":** Konkretes Prüfer-Feedback auf Deutsch (Lob für Richtiges + genaue Zeile/Stelle des Fehlers + wie der exakte IHK-Satz lauten muss).
-- **"feedback_vn":** Nhận xét cực chi tiết, sắc bén bằng tiếng Việt theo đúng 3 dòng gạch đầu dòng tách nhau bằng ký tự xuống dòng `\n` (TUYỆT ĐỐI KHÔNG viết gộp tất cả vào 1 dòng liền mạch!):
+- **"feedback_vn":** Nhận xét cực chi tiết, sắc bén bằng tiếng Việt theo đúng 3 dòng gạch đầu dòng tách nhau bằng ký tự xuống dòng \`\\n\` (TUYỆT ĐỐI KHÔNG viết gộp tất cả vào 1 dòng liền mạch!):
   - **Điểm thành phần (Teilpunkte):** Phương pháp/Công thức (.../40%) · Tính toán/Lập luận (.../40%) · Từ khóa IHK (.../20%)
   - **Chỗ làm đúng & Chỗ sai/thiếu:** Chỉ đích danh dòng nào, số nào hoặc tài khoản nào đúng/nhầm và giải thích TẠI SAO.
-  - **Câu tiếng Đức chuẩn nên viết khi đi thi:** (in đậm từ khóa ăn điểm; công thức toán viết gọn bằng `$...$` trong dòng hoặc `$$...$$` trên dòng riêng; nếu có tính toán ghi rõ phím **Casio fx-580VN X** như `[ ■/□ ] [ 900 ] [ ÷ ] [ 50 ] [ × ] [ 20 ] [ = ]`).
+  - **Câu tiếng Đức chuẩn nên viết khi đi thi:** (in đậm từ khóa ăn điểm; công thức toán viết gọn bằng \`$...$\` trong dòng hoặc \`$$...$$\` trên dòng riêng; nếu có tính toán ghi rõ phím **Casio fx-580VN X** như \`[ ■/□ ] [ 900 ] [ ÷ ] [ 50 ] [ × ] [ 20 ] [ = ]\`).
 - **"musterloesung_de":** Vollständige, mustergültige IHK-Lösung auf Deutsch (mit sauberem Rechenweg / LaTeX \`$$...$$\` / Buchungssatz).
 - **"musterloesung_vn":** Bản dịch & giải thích từng bước đáp án mẫu bằng tiếng Việt (+ bấm máy Casio fx-580VN X nếu có tính toán).
 
