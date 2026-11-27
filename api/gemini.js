@@ -4,6 +4,7 @@ const ADMIN_EMAIL = 'ngoctaixs@gmail.com';
 // - INSTANT: dành riêng cho tra từ điển 1 từ (~150-300ms!)
 const GROQ_INSTANT_MODELS = [
   'llama-3.1-8b-instant',
+  'meta-llama/llama-4-scout-17b-16e-instruct',
   'llama-3.3-70b-versatile',
 ];
 // - TEXT: dành cho phân tích bài học, lọc PDF, tạo flashcard/test chuẩn IHK
@@ -229,15 +230,15 @@ async function callGroq({
   const primaryOrder = [...ready, ...cooling];
 
   const reqOpts = {
-    timeoutMs: instant ? 12000 : 45000,
-    maxTokens: instant ? Math.min(maxTokens, 360) : maxTokens,
+    timeoutMs: instant ? 10000 : 45000,
+    maxTokens: instant ? Math.min(maxTokens, 750) : maxTokens,
     temperature: temperature !== null ? temperature : instant ? 0.1 : 0.25,
     chatMessages,
   };
 
   const errors = [];
   // 1. Gọi thẳng danh sách model ưu tiên (0ms trễ tìm model!)
-  for (const model of primaryOrder.slice(0, instant ? 2 : 3)) {
+  for (const model of primaryOrder.slice(0, 3)) {
     const res = await requestGroqModel(groqKey, model, parts, expectJson, reqOpts);
     if (res.ok) return { ok: true, data: res.data, model: res.model };
     errors.push(res.error);
@@ -464,6 +465,25 @@ async function callGemini({
   }
 
   throw new Error(`Không gọi được AI. Chi tiết: ${errorLog.slice(0, 3).join(' | ')}`);
+}
+
+
+// Dự phòng siêu tốc (Google Translate miễn phí) khi Groq/Gemini bị quá tải 429 lúc tra từ
+async function fallbackQuickTranslate(text, sl = 'de', tl = 'vi') {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${encodeURIComponent(sl)}&tl=${encodeURIComponent(tl)}&dt=t&q=${encodeURIComponent(text)}`;
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return '';
+    const arr = await res.json();
+    if (!Array.isArray(arr) || !Array.isArray(arr[0])) return '';
+    return arr[0].map((seg) => (Array.isArray(seg) ? seg[0] || '' : '')).join('').trim();
+  } catch {
+    clearTimeout(timer);
+    return '';
+  }
 }
 
 export default async function handler(req, res) {
@@ -888,7 +908,7 @@ ANTWORTE AUSSCHLIESSLICH MIT VALIDEM JSON:
     {
       "category": "Fachbegriff",
       "front_de": "Begriff / Frage / Formel DE",
-      "hint_vn": "Gợi ý ngắn VN",
+      "hint_vn": "Dịch đầy đủ câu hỏi / thuật ngữ mặt trước sang tiếng Việt",
       "back_de": "Präzise IHK-Antwort DE",
       "back_vn": "Giải thích & công thức VN",
       "example_de": "Praxisbeispiel DE",
@@ -1080,10 +1100,10 @@ BEWERTUNGSKRITERIEN (IHK-TEILPUNKTE-SCHEMA):
 
 PFLICHTINHALTE FÜR JEDE AUFGABE:
 - **"feedback_de":** Konkretes Prüfer-Feedback auf Deutsch (Lob für Richtiges + genaue Zeile/Stelle des Fehlers + wie der exakte IHK-Satz lauten muss).
-- **"feedback_vn":** Nhận xét cực chi tiết, sắc bén bằng tiếng Việt theo 3 ý rõ ràng:
-  * **Điểm thành phần (Teilpunkte):** Phương pháp/Công thức (...%) · Tính toán/Lập luận (...%) · Từ khóa IHK (...%)
-  * **Chỗ làm đúng & Chỗ sai/thiếu:** Chỉ đích danh dòng nào, số nào hoặc tài khoản nào bị nhầm và giải thích TẠI SAO.
-  * **Câu tiếng Đức chuẩn nên viết khi đi thi** (in đậm từ khóa ăn điểm) + nếu là bài tính toán, ghi rõ tổ hợp phím **Casio fx-580VN X** (\`[ ■/□ ]\`, \`[ ▼ ]\`, \`[ Ans ]\`, \`[ S⇔D ]\`, \`SOLVE\`).
+- **"feedback_vn":** Nhận xét cực chi tiết, sắc bén bằng tiếng Việt theo đúng 3 dòng gạch đầu dòng tách nhau bằng ký tự xuống dòng `\n` (TUYỆT ĐỐI KHÔNG viết gộp tất cả vào 1 dòng liền mạch!):
+  - **Điểm thành phần (Teilpunkte):** Phương pháp/Công thức (.../40%) · Tính toán/Lập luận (.../40%) · Từ khóa IHK (.../20%)
+  - **Chỗ làm đúng & Chỗ sai/thiếu:** Chỉ đích danh dòng nào, số nào hoặc tài khoản nào đúng/nhầm và giải thích TẠI SAO.
+  - **Câu tiếng Đức chuẩn nên viết khi đi thi:** (in đậm từ khóa ăn điểm; công thức toán viết gọn bằng `$...$` trong dòng hoặc `$$...$$` trên dòng riêng; nếu có tính toán ghi rõ phím **Casio fx-580VN X** như `[ ■/□ ] [ 900 ] [ ÷ ] [ 50 ] [ × ] [ 20 ] [ = ]`).
 - **"musterloesung_de":** Vollständige, mustergültige IHK-Lösung auf Deutsch (mit sauberem Rechenweg / LaTeX \`$$...$$\` / Buchungssatz).
 - **"musterloesung_vn":** Bản dịch & giải thích từng bước đáp án mẫu bằng tiếng Việt (+ bấm máy Casio fx-580VN X nếu có tính toán).
 
@@ -1114,29 +1134,91 @@ ANTWORTE AUSSCHLIESSLICH MIT VALIDEM JSON:
     }
 
     // =========================================================================
-    // ACTION 5: TRA TỪ ĐIỂN BẤM-ĐÂU-DỊCH-ĐÓ (CHẾ ĐỘ SIÊU TỐC ~200ms)
+    // ACTION 5: TRA TỪ ĐIỂN ĐỨC–VIỆT / VIỆT–ĐỨC SIÊU TỐC (~250ms, CHỐNG CẮT JSON & CÓ DỰ PHÒNG)
     // =========================================================================
     if (action === 'lookup_word') {
       const { word = '', contextSentence = '' } = payload || {};
-      const cleaned = word.trim();
+      const cleaned = String(word || '').trim();
       if (!cleaned) {
         return res.status(400).json({ error: 'Thiếu từ cần tra.' });
       }
 
-      const ctx = (contextSentence || '').slice(0, 220);
-      const prompt = `Deutsch-Vietnamesisch Wörterbuch (Veranstaltungskaufmann IHK, B2).
-Wort: "${cleaned}"
-Satz: "${ctx}"
-Gib NUR JSON zurück:
-{"lemma_de":"Grundform ohne Artikel","article":"der|die|das oder leer bei Nicht-Nomen","plural":"die ... oder leer","word_type":"Nomen|Verb|Adjektiv|Adverb|Präposition|Abkürzung","meaning_vn":"Nghĩa tiếng Việt ngắn gọn, đúng ngữ cảnh","example_de":"1 câu ví dụ ngắn DE","example_vn":"Dịch ví dụ VN","grammar_note_vn":"1 dòng ghi chú giống/chia từ nếu cần"}`;
+      const ctx = String(contextSentence || '').slice(0, 180);
+      // Phát hiện xem người dùng đang gõ tiếng Việt (có dấu tiếng Việt) hay tiếng Đức
+      const isVietnameseQuery = /[ăâđêôơưàáảãạằắẳẵặầấẩẫậèéẻẽẹềếểễệìíỉĩịòóỏõọồốổỗộờớởỡợùúủũụừứửữựỳýỷỹỵ]/i.test(cleaned);
 
-      const result = await callGemini({
-        parts: [{ text: prompt }],
-        expectJson: true,
-        instant: true,
-        maxTokens: 320,
-      });
-      return res.status(200).json({ data: result });
+      const prompt = isVietnameseQuery
+        ? `Từ điển Việt–Đức (ngành Veranstaltungskaufmann IHK & giao tiếp B2).
+Từ tiếng Việt cần dịch sang tiếng Đức: "${cleaned}"
+Trả về DUY NHẤT 1 JSON hợp lệ (ngắn gọn, súc tích):
+{"lemma_de":"Từ tiếng Đức tương đương chuẩn nhất (không kèm der/die/das)","article":"der|die|das (rỗng nếu không phải danh từ)","plural":"die ... (rỗng nếu không có)","word_type":"Nomen|Verb|Adjektiv|Adverb|Ausdruck","meaning_vn":"Nghĩa tiếng Việt đầy đủ & sắc thái dùng","example_de":"1 câu ví dụ ngắn bằng tiếng Đức","example_vn":"Dịch câu ví dụ sang tiếng Việt","grammar_note_vn":"Ghi chú ngắn giống/chia từ hoặc từ đồng nghĩa DE"}`
+        : `Deutsch-Vietnamesisch Wörterbuch (Veranstaltungskaufmann IHK & Alltag B2).
+Wort/Ausdruck: "${cleaned}"${ctx ? `\nKontext: "${ctx}"` : ''}
+Antworte NUR mit EINEM validen JSON (kurz, präzise):
+{"lemma_de":"Grundform ohne Artikel","article":"der|die|das oder leer","plural":"die ... oder leer","word_type":"Nomen|Verb|Adjektiv|Adverb|Präposition|Abkürzung","meaning_vn":"Nghĩa tiếng Việt ngắn gọn, đúng ngữ cảnh","example_de":"1 kurzer Beispielsatz DE","example_vn":"Dịch ví dụ VN","grammar_note_vn":"1 dòng ngắn ghi chú giống/chia động từ/ngữ pháp"}`;
+
+      try {
+        const result = await callGemini({
+          parts: [{ text: prompt }],
+          expectJson: true,
+          instant: true,
+          maxTokens: 700,
+        });
+        return res.status(200).json({ data: result });
+      } catch (aiErr) {
+        // Dự phòng siêu nhanh để KHÔNG BAO GIỜ bị báo lỗi trắng khi người dùng đang học
+        const translated = await fallbackQuickTranslate(
+          cleaned,
+          isVietnameseQuery ? 'vi' : 'de',
+          isVietnameseQuery ? 'de' : 'vi'
+        );
+        if (translated) {
+          return res.status(200).json({
+            data: {
+              lemma_de: isVietnameseQuery ? translated : cleaned,
+              article: '',
+              plural: '',
+              word_type: 'Từ điển nhanh',
+              meaning_vn: isVietnameseQuery ? cleaned : translated,
+              example_de: '',
+              example_vn: '',
+              grammar_note_vn: 'Dịch dự phòng nhanh (AI tạm bận).',
+            },
+          });
+        }
+        throw aiErr;
+      }
+    }
+
+    // =========================================================================
+    // ACTION 5B: DỊCH NHANH CÂU HỎI FLASHCARD / CÂU NGẮN ĐỨC -> VIỆT (~200ms)
+    // =========================================================================
+    if (action === 'translate_phrase') {
+      const { text = '' } = payload || {};
+      const cleaned = String(text || '').trim();
+      if (!cleaned) {
+        return res.status(400).json({ error: 'Thiếu nội dung cần dịch.' });
+      }
+
+      const prompt = `Übersetze diesen deutschen Lernsatz (Veranstaltungskaufmann IHK) natürlich und genau ins Vietnamesische.
+Text: "${cleaned.slice(0, 500)}"
+Antworte NUR als JSON: {"translation_vn":"Bản dịch tiếng Việt rõ ràng, dễ hiểu"}`;
+
+      try {
+        const result = await callGemini({
+          parts: [{ text: prompt }],
+          expectJson: true,
+          instant: true,
+          maxTokens: 450,
+        });
+        return res.status(200).json({ data: result });
+      } catch {
+        const translated = await fallbackQuickTranslate(cleaned, 'de', 'vi');
+        if (translated) {
+          return res.status(200).json({ data: { translation_vn: translated } });
+        }
+        return res.status(500).json({ error: 'Không dịch được câu này lúc này, thử lại sau vài giây.' });
+      }
     }
 
     // =========================================================================
@@ -1156,7 +1238,7 @@ ANTWORTE NUR ALS VALIDES JSON:
     {
       "category": "Fachbegriff",
       "front_de": "Begriff DE",
-      "hint_vn": "Gợi ý VN",
+      "hint_vn": "Dịch đầy đủ mặt trước sang tiếng Việt",
       "back_de": "IHK-Definition DE",
       "back_vn": "Định nghĩa VN",
       "example_de": "Beispiel DE",
